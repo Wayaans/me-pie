@@ -44,6 +44,17 @@ themes/
 
 Each extension lives in a separate folder. The `pi` manifest in `package.json` loads `extensions/*/index.ts` and the package's resource directories.
 
+## Included extensions
+
+- `answer` — extract questions from the latest assistant response into an interactive Q&A.
+- `codex-usage` — show OpenAI Codex subscription usage.
+- `file-search` — provide first-class, bounded `fd` and `rg` search tools.
+- `find-docs` — retrieve current Context7 documentation.
+- `github-references` — autocomplete and inspect GitHub issues and pull requests.
+- `localize` — translate and refine prompts into English before submission.
+- `mepie-ui` — add a theme-aware PI header and model, context, cost, and Git dashboard.
+- `skill-shortcut` — invoke loaded skills with `$skill-name`.
+
 ## Add an extension
 
 1. Create `extensions/<name>/index.ts`.
@@ -63,6 +74,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 | Command | Purpose |
 | --- | --- |
 | `bun run typecheck` | Type-check all extensions without emitting files. |
-| `bun run check` | Run the repository checks. |
+| `bun run test` | Run the extension test suite. |
+| `bun run check` | Type-check and test the package. |
 
 Effect 4 is currently installed as `4.0.0-beta.102`, the current Effect 4 beta pinned for reproducible installs.
