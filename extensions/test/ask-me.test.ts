@@ -78,6 +78,7 @@ test("ask-me transcript permanently includes every submitted question and answer
 		],
 	};
 	const transcript = formatAskMeTranscript(details);
+	assert.match(transcript, /^Interview: Deployment choices/);
 	assert.match(transcript, /Q1\. Which database should the project use\?/);
 	assert.match(transcript, /A1\. PostgreSQL/);
 	assert.match(transcript, /Used recommendation: Production requires concurrent writes\./);
@@ -267,6 +268,7 @@ test("ask-me renderer updates its compact header and keeps answers visible while
 		context,
 	);
 	assert.match(header.render(120).join("\n"), /ask-me · questionnaire · ✓ done/);
+	assert.match(result.render(120).join("\n"), /Interview: Deployment choices/);
 	assert.match(result.render(120).join("\n"), /Q1\. Which database/);
 	assert.match(result.render(120).join("\n"), /A2\. Yes/);
 });

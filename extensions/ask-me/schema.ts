@@ -190,7 +190,9 @@ export function formatAskMeTranscript(details: AskMeDetails): string {
 	const heading = details.status === "submitted"
 		? `The user submitted ${details.answers.length} answer${details.answers.length === 1 ? "" : "s"} for ${details.questions.length} question${details.questions.length === 1 ? "" : "s"}.`
 		: `The user cancelled after answering ${details.answers.length} of ${details.questions.length} questions. Do not infer answers for unanswered questions.`;
-	const lines = [heading, ""];
+	const lines = details.title
+		? [`Interview: ${details.title}`, "", heading, ""]
+		: [heading, ""];
 
 	for (let index = 0; index < details.questions.length; index++) {
 		const question = details.questions[index]!;

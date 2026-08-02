@@ -25,6 +25,8 @@ After completion, cancellation, or failure, the status updates and the complete 
 ```text
 ask-me · questionnaire · ✓ done
 
+Interview: Deployment choices
+
 The user submitted 2 answers for 2 questions:
 
 Q1. Which database should the project use?
@@ -34,7 +36,7 @@ Q2. Should migrations run during deployment?
 A2. Yes
 ```
 
-Cancellation retains partial answers and explicitly marks unanswered questions. The same transcript is returned to the LLM.
+The completed transcript includes the interview title, so round names and other title context remain visible after the questionnaire closes. Cancellation retains partial answers and explicitly marks unanswered questions. The same transcript is returned to the LLM.
 
 ## TUI controls
 
