@@ -2,7 +2,7 @@ import { Effect, Schema } from "effect";
 import type { WorkflowPlan, WorkflowRun } from "./domain.ts";
 import { CorruptDataError, UnsupportedVersionError } from "./errors.ts";
 
-export const SCHEMA_VERSION = 1 as const;
+export const SCHEMA_VERSION = 2 as const;
 
 const ThinkingLevelSchema = Schema.Literals(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const RunPhaseSchema = Schema.Literals([
@@ -13,7 +13,10 @@ const WorkItemStatusSchema = Schema.Literals([
 	"report-revision", "blocked", "completed", "failed", "interrupted",
 ]);
 
-export const PiLaunchProfileSchema = Schema.Struct({ model: Schema.String, thinking: ThinkingLevelSchema });
+export const PiLaunchProfileSchema = Schema.Struct({
+	model: Schema.optionalKey(Schema.String),
+	thinking: Schema.optionalKey(ThinkingLevelSchema),
+});
 
 export const CompletionStrategySchema = Schema.Union([
 	Schema.Struct({ type: Schema.Literal("ledger-only") }),
@@ -40,8 +43,8 @@ export const WorkItemSchema = Schema.Struct({
 	orderReason: Schema.String,
 	dependsOn: Schema.Array(Schema.String),
 	delegationPrompt: Schema.String,
-	launchProfile: PiLaunchProfileSchema,
-	completionStrategy: CompletionStrategySchema,
+	launchProfile: Schema.optionalKey(PiLaunchProfileSchema),
+	completionStrategy: Schema.optionalKey(CompletionStrategySchema),
 	status: WorkItemStatusSchema,
 });
 
@@ -85,6 +88,21 @@ export const WorkerIdentitySchema = Schema.Struct({
 	sessionFile: Schema.optionalKey(Schema.String),
 });
 
+const PlanChangeSchema = Schema.Union([
+	Schema.Struct({ type: Schema.Literal("set-summary"), summary: Schema.String }),
+	Schema.Struct({ type: Schema.Literal("upsert-work-item"), workItem: WorkItemSchema }),
+	Schema.Struct({ type: Schema.Literal("remove-work-item"), workItemId: Schema.String }),
+	Schema.Struct({ type: Schema.Literal("set-user-resolutions"), userResolutions: Schema.Array(UserResolutionSchema) }),
+	Schema.Struct({ type: Schema.Literal("set-unresolved-questions"), questions: Schema.Array(Schema.String) }),
+]);
+
+const PlanningDetailsSchema = Schema.Struct({
+	unresolvedQuestions: Schema.Array(Schema.String),
+	changes: Schema.Array(Schema.Struct({ timestamp: Schema.String, change: PlanChangeSchema })),
+	previousActiveTools: Schema.optionalKey(Schema.Array(Schema.String)),
+	restrictedActiveTools: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 export const WorkflowRunSchema = Schema.Struct({
 	id: Schema.String,
 	projectId: Schema.String,
@@ -94,6 +112,7 @@ export const WorkflowRunSchema = Schema.Struct({
 	createdAt: Schema.String,
 	updatedAt: Schema.String,
 	plan: WorkflowPlanSchema,
+	planning: PlanningDetailsSchema,
 	activeWorkItemId: Schema.optionalKey(Schema.String),
 	worker: Schema.optionalKey(WorkerIdentitySchema),
 });

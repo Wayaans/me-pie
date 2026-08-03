@@ -58,8 +58,8 @@ export interface WorkItem {
 	readonly orderReason: string;
 	readonly dependsOn: readonly string[];
 	readonly delegationPrompt: string;
-	readonly launchProfile: PiLaunchProfile;
-	readonly completionStrategy: CompletionStrategy;
+	readonly launchProfile?: Partial<PiLaunchProfile>;
+	readonly completionStrategy?: CompletionStrategy;
 	readonly status: WorkItemStatus;
 }
 
@@ -103,6 +103,25 @@ export interface WorkerReport {
 	readonly questions?: readonly string[];
 }
 
+export type PlanChange =
+	| { readonly type: "set-summary"; readonly summary: string }
+	| { readonly type: "upsert-work-item"; readonly workItem: WorkItem }
+	| { readonly type: "remove-work-item"; readonly workItemId: string }
+	| { readonly type: "set-user-resolutions"; readonly userResolutions: readonly UserResolution[] }
+	| { readonly type: "set-unresolved-questions"; readonly questions: readonly string[] };
+
+export interface PlanChangeRecord {
+	readonly timestamp: string;
+	readonly change: PlanChange;
+}
+
+export interface PlanningDetails {
+	readonly unresolvedQuestions: readonly string[];
+	readonly changes: readonly PlanChangeRecord[];
+	readonly previousActiveTools?: readonly string[];
+	readonly restrictedActiveTools?: readonly string[];
+}
+
 export interface WorkflowRun {
 	readonly id: string;
 	readonly projectId: string;
@@ -112,6 +131,7 @@ export interface WorkflowRun {
 	readonly createdAt: string;
 	readonly updatedAt: string;
 	readonly plan: WorkflowPlan;
+	readonly planning: PlanningDetails;
 	readonly activeWorkItemId?: string;
 	readonly worker?: WorkerIdentity;
 }

@@ -92,10 +92,15 @@ function findDependencyCycle(items: readonly WorkItem[]): readonly string[] | un
 }
 
 function validateFinalizedItem(item: WorkItem): Effect.Effect<void, ValidationError> {
+	if (!item.id.trim() || !item.title.trim()) return fail("finalized item must have an identity", item.id);
+	if (!item.orderReason.trim()) return fail("finalized item must explain its order", item.id);
 	if (item.requirements.length === 0 || item.requirements.some((requirement) => !requirement.trim())) {
 		return fail("finalized item must have requirements", item.id);
 	}
 	if (!item.delegationPrompt.trim()) return fail("finalized item must have a delegation prompt", item.id);
+	if (!item.launchProfile?.model || !item.launchProfile.thinking) {
+		return fail("finalized item must have an explicit model and thinking level", item.id);
+	}
 	const model = item.launchProfile.model.trim();
 	if (!/^[^/\s]+\/[^/\s]+$/.test(model) || model !== item.launchProfile.model) {
 		return fail("model must be an exact provider/model identifier", item.id);
@@ -129,6 +134,7 @@ export function validatePlan(plan: WorkflowPlan): Effect.Effect<void, Validation
 			}
 		}
 		if (plan.finalized) {
+			if (plan.workItems.length === 0) return yield* fail("finalized plan must contain at least one work item", "workItems");
 			for (const item of plan.workItems) yield* validateFinalizedItem(item);
 		}
 		const active = plan.workItems.filter((item) => ACTIVE_WORKER_STATUSES.has(item.status));
@@ -139,6 +145,18 @@ export function validatePlan(plan: WorkflowPlan): Effect.Effect<void, Validation
 export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationError> {
 	return Effect.gen(function* () {
 		yield* validatePlan(run.plan);
+		if (["ready", "executing", "completed"].includes(run.phase) && !run.plan.finalized) {
+			return yield* fail(`${run.phase} run must have a finalized plan`, "plan.finalized");
+		}
+		if (run.plan.finalized && run.planning.unresolvedQuestions.length > 0) {
+			return yield* fail("finalized plan cannot have unresolved questions", "planning.unresolvedQuestions");
+		}
+		if (run.planning.unresolvedQuestions.some((question) => !question.trim())) {
+			return yield* fail("unresolved questions must not be empty", "planning.unresolvedQuestions");
+		}
+		if (new Set(run.planning.unresolvedQuestions).size !== run.planning.unresolvedQuestions.length) {
+			return yield* fail("unresolved questions must be unique", "planning.unresolvedQuestions");
+		}
 		const byId = new Map(run.plan.workItems.map((item) => [item.id, item] as const));
 		if (run.activeWorkItemId !== undefined && !byId.has(run.activeWorkItemId)) {
 			return yield* fail("active work-item ID must reference an existing item", "activeWorkItemId");
