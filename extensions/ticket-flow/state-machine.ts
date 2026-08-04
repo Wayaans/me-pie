@@ -161,6 +161,21 @@ export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationErr
 		if (run.activeWorkItemId !== undefined && !byId.has(run.activeWorkItemId)) {
 			return yield* fail("active work-item ID must reference an existing item", "activeWorkItemId");
 		}
+		if (run.requestedLaunchProfile !== undefined) {
+			if (run.activeWorkItemId === undefined) return yield* fail("requested launch profile requires an active work item", "requestedLaunchProfile");
+			const activeItem = byId.get(run.activeWorkItemId);
+			if (activeItem?.launchProfile?.model !== run.requestedLaunchProfile.model
+				|| activeItem.launchProfile.thinking !== run.requestedLaunchProfile.thinking) {
+				return yield* fail("requested launch profile must match the active work item", "requestedLaunchProfile");
+			}
+		}
+		if (run.tmux !== undefined) {
+			if (run.tmux.runId !== run.id) return yield* fail("tmux run ID does not match the run", "tmux.runId");
+			if (run.tmux.workItemId !== run.activeWorkItemId) return yield* fail("tmux handle must match the active work item", "tmux.workItemId");
+			if (!run.tmux.serverSocketPath.startsWith("/") || !/^\$\d+$/.test(run.tmux.sessionId) || !/^@\d+$/.test(run.tmux.windowId) || !/^%\d+$/.test(run.tmux.paneId)) {
+				return yield* fail("tmux handle contains invalid stable IDs", "tmux");
+			}
+		}
 		if (run.worker !== undefined) {
 			if (run.worker.runId !== run.id) return yield* fail("worker run ID does not match the run", "worker.runId");
 			if (!byId.has(run.worker.workItemId)) return yield* fail("worker work-item ID must reference an existing item", "worker.workItemId");
@@ -171,6 +186,9 @@ export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationErr
 		const activeItems = run.plan.workItems.filter((item) => ACTIVE_WORKER_STATUSES.has(item.status));
 		if (activeItems.length === 1 && run.activeWorkItemId !== activeItems[0]?.id) {
 			return yield* fail("active worker state must match the run's active work item", "activeWorkItemId");
+		}
+		if (activeItems.length === 0 && (run.requestedLaunchProfile !== undefined || run.tmux !== undefined)) {
+			return yield* fail("worker launch metadata requires an active work-item state", "activeWorkItemId");
 		}
 	});
 }

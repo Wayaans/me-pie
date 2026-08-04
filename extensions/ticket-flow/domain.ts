@@ -122,6 +122,18 @@ export interface PlanningDetails {
 	readonly restrictedActiveTools?: readonly string[];
 }
 
+export interface TmuxWindowState {
+	readonly runId: string;
+	readonly workItemId: string;
+	readonly serverSocketPath: string;
+	readonly sessionId: string;
+	readonly sessionName: string;
+	readonly windowId: string;
+	readonly paneId: string;
+	readonly displayName: string;
+	readonly socketPath: string;
+}
+
 export interface WorkflowRun {
 	readonly id: string;
 	readonly projectId: string;
@@ -133,6 +145,8 @@ export interface WorkflowRun {
 	readonly plan: WorkflowPlan;
 	readonly planning: PlanningDetails;
 	readonly activeWorkItemId?: string;
+	readonly requestedLaunchProfile?: PiLaunchProfile;
+	readonly tmux?: TmuxWindowState;
 	readonly worker?: WorkerIdentity;
 }
 

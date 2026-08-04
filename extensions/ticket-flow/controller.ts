@@ -9,9 +9,11 @@ import { createRunId } from "./domain.ts";
 import { appendEvent, makeWorkflowEvent, replayEvents } from "./event-store.ts";
 import { acquireProjectLock, type ProjectLock } from "./lock.ts";
 import { pathsForProject, type WorkflowPaths } from "./paths.ts";
-import { normalizePlan, transitionRun, validatePlan } from "./state-machine.ts";
+import { normalizePlan, transitionRun, transitionWorkItem, validatePlan } from "./state-machine.ts";
 import type { PersistenceError, ValidationError } from "./errors.ts";
 import { saveRun } from "./state-store.ts";
+import { workflowRuntimeDirectory } from "./tmux/command.ts";
+import { TmuxController } from "./tmux/controller.ts";
 
 export const WORKFLOW_TOOL_NAMES = [
 	"workflow_plan",
@@ -44,6 +46,7 @@ interface ActiveRun {
 	readonly paths: WorkflowPaths;
 	readonly lock: ProjectLock;
 	readonly scope: Scope.Closeable;
+	workerToken?: string;
 }
 
 function unique(values: readonly string[]): string[] {
@@ -140,10 +143,15 @@ export class WorkflowController {
 		private readonly pi: WorkflowControllerPi,
 		private readonly now: () => Date = () => new Date(),
 		private readonly newRunId: () => string = createRunId,
+		private readonly tmux = new TmuxController(),
 	) {}
 
 	get activeRun(): WorkflowRun | undefined {
 		return this.active?.run;
+	}
+
+	verifyTmux() {
+		return this.tmux.detect();
 	}
 
 	private persist(
@@ -263,6 +271,112 @@ export class WorkflowController {
 		});
 	}
 
+	startWorker(workItemId: string) {
+		return Effect.gen({ self: this }, function* () {
+			const active = yield* this.requireRun();
+			if (!active.plan.finalized || (active.phase !== "ready" && active.phase !== "executing")) {
+				return yield* Effect.fail(new Error("A worker can start only after the Ticket Flow plan is finalized."));
+			}
+			if (active.tmux !== undefined) {
+				if (active.tmux.workItemId === workItemId) return active;
+				return yield* Effect.fail(new Error(`Work item ${active.activeWorkItemId} already owns the active worker.`));
+			}
+			const item = active.plan.workItems.find((candidate) => candidate.id === workItemId);
+			if (!item) return yield* Effect.fail(new Error(`Unknown work item: ${workItemId}`));
+			if (item.dependsOn.some((dependencyId) => active.plan.workItems.find((candidate) => candidate.id === dependencyId)?.status !== "completed")) {
+				return yield* Effect.fail(new Error(`Work item ${workItemId} has incomplete dependencies.`));
+			}
+			if (!item.launchProfile?.model || !item.launchProfile.thinking) {
+				return yield* Effect.fail(new Error(`Work item ${workItemId} has no complete launch profile.`));
+			}
+			let status = item.status;
+			if (status === "planned" || status === "interrupted") status = yield* transitionWorkItem(status, "ready");
+			if (status !== "ready") return yield* Effect.fail(new Error(`Work item ${workItemId} cannot start while ${status}.`));
+			status = yield* transitionWorkItem(status, "spawning");
+			const phase = active.phase === "ready" ? yield* transitionRun(active.phase, "executing") : active.phase;
+			const spawningItem = { ...item, status };
+			const spawning: WorkflowRun = {
+				...active,
+				phase,
+				updatedAt: this.now().toISOString(),
+				activeWorkItemId: workItemId,
+				requestedLaunchProfile: { model: item.launchProfile.model, thinking: item.launchProfile.thinking },
+				plan: { ...active.plan, workItems: active.plan.workItems.map((candidate) => candidate.id === workItemId ? spawningItem : candidate) },
+			};
+			yield* this.persist(spawning, "worker-spawning", { workItemId, requestedLaunchProfile: spawning.requestedLaunchProfile });
+			const activeState = this.active!;
+			activeState.workerToken = crypto.randomUUID();
+			const socketPath = `${workflowRuntimeDirectory(active.id)}/workflow.sock`;
+			const handle = yield* this.tmux.createWorkerWindow({
+				runId: active.id,
+				workItemId,
+				title: item.title,
+				order: item.order,
+				cwd: active.projectPath,
+				profile: spawning.requestedLaunchProfile!,
+				socketPath,
+				token: activeState.workerToken,
+			}).pipe(Effect.catch((cause) => Effect.gen({ self: this }, function* () {
+				const failedItem = { ...spawningItem, status: yield* transitionWorkItem("spawning", "failed") };
+				const { activeWorkItemId: _activeWorkItemId, requestedLaunchProfile: _requestedLaunchProfile, ...failedBase } = spawning;
+				const failed: WorkflowRun = {
+					...failedBase,
+					updatedAt: this.now().toISOString(),
+					plan: { ...spawning.plan, workItems: spawning.plan.workItems.map((candidate) => candidate.id === workItemId ? failedItem : candidate) },
+				};
+				delete activeState.workerToken;
+				yield* this.persist(failed, "worker-start-failed", { workItemId, message: errorMessage(cause) });
+				return yield* Effect.fail(cause);
+			})));
+			const verifyingItem = { ...spawningItem, status: yield* transitionWorkItem("spawning", "verifying-worker") };
+			const verifying: WorkflowRun = {
+				...spawning,
+				updatedAt: this.now().toISOString(),
+				tmux: handle,
+				plan: { ...spawning.plan, workItems: spawning.plan.workItems.map((candidate) => candidate.id === workItemId ? verifyingItem : candidate) },
+			};
+			return yield* this.persist(verifying, "worker-window-created", { workItemId, handle }).pipe(
+				Effect.onError(() => this.tmux.closeWindow(handle, true).pipe(Effect.catch(() => Effect.void))),
+			);
+		});
+	}
+
+	readWorker(workItemId: string, lines = 200) {
+		return Effect.gen({ self: this }, function* () {
+			const active = yield* this.requireRun();
+			if (active.activeWorkItemId !== workItemId || active.tmux?.workItemId !== workItemId) {
+				return yield* Effect.fail(new Error(`Work item ${workItemId} does not own the active tmux window.`));
+			}
+			return boundStatusOutput(yield* this.tmux.capturePane(active.tmux, lines));
+		});
+	}
+
+	closeWorker(workItemId: string, force = false) {
+		return Effect.gen({ self: this }, function* () {
+			const active = yield* this.requireRun();
+			if (active.activeWorkItemId !== workItemId || active.tmux?.workItemId !== workItemId) {
+				return yield* Effect.fail(new Error(`Work item ${workItemId} does not own the active tmux window.`));
+			}
+			const closeResult = yield* this.tmux.closeWindow(active.tmux, force);
+			const currentItem = active.plan.workItems.find((item) => item.id === workItemId)!;
+			const status = currentItem.status === "interrupted" ? currentItem.status : yield* transitionWorkItem(currentItem.status, "interrupted");
+			const {
+				activeWorkItemId: _activeWorkItemId,
+				requestedLaunchProfile: _requestedLaunchProfile,
+				tmux: _tmux,
+				...nextBase
+			} = active;
+			const next: WorkflowRun = {
+				...nextBase,
+				updatedAt: this.now().toISOString(),
+				plan: { ...active.plan, workItems: active.plan.workItems.map((item) => item.id === workItemId ? { ...item, status } : item) },
+			};
+			if (this.active) delete this.active.workerToken;
+			const run = yield* this.persist(next, "worker-window-closed", { workItemId, ...closeResult });
+			return { run, closeResult };
+		});
+	}
+
 	finalizePlan() {
 		return Effect.gen({ self: this }, function* () {
 			const active = yield* this.requirePlanningRun();
@@ -302,6 +416,9 @@ export class WorkflowController {
 				: Effect.fail(new Error("No active Ticket Flow run."));
 		}
 		return Effect.gen({ self: this }, function* () {
+			if (activeState.run.tmux && activeState.run.activeWorkItemId) {
+				yield* this.closeWorker(activeState.run.activeWorkItemId).pipe(Effect.catch(() => this.closeWorker(activeState.run.activeWorkItemId!, true)));
+			}
 			const phase = yield* transitionRun(activeState.run.phase, "stopped");
 			const stopped = yield* this.persist(
 				{ ...activeState.run, phase, updatedAt: this.now().toISOString() },
@@ -315,7 +432,14 @@ export class WorkflowController {
 
 	shutdown() {
 		const activeState = this.active;
-		return activeState ? this.release(activeState) : Effect.void;
+		if (!activeState) return Effect.void;
+		const close = activeState.run.tmux && activeState.run.activeWorkItemId
+			? this.tmux.closeWindow(activeState.run.tmux).pipe(
+				Effect.catch(() => this.tmux.closeWindow(activeState.run.tmux!, true)),
+				Effect.catch(() => Effect.void),
+			)
+			: Effect.void;
+		return close.pipe(Effect.ensuring(this.release(activeState)));
 	}
 
 	status() {

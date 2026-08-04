@@ -24,6 +24,7 @@ import {
 	registerOrchestratorTools,
 } from "../ticket-flow/orchestrator/tools.ts";
 import { detectWorkflowRole } from "../ticket-flow/role.ts";
+import { TmuxController } from "../ticket-flow/tmux/controller.ts";
 
 function runEffect<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
 	return Effect.runPromise(effect);
@@ -88,6 +89,7 @@ test("role detection selects worker only for the exact worker value", () => {
 	assert.equal(detectWorkflowRole({ MEPIE_WORKFLOW_ROLE: "worker" }), "worker");
 	assert.equal(detectWorkflowRole({ MEPIE_WORKFLOW_ROLE: "orchestrator" }), "orchestrator");
 	assert.equal(detectWorkflowRole({}), "orchestrator");
+	assert.throws(() => detectWorkflowRole({ MEPIE_WORKFLOW_ROLE: "unexpected" }), /Unsupported/);
 });
 
 test("run creation persists the prompt, acquires the lock, and restricts tools", async () => {
@@ -197,6 +199,9 @@ test("workflow tools dispatch legal actions and reject unavailable runtimes", as
 		status: () => Effect.succeed("status"),
 		pause: () => Effect.sync(() => { calls.push("pause"); return { ...run, phase: "paused" as const }; }),
 		stop: () => Effect.sync(() => { calls.push("stop"); return { ...run, phase: "stopped" as const }; }),
+		startWorker: () => Effect.sync(() => { calls.push("startWorker"); return { ...run, phase: "executing" as const }; }),
+		readWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
+		closeWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
 	};
 	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: Record<string, unknown>) => Promise<unknown> };
 	const tools = new Map<string, CapturedTool>();
@@ -208,9 +213,13 @@ test("workflow tools dispatch legal actions and reject unavailable runtimes", as
 	await tools.get("workflow_plan")?.execute("id", { action: "finalize" });
 	await tools.get("workflow_control")?.execute("id", { action: "pause" });
 	await tools.get("workflow_control")?.execute("id", { action: "stop" });
-	assert.deepEqual(calls, ["save", "update", "finalize", "pause", "stop"]);
-	for (const action of ["delegate", "wait", "read", "send", "close"]) {
+	assert.deepEqual(calls, ["save", "update", "finalize", "startWorker", "pause", "stop"]);
+	await tools.get("workflow_worker")!.execute("id", { action: "delegate", workItemId: "domain" });
+	for (const action of ["read", "close"]) {
 		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain" }), /Stage 3/);
+	}
+	for (const action of ["wait", "send"]) {
+		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain" }), /Stage 4/);
 	}
 	for (const action of ["inspect", "accept", "revise", "block"]) {
 		await assert.rejects(tools.get("workflow_review_report")!.execute("id", { action, workItemId: "domain" }), /No worker report/);
@@ -259,7 +268,16 @@ test("system-prompt injection is active only while a command-created run exists"
 			appendEntry: () => undefined,
 			sendUserMessage: (message: string) => { sent.push(message); },
 		};
-		ticketFlow(fake as unknown as ExtensionAPI);
+		const tmuxResponses = [
+			{ stdout: "tmux 3.7\n", stderr: "", code: 0 },
+			{ stdout: "/tmp/tmux.sock\t$1\tmain\t%1\n", stderr: "", code: 0 },
+		];
+		const tmux = new TmuxController({
+			runner: { run: async () => tmuxResponses.shift()! },
+			environment: { TMUX: "present" },
+			tmuxExecutable: "/bin/tmux",
+		});
+		ticketFlow(fake as unknown as ExtensionAPI, { tmux });
 		const before = handlers.get("before_agent_start");
 		assert.equal(before?.({ systemPrompt: "base" }, {}), undefined);
 		const project = temporaryDirectory("ticket-flow-stage2-integration-project-");

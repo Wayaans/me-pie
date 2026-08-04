@@ -2,7 +2,7 @@ import { Effect, Schema } from "effect";
 import type { WorkflowPlan, WorkflowRun } from "./domain.ts";
 import { CorruptDataError, UnsupportedVersionError } from "./errors.ts";
 
-export const SCHEMA_VERSION = 2 as const;
+export const SCHEMA_VERSION = 3 as const;
 
 const ThinkingLevelSchema = Schema.Literals(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const RunPhaseSchema = Schema.Literals([
@@ -78,6 +78,18 @@ export const WorkerReportSchema = Schema.Struct({
 	questions: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+export const TmuxWindowStateSchema = Schema.Struct({
+	runId: Schema.String,
+	workItemId: Schema.String,
+	serverSocketPath: Schema.String,
+	sessionId: Schema.String,
+	sessionName: Schema.String,
+	windowId: Schema.String,
+	paneId: Schema.String,
+	displayName: Schema.String,
+	socketPath: Schema.String,
+});
+
 export const WorkerIdentitySchema = Schema.Struct({
 	runId: Schema.String,
 	workItemId: Schema.String,
@@ -114,6 +126,8 @@ export const WorkflowRunSchema = Schema.Struct({
 	plan: WorkflowPlanSchema,
 	planning: PlanningDetailsSchema,
 	activeWorkItemId: Schema.optionalKey(Schema.String),
+	requestedLaunchProfile: Schema.optionalKey(Schema.Struct({ model: Schema.String, thinking: ThinkingLevelSchema })),
+	tmux: Schema.optionalKey(TmuxWindowStateSchema),
 	worker: Schema.optionalKey(WorkerIdentitySchema),
 });
 

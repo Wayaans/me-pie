@@ -135,8 +135,15 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 					if (params.plan !== undefined || params.changes !== undefined || params.unresolvedQuestions !== undefined) {
 						throw new Error("workflow_plan finalize does not accept plan data or changes.");
 					}
-					const run = await runController(controller.finalizePlan(), signal);
-					return result(`Plan finalized and ready with ${run.plan.workItems.length} item(s). Worker execution is pending Stage 3.`, run);
+					const ready = await runController(controller.finalizePlan(), signal);
+					const first = ready.plan.workItems.find((item) =>
+						(item.status === "planned" || item.status === "ready" || item.status === "interrupted")
+						&& item.dependsOn.every((dependencyId) => ready.plan.workItems.find((candidate) => candidate.id === dependencyId)?.status === "completed")
+					);
+					const run = first === undefined
+						? ready
+						: await runController(controller.startWorker(first.id), signal);
+					return result(`Plan finalized with ${run.plan.workItems.length} item(s) and the first eligible Pi worker started.`, run);
 				}
 			}
 		},
@@ -145,22 +152,40 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 	pi.registerTool({
 		name: "workflow_worker",
 		label: "Workflow Worker",
-		description: "Control the workflow-owned worker. Registered in Stage 2; runtime actions become available in Stage 3.",
+		description: "Start, inspect, or close the workflow-owned tmux worker. Stage 3 starts Pi but never sends the delegation prompt.",
 		parameters: WorkflowWorkerParameters,
 		executionMode: "sequential",
-		async execute() {
-			throw new Error("workflow_worker is not available before the Stage 3 worker runtime.");
+		async execute(_toolCallId, params, signal) {
+			switch (params.action) {
+				case "delegate": {
+					if (params.message !== undefined) throw new Error("Stage 3 cannot send delegation text before native worker verification.");
+					const run = await runController(controller.startWorker(params.workItemId), signal);
+					return result(`Started Pi for ${params.workItemId}; waiting for Stage 4 native verification before delegation.`, run);
+				}
+				case "read": {
+					const output = await runController(controller.readWorker(params.workItemId, params.lines), signal);
+					return result(output, controller.activeRun);
+				}
+				case "close": {
+					const closed = await runController(controller.closeWorker(params.workItemId), signal);
+					return result(`Closed the workflow-owned worker${closed.closeResult.forced ? " forcibly" : " gracefully"}.`, closed.run);
+				}
+				case "wait":
+					throw new Error("Native worker events are not available before Stage 4.");
+				case "send":
+					throw new Error("Messages cannot be sent before Stage 4 native worker verification.");
+			}
 		},
 	});
 
 	pi.registerTool({
 		name: "workflow_review_report",
 		label: "Workflow Review Report",
-		description: "Inspect or review a worker report. Reports are unavailable during Stage 2 planning.",
+		description: "Inspect or review a worker report. Native reports become available in Stage 5.",
 		parameters: WorkflowReviewReportParameters,
 		executionMode: "sequential",
 		async execute() {
-			throw new Error("No worker report exists for this planning-only run.");
+			throw new Error("No worker report exists before Stage 5 native reporting.");
 		},
 	});
 

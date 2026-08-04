@@ -6,6 +6,8 @@ import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts"
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
 import { detectWorkflowRole, isTicketFlowInvocation } from "./role.ts";
 import type { WorkflowRun } from "./domain.ts";
+import { prepareWorkerLifecycle, type WorkerLifecycle } from "./worker/lifecycle.ts";
+import { TmuxController } from "./tmux/controller.ts";
 
 export function workflowFooterStatus(run: WorkflowRun): string {
 	if (run.phase === "ready") return `ticket-flow · ready · ${run.plan.workItems.length} items`;
@@ -24,18 +26,31 @@ function notifyError(ctx: ExtensionContext, error: unknown): void {
 	ctx.ui.notify(message, "error");
 }
 
-export default function ticketFlow(pi: ExtensionAPI): void {
+export interface TicketFlowExtensionOptions {
+	readonly tmux?: TmuxController;
+}
+
+export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensionOptions = {}): void {
 	const role = detectWorkflowRole();
 	if (role === "worker") {
+		let lifecycle: WorkerLifecycle | undefined;
+		pi.on("session_start", async () => {
+			lifecycle = await Effect.runPromise(prepareWorkerLifecycle());
+			await Effect.runPromise(lifecycle.start());
+		});
 		pi.on("input", (event, ctx) => {
 			if (!isTicketFlowInvocation(event.text)) return;
 			if (ctx.hasUI) ctx.ui.notify("A Ticket Flow worker cannot start a nested workflow.", "error");
 			return { action: "handled" as const };
 		});
+		pi.on("session_shutdown", async () => {
+			if (!lifecycle) return;
+			await Effect.runPromise(lifecycle.shutdown());
+		});
 		return;
 	}
 
-	const controller = new WorkflowController(pi);
+	const controller = new WorkflowController(pi, undefined, undefined, options.tmux);
 	registerOrchestratorTools(pi, controller);
 
 	pi.registerCommand("ticket-flow", {
@@ -44,6 +59,7 @@ export default function ticketFlow(pi: ExtensionAPI): void {
 			try {
 				const command = parseTicketFlowCommand(args);
 				assertCommandPrerequisites({ mode: ctx.mode, tmux: process.env.TMUX });
+				await Effect.runPromise(controller.verifyTmux(), { signal: ctx.signal });
 				const run = await Effect.runPromise(controller.startRun({
 					cwd: ctx.cwd,
 					prompt: command.prompt,
