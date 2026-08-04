@@ -1296,13 +1296,13 @@ export class WorkflowController {
 		return this.serialize(Effect.gen({ self: this }, function* () {
 			const activeState = this.active;
 			if (!activeState) return;
-			// A session reload or orchestrator exit detaches only local resources.
-			// The worker, token, tmux window, durable state, and lock remain intact
-			// for authenticated recovery by this session or a proven stale takeover.
+			// A session reload or orchestrator exit preserves the worker, token,
+			// tmux window, and durable state while releasing local listeners, fibers,
+			// tool restrictions, and the verified project-lock lease.
 			yield* activeState.protocol?.shutdown() ?? Effect.void;
 			delete activeState.protocol;
 			delete activeState.workerToken;
-			this.detach(activeState);
+			yield* this.release(activeState);
 		}));
 	}
 
