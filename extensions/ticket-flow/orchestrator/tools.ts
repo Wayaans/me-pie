@@ -152,15 +152,15 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 	pi.registerTool({
 		name: "workflow_worker",
 		label: "Workflow Worker",
-		description: "Start, inspect, or close the workflow-owned tmux worker. Stage 3 starts Pi but never sends the delegation prompt.",
+		description: "Start, wait for, inspect, send feedback to, or close the authenticated workflow-owned Pi worker.",
 		parameters: WorkflowWorkerParameters,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal) {
 			switch (params.action) {
 				case "delegate": {
-					if (params.message !== undefined) throw new Error("Stage 3 cannot send delegation text before native worker verification.");
+					if (params.message !== undefined) throw new Error("workflow_worker delegate uses the planned delegation prompt; use send for feedback.");
 					const run = await runController(controller.startWorker(params.workItemId), signal);
-					return result(`Started Pi for ${params.workItemId}; waiting for Stage 4 native verification before delegation.`, run);
+					return result(`Started Pi for ${params.workItemId}; its planned delegation is delivered natively only after exact profile verification.`, run);
 				}
 				case "read": {
 					const output = await runController(controller.readWorker(params.workItemId, params.lines), signal);
@@ -170,10 +170,16 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 					const closed = await runController(controller.closeWorker(params.workItemId), signal);
 					return result(`Closed the workflow-owned worker${closed.closeResult.forced ? " forcibly" : " gracefully"}.`, closed.run);
 				}
-				case "wait":
-					throw new Error("Native worker events are not available before Stage 4.");
-				case "send":
-					throw new Error("Messages cannot be sent before Stage 4 native worker verification.");
+				case "wait": {
+					if (params.message !== undefined || params.lines !== undefined) throw new Error("workflow_worker wait does not accept message or lines.");
+					const output = await runController(controller.waitWorker(params.workItemId, params.until, signal, params.timeoutMs), signal);
+					return result(output, controller.activeRun);
+				}
+				case "send": {
+					if (params.until !== undefined || params.lines !== undefined) throw new Error("workflow_worker send accepts only feedback text.");
+					const run = await runController(controller.sendWorkerFeedback(params.workItemId, requireOnly(params.message, "message"), signal), signal);
+					return result("Sent native feedback to the verified worker Pi session.", run);
+				}
 			}
 		},
 	});

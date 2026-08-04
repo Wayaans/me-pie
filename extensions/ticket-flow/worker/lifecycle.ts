@@ -1,6 +1,8 @@
 import path from "node:path";
 import { Data, Effect } from "effect";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { THINKING_LEVELS, type PiLaunchProfile } from "../domain.ts";
+import { workerIdentityFromContext, WorkerProtocolRuntime } from "../protocol/runtime.ts";
 
 export interface WorkerStartupEnvironment {
 	readonly runId: string;
@@ -52,44 +54,49 @@ export function readWorkerEnvironment(environment: NodeJS.ProcessEnv = process.e
 	if (!path.isAbsolute(socketPath)) {
 		throw new WorkerEnvironmentError({ variable: "MEPIE_WORKFLOW_SOCKET", message: "The workflow socket path must be absolute." });
 	}
-	return {
-		runId,
-		workItemId,
-		requestedProfile: { model, thinking: thinking as PiLaunchProfile["thinking"] },
-		socketPath,
-		token,
-	};
+	return { runId, workItemId, requestedProfile: { model, thinking: thinking as PiLaunchProfile["thinking"] }, socketPath, token };
 }
 
 export class WorkerLifecycle {
 	private started = false;
 	private released = false;
+	private readonly runtime = new WorkerProtocolRuntime();
 
 	constructor(readonly environment: WorkerStartupEnvironment) {}
 
-	start(): Effect.Effect<this, WorkerLifecycleError> {
+	start(pi?: ExtensionAPI, context?: ExtensionContext): Effect.Effect<this, WorkerLifecycleError> {
 		if (this.released) return Effect.fail(new WorkerLifecycleError({ message: "A released Ticket Flow worker lifecycle cannot be restarted." }));
-		return Effect.sync(() => {
-			this.started = true;
-			return this;
+		const configured = Effect.try({
+			try: () => pi && context
+				? workerIdentityFromContext(context, this.environment.runId, this.environment.workItemId)
+				: undefined,
+			catch: (cause) => new WorkerLifecycleError({ message: cause instanceof Error ? cause.message : String(cause) }),
 		});
+		return configured.pipe(
+			Effect.flatMap((identity) => identity && pi && context
+				? this.runtime.start({
+					socketPath: this.environment.socketPath,
+					identity,
+					token: this.environment.token,
+					onDelegate: (prompt) => pi.sendUserMessage(prompt, context.isIdle() ? undefined : { deliverAs: "followUp" }),
+					onFeedback: (message) => pi.sendUserMessage(message, context.isIdle() ? undefined : { deliverAs: "followUp" }),
+					onShutdown: () => context.shutdown(),
+				})
+				: Effect.void),
+			Effect.as(this),
+			Effect.tap(() => Effect.sync(() => { this.started = true; })),
+		);
 	}
 
-	shutdown() {
-		return Effect.sync(() => {
-			if (this.released) return;
+	shutdown(): Effect.Effect<void> {
+		return this.runtime.shutdown().pipe(Effect.ensuring(Effect.sync(() => {
 			this.released = true;
 			this.started = false;
-		});
+		})));
 	}
 
-	get isStarted(): boolean {
-		return this.started;
-	}
-
-	get isReleased(): boolean {
-		return this.released;
-	}
+	get isStarted(): boolean { return this.started; }
+	get isReleased(): boolean { return this.released; }
 }
 
 export function prepareWorkerLifecycle(environment: NodeJS.ProcessEnv = process.env) {

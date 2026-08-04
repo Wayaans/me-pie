@@ -34,18 +34,18 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	const role = detectWorkflowRole();
 	if (role === "worker") {
 		let lifecycle: WorkerLifecycle | undefined;
-		pi.on("session_start", async () => {
-			lifecycle = await Effect.runPromise(prepareWorkerLifecycle());
-			await Effect.runPromise(lifecycle.start());
+		pi.on("session_start", async (_event, ctx) => {
+			lifecycle = await Effect.runPromise(prepareWorkerLifecycle(), { signal: ctx.signal });
+			await Effect.runPromise(lifecycle.start(pi, ctx), { signal: ctx.signal });
 		});
 		pi.on("input", (event, ctx) => {
 			if (!isTicketFlowInvocation(event.text)) return;
 			if (ctx.hasUI) ctx.ui.notify("A Ticket Flow worker cannot start a nested workflow.", "error");
 			return { action: "handled" as const };
 		});
-		pi.on("session_shutdown", async () => {
+		pi.on("session_shutdown", async (_event, ctx) => {
 			if (!lifecycle) return;
-			await Effect.runPromise(lifecycle.shutdown());
+			await Effect.runPromise(lifecycle.shutdown(), { signal: ctx.signal });
 		});
 		return;
 	}

@@ -122,6 +122,13 @@ export interface PlanningDetails {
 	readonly restrictedActiveTools?: readonly string[];
 }
 
+export interface ProtocolCommandState {
+	readonly type: "delegate" | "feedback" | "shutdown";
+	readonly requestId: string;
+	readonly messageId: string;
+	readonly acknowledged: boolean;
+}
+
 export interface TmuxWindowState {
 	readonly runId: string;
 	readonly workItemId: string;
@@ -146,6 +153,10 @@ export interface WorkflowRun {
 	readonly planning: PlanningDetails;
 	readonly activeWorkItemId?: string;
 	readonly requestedLaunchProfile?: PiLaunchProfile;
+	/** Intended native protocol path; never a project-local path. */
+	readonly workflowSocketPath?: string;
+	/** Safe delivery IDs only; prompts and connection tokens are never persisted here. */
+	readonly protocolCommands?: readonly ProtocolCommandState[];
 	readonly tmux?: TmuxWindowState;
 	readonly worker?: WorkerIdentity;
 }

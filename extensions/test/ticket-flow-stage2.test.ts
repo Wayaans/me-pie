@@ -202,6 +202,8 @@ test("workflow tools dispatch legal actions and reject unavailable runtimes", as
 		startWorker: () => Effect.sync(() => { calls.push("startWorker"); return { ...run, phase: "executing" as const }; }),
 		readWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
 		closeWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
+		waitWorker: () => Effect.fail(new Error("Stage 4 fake runtime unavailable")),
+		sendWorkerFeedback: () => Effect.fail(new Error("Stage 4 fake runtime unavailable")),
 	};
 	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: Record<string, unknown>) => Promise<unknown> };
 	const tools = new Map<string, CapturedTool>();
@@ -218,8 +220,8 @@ test("workflow tools dispatch legal actions and reject unavailable runtimes", as
 	for (const action of ["read", "close"]) {
 		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain" }), /Stage 3/);
 	}
-	for (const action of ["wait", "send"]) {
-		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain" }), /Stage 4/);
+	for (const action of ["wait", "send"] as const) {
+		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain", ...(action === "send" ? { message: "feedback" } : {}) }), /Stage 4/);
 	}
 	for (const action of ["inspect", "accept", "revise", "block"]) {
 		await assert.rejects(tools.get("workflow_review_report")!.execute("id", { action, workItemId: "domain" }), /No worker report/);

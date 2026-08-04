@@ -1,5 +1,7 @@
 # Stage 4: Native protocol
 
+**Status: Complete**
+
 ## Objective
 
 Connect the orchestrator and worker extensions through an authenticated local Unix socket, verify worker identity and launch profile, and deliver prompts and feedback through Pi APIs rather than tmux input.

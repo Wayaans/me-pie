@@ -127,6 +127,13 @@ export const WorkflowRunSchema = Schema.Struct({
 	planning: PlanningDetailsSchema,
 	activeWorkItemId: Schema.optionalKey(Schema.String),
 	requestedLaunchProfile: Schema.optionalKey(Schema.Struct({ model: Schema.String, thinking: ThinkingLevelSchema })),
+	workflowSocketPath: Schema.optionalKey(Schema.String),
+	protocolCommands: Schema.optionalKey(Schema.Array(Schema.Struct({
+		type: Schema.Literals(["delegate", "feedback", "shutdown"]),
+		requestId: Schema.String,
+		messageId: Schema.String,
+		acknowledged: Schema.Boolean,
+	}))),
 	tmux: Schema.optionalKey(TmuxWindowStateSchema),
 	worker: Schema.optionalKey(WorkerIdentitySchema),
 });

@@ -169,6 +169,12 @@ export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationErr
 				return yield* fail("requested launch profile must match the active work item", "requestedLaunchProfile");
 			}
 		}
+		if (run.workflowSocketPath !== undefined) {
+			if (!run.workflowSocketPath.startsWith("/") || run.workflowSocketPath.startsWith(`${run.projectPath}/`)) {
+				return yield* fail("workflow socket path must be absolute and outside the project", "workflowSocketPath");
+			}
+			if (run.activeWorkItemId === undefined) return yield* fail("workflow socket path requires an active work item", "workflowSocketPath");
+		}
 		if (run.tmux !== undefined) {
 			if (run.tmux.runId !== run.id) return yield* fail("tmux run ID does not match the run", "tmux.runId");
 			if (run.tmux.workItemId !== run.activeWorkItemId) return yield* fail("tmux handle must match the active work item", "tmux.workItemId");
@@ -187,7 +193,7 @@ export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationErr
 		if (activeItems.length === 1 && run.activeWorkItemId !== activeItems[0]?.id) {
 			return yield* fail("active worker state must match the run's active work item", "activeWorkItemId");
 		}
-		if (activeItems.length === 0 && (run.requestedLaunchProfile !== undefined || run.tmux !== undefined)) {
+		if (activeItems.length === 0 && (run.requestedLaunchProfile !== undefined || run.workflowSocketPath !== undefined || run.tmux !== undefined)) {
 			return yield* fail("worker launch metadata requires an active work-item state", "activeWorkItemId");
 		}
 	});
