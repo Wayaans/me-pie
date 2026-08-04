@@ -27,3 +27,5 @@ export function assertCommandPrerequisites(input: CommandPrerequisites): void {
 }
 
 export const ORCHESTRATOR_KICKOFF = "Begin Ticket Flow analysis. Interpret the original workflow prompt, read all referenced ticket and specification material, resolve known user questions, save a normalized plan, and finalize it only when every invariant is satisfied.";
+
+export const RECOVERY_KICKOFF = "Ticket Flow recovery is attached. Call workflow_control status, preserve any explicit user pause, and continue only from the reported durable checkpoint using workflow tools.";

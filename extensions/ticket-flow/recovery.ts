@@ -1,6 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { Effect } from "effect";
-import type { WorkflowRun } from "./domain.ts";
+import type { WorkerIdentity, WorkflowRun } from "./domain.ts";
 import { inspectProjectLock, type ProjectLockStatus } from "./lock.ts";
 import { pathsForProject, resolveWorkflowPaths, type WorkflowPaths } from "./paths.ts";
 import { loadRun } from "./state-store.ts";
@@ -82,7 +82,7 @@ function requestedProfileMatches(run: WorkflowRun): boolean {
 export function reconcileRecovery(
 	run: WorkflowRun,
 	tmux: Pick<TmuxController, "inspectWindow">,
-	protocolConnected = false,
+	protocolIdentity?: WorkerIdentity,
 ): Effect.Effect<RecoveryReconciliation> {
 	return Effect.gen(function* () {
 		if (run.phase === "failed") return { kind: "ambiguous", safe: false, message: "Failed runs require an explicit stop or manual plan decision before recovery." } as const;
@@ -120,7 +120,13 @@ export function reconcileRecovery(
 				tmux: inspection,
 			} as const;
 		}
-		if (!protocolConnected) return { kind: "worker-alive-disconnected", safe: true, message: "The verified owned worker is alive and should reconnect to the recreated socket.", tmux: inspection } as const;
+		if (item.status === "completed") return { kind: "safe-to-resume", safe: true, message: "The accepted item can resume its verified tmux close checkpoint.", tmux: inspection } as const;
+		if (!protocolIdentity) return { kind: "worker-alive-disconnected", safe: true, message: "The verified owned worker is alive and should reconnect to the recreated socket.", tmux: inspection } as const;
+		const protocolMatches = protocolIdentity.runId === run.id
+			&& protocolIdentity.workItemId === item.id
+			&& (!run.worker?.sessionId || protocolIdentity.sessionId === run.worker.sessionId)
+			&& (!run.worker?.sessionFile || protocolIdentity.sessionFile === run.worker.sessionFile);
+		if (!protocolMatches) return { kind: "ambiguous", safe: false, message: "Connected worker session identity does not match persisted recovery state.", tmux: inspection } as const;
 		return { kind: "safe-to-resume", safe: true, message: "Tmux ownership and native worker identity are verified.", tmux: inspection } as const;
 	});
 }

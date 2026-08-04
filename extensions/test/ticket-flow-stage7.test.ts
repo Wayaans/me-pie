@@ -9,6 +9,7 @@ import type { WorkItem, WorkerIdentity, WorkflowRun } from "../ticket-flow/domai
 import { replayEvents } from "../ticket-flow/event-store.ts";
 import { inspectProjectLock } from "../ticket-flow/lock.ts";
 import { pathsForProject } from "../ticket-flow/paths.ts";
+import { saveRun } from "../ticket-flow/state-store.ts";
 import { ProtocolClient } from "../ticket-flow/protocol/client.ts";
 import { readWorkflowToken, workflowTokenPath } from "../ticket-flow/protocol/runtime.ts";
 import { reconcileRecovery } from "../ticket-flow/recovery.ts";
@@ -70,6 +71,7 @@ test("recovery reconciliation classifies disconnected, pending-report, profile, 
 	assert.equal((await Effect.runPromise(reconcileRecovery(reconciliationRun("running"), inspect("missing") as never))).kind, "window-missing");
 	assert.equal((await Effect.runPromise(reconcileRecovery(reconciliationRun("running", { worker: { runId: "run", workItemId: "one", provider: "openai-codex", model: "other", thinking: "high" } }), inspect("alive") as never))).kind, "profile-mismatch");
 	assert.equal((await Effect.runPromise(reconcileRecovery(reconciliationRun("running", { protocolCommands: [{ type: "feedback", requestId: "r", messageId: "m", acknowledged: false }] }), inspect("alive") as never))).kind, "ambiguous");
+	assert.equal((await Effect.runPromise(reconcileRecovery(reconciliationRun("running"), inspect("alive") as never, { runId: "run", workItemId: "one", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high", sessionId: "other-session" }))).kind, "ambiguous");
 });
 
 test("orchestrator reload preserves the worker and recovers the same socket without duplicate creation", async () => {
@@ -107,6 +109,21 @@ test("recovery rejects a different Pi worker session even with the correct token
 	await Effect.runPromise(replacement.shutdown()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 
+test("an explicit pause survives reload and reconnect without delivering delegation", async () => {
+	const project = makeTemporaryDirectory("ticket-flow-stage7-user-pause-project-"); const agent = makeTemporaryDirectory("ticket-flow-stage7-user-pause-agent-"); const tmux = new FakeTmux();
+	const { controller, run } = await startExecuting(project, agent, "user-pause-run", tmux);
+	const resolved = await Effect.runPromise(pathsForProject(project, "user-pause-run", agent));
+	await Effect.runPromise(controller.pause()); await Effect.runPromise(controller.shutdown());
+	const replacement = new WorkflowController(makeToolState().pi, undefined, undefined, tmux as never);
+	await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "user-pause-run", sessionId: "session-one" }));
+	const client = new ProtocolClient({ socketPath: run.workflowSocketPath!, identity: { runId: "user-pause-run", workItemId: "one", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high", sessionId: "paused-worker" }, token: await Effect.runPromise(readWorkflowToken(resolved.paths.runDir)), onDelegate: () => undefined, onFeedback: () => undefined, onShutdown: () => undefined });
+	await Effect.runPromise(client.start()); await eventually(() => client.isVerified && replacement.activeRun?.worker?.sessionId === "paused-worker");
+	assert.equal(client.authoritativeContext, undefined); assert.equal(replacement.activeRun?.phase, "paused"); assert.equal(replacement.activeRun?.pauseReason, "user");
+	await Effect.runPromise(replacement.resume()); await eventually(() => client.authoritativeContext !== undefined);
+	assert.equal(replacement.activeRun?.phase, "executing"); assert.equal(tmux.created, 1);
+	await Effect.runPromise(client.shutdown()); await Effect.runPromise(replacement.stop()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
+});
+
 test("pause and resume preserve a connected worker and never spawn a second window", async () => {
 	const project = makeTemporaryDirectory("ticket-flow-stage7-pause-project-"); const agent = makeTemporaryDirectory("ticket-flow-stage7-pause-agent-"); const tmux = new FakeTmux();
 	const { controller, run } = await startExecuting(project, agent, "pause-run", tmux);
@@ -135,11 +152,35 @@ test("a worker exit after report submission preserves report review across later
 	await Effect.runPromise(replacement.stop()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 
+test("an accepted item resumes its durable worker-close checkpoint after recovery", async () => {
+	const project = makeTemporaryDirectory("ticket-flow-stage7-close-project-"); const agent = makeTemporaryDirectory("ticket-flow-stage7-close-agent-"); const tmux = new FakeTmux();
+	const { controller, run } = await startExecuting(project, agent, "close-run", tmux);
+	const resolved = await Effect.runPromise(pathsForProject(project, "close-run", agent));
+	const client = new ProtocolClient({ socketPath: run.workflowSocketPath!, identity: { runId: "close-run", workItemId: "one", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high", sessionId: "close-worker" }, token: await Effect.runPromise(readWorkflowToken(resolved.paths.runDir)), onDelegate: () => undefined, onFeedback: () => undefined, onShutdown: () => undefined, retryDelaysMs: [10] });
+	await Effect.runPromise(client.start()); await eventually(() => controller.activeRun?.plan.workItems[0]?.status === "running");
+	const active = controller.activeRun!;
+	const completedAt = new Date().toISOString();
+	const completed = {
+		...active,
+		progression: { operation: "accept" as const, stage: "worker-closing", workItemId: "one", updatedAt: completedAt },
+		plan: { ...active.plan, workItems: active.plan.workItems.map((candidate) => candidate.id === "one" ? { ...candidate, status: "completed" as const, completion: { acceptedAttempt: 1, acceptedReportPath: path.join(resolved.paths.reportsDir, "one-accepted.json"), comment: "accepted", completedAt, strategy: { type: "ledger-only" as const }, worker: active.worker!, requestedLaunchProfile: profile } } : candidate) },
+	};
+	await Effect.runPromise(saveRun(resolved.paths, completed));
+	(controller as unknown as { active: { run: typeof completed } }).active.run = completed;
+	await Effect.runPromise(controller.shutdown());
+	const replacement = new WorkflowController(makeToolState().pi, undefined, undefined, tmux as never);
+	await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "close-run", sessionId: "session-one" }));
+	await eventually(() => replacement.activeRun === undefined, 4_000);
+	assert.equal(tmux.closed, 1); assert.equal(tmux.created, 1);
+	await Effect.runPromise(client.shutdown()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
+});
+
 test("dead matching owners are taken over and every takeover is recorded", async () => {
 	const project = makeTemporaryDirectory("ticket-flow-stage7-stale-project-"); const agent = makeTemporaryDirectory("ticket-flow-stage7-stale-agent-"); const tmux = new FakeTmux();
 	const { controller } = await startExecuting(project, agent, "stale-run", tmux);
 	const resolved = await Effect.runPromise(pathsForProject(project, "stale-run", agent));
 	const ownerFile = path.join(resolved.paths.rootDir, `${resolved.paths.projectId}.lock`, "owner.json");
+	assert.equal((await Effect.runPromise(inspectProjectLock(resolved.paths.rootDir, resolved.paths.projectId, { runId: "stale-run", expectedOwnerSessionId: "session-one" }))).state, "live", "same PID without current session proof is not adopted");
 	const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8")); fs.writeFileSync(ownerFile, JSON.stringify({ ...owner, pid: 999_999_999 }));
 	const status = await Effect.runPromise(inspectProjectLock(resolved.paths.rootDir, resolved.paths.projectId, { runId: "stale-run", expectedOwnerSessionId: "session-one", liveness: { isAlive: () => false } }));
 	assert.equal(status.state, "stale");

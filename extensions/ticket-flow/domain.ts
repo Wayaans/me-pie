@@ -220,6 +220,7 @@ export interface WorkflowRun {
 	/** Pi session that most recently acquired or recovered orchestration ownership. */
 	readonly orchestratorSessionId?: string;
 	readonly phase: RunPhase;
+	readonly pauseReason?: "user" | "blocker" | "recovery";
 	readonly createdAt: string;
 	readonly updatedAt: string;
 	readonly plan: WorkflowPlan;

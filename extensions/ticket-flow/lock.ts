@@ -97,7 +97,9 @@ export function inspectProjectLock(
 		}
 		const owner = decodeLockOwner(input);
 		if (!owner) return { state: "ambiguous", reason: "The lock owner schema is invalid." } as const;
-		if (owner.pid === process.pid && owner.runId === options.runId && (options.sessionId === undefined || owner.sessionId === options.sessionId)) {
+		if (owner.pid === process.pid && owner.runId === options.runId
+			&& options.sessionId !== undefined && owner.sessionId === options.sessionId
+			&& (options.expectedOwnerSessionId === undefined || owner.sessionId === options.expectedOwnerSessionId)) {
 			return { state: "owned", owner, reason: "This live Pi session already owns the lock." } as const;
 		}
 		const alive = (options.liveness ?? nodeProcessLiveness).isAlive(owner.pid);

@@ -3,6 +3,7 @@ import type {
 	CompletionRecord,
 	PlanChange,
 	PlanningDetails,
+	PiLaunchProfile,
 	ProgressionCheckpoint,
 	WorkflowBlocker,
 	WorkflowPlan,
@@ -408,16 +409,7 @@ export class WorkflowController {
 			yield* writeWorkflowToken(activeState.paths.runDir, activeState.workerToken).pipe(Effect.catch(failProtocolStart));
 			const token = yield* readWorkflowToken(activeState.paths.runDir).pipe(Effect.catch(failProtocolStart));
 			activeState.workerToken = token;
-			const server = new ProtocolServer({
-				socketPath,
-				runId: active.id,
-				workItemId,
-				token,
-				profile: socketRun.requestedLaunchProfile!,
-				onEvent: (event) => Effect.runPromise(this.receiveProtocolEvent(event)),
-				onAcknowledgement: (receipt) => Effect.runPromise(this.acknowledgeProtocolCommand(receipt.requestId)),
-				onRejected: (rejection) => Effect.runPromise(this.rejectProtocolWorker(rejection)),
-			});
+			const server = this.makeProtocolServer(socketPath, active.id, workItemId, token, socketRun.requestedLaunchProfile!);
 			yield* server.start().pipe(Effect.catch(failProtocolStart));
 			yield* Scope.addFinalizer(activeState.scope, server.shutdown());
 			activeState.protocol = server;
@@ -459,22 +451,26 @@ export class WorkflowController {
 		});
 	}
 
+	private makeProtocolServer(socketPath: string, runId: string, workItemId: string, token: string, profile: PiLaunchProfile): ProtocolServer {
+		return new ProtocolServer({
+			socketPath,
+			runId,
+			workItemId,
+			token,
+			profile,
+			onEvent: (event) => Effect.runPromise(this.receiveProtocolEvent(event)),
+			onAcknowledgement: (receipt) => Effect.runPromise(this.acknowledgeProtocolCommand(receipt.requestId)),
+			onRejected: (rejection) => Effect.runPromise(this.rejectProtocolWorker(rejection)),
+		});
+	}
+
 	private startRecoveredProtocol(activeState: ActiveRun) {
 		return Effect.gen({ self: this }, function* () {
 			const run = activeState.run;
 			if (activeState.protocol || !run.activeWorkItemId || !run.requestedLaunchProfile || !run.workflowSocketPath) return;
 			const token = yield* readWorkflowToken(activeState.paths.runDir);
 			activeState.workerToken = token;
-			const server = new ProtocolServer({
-				socketPath: run.workflowSocketPath,
-				runId: run.id,
-				workItemId: run.activeWorkItemId,
-				token,
-				profile: run.requestedLaunchProfile,
-				onEvent: (event) => Effect.runPromise(this.receiveProtocolEvent(event)),
-				onAcknowledgement: (receipt) => Effect.runPromise(this.acknowledgeProtocolCommand(receipt.requestId)),
-				onRejected: (rejection) => Effect.runPromise(this.rejectProtocolWorker(rejection)),
-			});
+			const server = this.makeProtocolServer(run.workflowSocketPath, run.id, run.activeWorkItemId, token, run.requestedLaunchProfile);
 			yield* server.start();
 			yield* Scope.addFinalizer(activeState.scope, server.shutdown());
 			activeState.protocol = server;
@@ -498,6 +494,7 @@ export class WorkflowController {
 			const next: WorkflowRun = {
 				...active,
 				phase: yield* transitionRun(active.phase, "paused"),
+				pauseReason: "recovery",
 				updatedAt: this.now().toISOString(),
 			};
 			yield* this.persist(next, "worker-profile-rejected", {
@@ -552,7 +549,7 @@ export class WorkflowController {
 					|| (active.worker.sessionFile !== undefined && active.worker.sessionFile !== event.identity.sessionFile)
 				)) {
 					const pausedPhase = active.phase === "paused" ? active.phase : yield* transitionRun(active.phase, "paused");
-					yield* this.persist({ ...active, phase: pausedPhase, updatedAt: this.now().toISOString() }, "worker-session-rejected", {
+					yield* this.persist({ ...active, phase: pausedPhase, pauseReason: "recovery", updatedAt: this.now().toISOString() }, "worker-session-rejected", {
 						workItemId: event.identity.workItemId,
 						expectedSessionId: active.worker.sessionId,
 						actualSessionId: event.identity.sessionId,
@@ -565,23 +562,37 @@ export class WorkflowController {
 				const server = this.active?.protocol;
 				if (!server) return yield* Effect.fail(new Error("Native protocol server disappeared before delegation."));
 				if (item.status === "running" || item.status === "report-review" || item.status === "report-pending" || item.status === "report-revision" || item.status === "blocked") {
-					const reconnectedPhase = item.status === "blocked"
+					const shouldResumeRecovery = active.phase === "paused" && active.pauseReason === "recovery";
+					const reconnectedPhase = item.status === "blocked" || (active.phase === "paused" && !shouldResumeRecovery)
 						? "paused" as const
-						: active.phase === "paused" ? yield* transitionRun(active.phase, "executing") : active.phase;
-					yield* this.persist({ ...active, phase: reconnectedPhase, worker: event.identity, updatedAt: this.now().toISOString() }, "worker-reconnected", {
-						workItemId: item.id, messageId: event.messageId, sessionId: event.identity.sessionId,
-					});
-					const pendingDelegate = (active.protocolCommands ?? []).find((command) => command.type === "delegate" && !command.acknowledged);
-					if (pendingDelegate && item.status === "running") {
-						const context = makeAuthoritativeWorkerContext(active, item, event.identity);
+						: shouldResumeRecovery ? yield* transitionRun(active.phase, "executing") : active.phase;
+					const pauseReason = reconnectedPhase === "paused" ? active.pauseReason : undefined;
+					const { pauseReason: _pauseReason, ...activeWithoutPauseReason } = active;
+					const reconnected = yield* this.persist({
+						...activeWithoutPauseReason,
+						phase: reconnectedPhase,
+						...(pauseReason === undefined ? {} : { pauseReason }),
+						worker: event.identity,
+						updatedAt: this.now().toISOString(),
+					}, "worker-reconnected", { workItemId: item.id, messageId: event.messageId, sessionId: event.identity.sessionId });
+					const pendingDelegate = (reconnected.protocolCommands ?? []).find((command) => command.type === "delegate" && !command.acknowledged);
+					if (pendingDelegate && item.status === "running" && reconnected.phase !== "paused") {
+						const context = makeAuthoritativeWorkerContext(reconnected, item, event.identity);
 						server.send("delegate", { prompt: item.delegationPrompt, context, requestId: pendingDelegate.requestId }, pendingDelegate.messageId);
 					}
 					return;
 				}
+				if (active.phase === "paused" && active.pauseReason === "user") {
+					yield* this.persist({ ...active, worker: event.identity, updatedAt: this.now().toISOString() }, "worker-verified-while-paused", {
+						workItemId: item.id, sessionId: event.identity.sessionId,
+					});
+					return;
+				}
 				const delegate = { type: "delegate" as const, requestId: crypto.randomUUID(), messageId: crypto.randomUUID(), acknowledged: false };
 				const running = { ...item, status: yield* transitionWorkItem(item.status, "running") };
+				const { pauseReason: _pauseReason, ...activeWithoutPauseReason } = active;
 				const next: WorkflowRun = {
-					...active,
+					...activeWithoutPauseReason,
 					phase: active.phase === "paused" ? yield* transitionRun(active.phase, "executing") : active.phase,
 					updatedAt: this.now().toISOString(),
 					worker: event.identity,
@@ -654,6 +665,7 @@ export class WorkflowController {
 			const next: WorkflowRun = {
 				...active,
 				phase,
+				...(event.type === "worker-blocked" ? { pauseReason: "blocker" as const } : {}),
 				updatedAt: this.now().toISOString(),
 				...(blocker === undefined ? {} : { blockers: [...(active.blockers ?? []), blocker] }),
 				plan: { ...active.plan, workItems: active.plan.workItems.map((candidate) => candidate.id === item.id ? { ...candidate, status } : candidate) },
@@ -1072,6 +1084,7 @@ export class WorkflowController {
 			return yield* this.persist({
 				...active,
 				phase,
+				pauseReason: "blocker",
 				updatedAt: blocker.reportedAt,
 				progression: checkpoint,
 				...(blockers === undefined ? {} : { blockers }),
@@ -1109,7 +1122,7 @@ export class WorkflowController {
 			const current = yield* this.requireRun();
 			const running = yield* transitionWorkItem(item.status, "running");
 			const phase = current.phase === "paused" ? yield* transitionRun(current.phase, "executing") : current.phase;
-			const { progression: _progression, ...withoutProgression } = current;
+			const { progression: _progression, pauseReason: _pauseReason, ...withoutProgression } = current;
 			return yield* this.persist({
 				...withoutProgression,
 				phase,
@@ -1144,7 +1157,7 @@ export class WorkflowController {
 
 	private recoveryTargetPhase(run: WorkflowRun): WorkflowRun["phase"] {
 		const activeItem = run.activeWorkItemId === undefined ? undefined : run.plan.workItems.find((item) => item.id === run.activeWorkItemId);
-		if (activeItem?.status === "blocked") return "paused";
+		if (run.pauseReason === "user" || activeItem?.status === "blocked") return "paused";
 		if (run.activeWorkItemId) return "executing";
 		if (run.plan.finalized) return "ready";
 		return run.planning.unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing";
@@ -1154,19 +1167,39 @@ export class WorkflowController {
 		return Effect.gen({ self: this }, function* () {
 			let active = yield* this.requireRun();
 			const activeState = this.active!;
-			if (active.activeWorkItemId && reconciliation.tmux?.state === "alive" && !activeState.protocol) {
+			const itemBeforeReconnect = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			if (active.activeWorkItemId && itemBeforeReconnect?.status !== "completed" && reconciliation.tmux?.state === "alive" && !activeState.protocol) {
 				yield* this.startRecoveredProtocol(activeState);
 			}
 			if (reconciliation.kind === "worker-alive-disconnected") {
 				const pausedPhase = active.phase === "paused" ? active.phase : yield* transitionRun(active.phase, "paused");
-				return yield* this.persist({ ...active, phase: pausedPhase, updatedAt: this.now().toISOString() }, "recovery-awaiting-worker", {
+				return yield* this.persist({ ...active, phase: pausedPhase, pauseReason: active.pauseReason ?? "recovery", updatedAt: this.now().toISOString() }, "recovery-awaiting-worker", {
 					message: reconciliation.message,
 				});
 			}
 			const target = this.recoveryTargetPhase(active);
-			const resumed: WorkflowRun = { ...active, phase: yield* transitionRun(active.phase, target), updatedAt: this.now().toISOString() };
+			const { pauseReason: _pauseReason, ...activeWithoutPauseReason } = active;
+			const resumed: WorkflowRun = {
+				...activeWithoutPauseReason,
+				phase: yield* transitionRun(active.phase, target),
+				...(target === "paused" && active.pauseReason !== undefined ? { pauseReason: active.pauseReason } : {}),
+				updatedAt: this.now().toISOString(),
+			};
 			active = yield* this.persist(resumed, "run-resumed", { reconciliation: reconciliation.kind, targetPhase: target });
-			const activeItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			let activeItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			if (activeItem?.status === "verifying-worker" && activeState.protocol?.isVerified && activeState.protocol.identity && active.phase !== "paused") {
+				const delegate = { type: "delegate" as const, requestId: crypto.randomUUID(), messageId: crypto.randomUUID(), acknowledged: false };
+				const running = { ...activeItem, status: yield* transitionWorkItem(activeItem.status, "running") };
+				active = yield* this.persist({
+					...active,
+					updatedAt: this.now().toISOString(),
+					protocolCommands: [...(active.protocolCommands ?? []), delegate],
+					plan: { ...active.plan, workItems: active.plan.workItems.map((item) => item.id === activeItem!.id ? running : item) },
+				}, "worker-delegated-after-resume", { workItemId: activeItem.id, requestId: delegate.requestId });
+				const context = makeAuthoritativeWorkerContext(active, activeItem, activeState.protocol.identity);
+				activeState.protocol.send("delegate", { prompt: activeItem.delegationPrompt, context, requestId: delegate.requestId }, delegate.messageId);
+				activeItem = running;
+			}
 			if (activeItem?.status === "report-pending") {
 				const report = yield* readLatestReportAttempt(activeState.paths, activeItem.id);
 				if (report) {
@@ -1225,12 +1258,12 @@ export class WorkflowController {
 					takeover: recovered.takeover,
 					previousOwnerState: candidate.lock.state,
 				});
-				const reconciliation = yield* reconcileRecovery(recoveredRun, this.tmux, false);
+				const reconciliation = yield* reconcileRecovery(recoveredRun, this.tmux);
 				if (!reconciliation.safe) {
 					const pausedPhase = recoveredRun.phase === "paused" || recoveredRun.phase === "failed"
 						? recoveredRun.phase
 						: yield* transitionRun(recoveredRun.phase, "paused");
-					return yield* this.persist({ ...recoveredRun, phase: pausedPhase, updatedAt: this.now().toISOString() }, "recovery-paused", {
+					return yield* this.persist({ ...recoveredRun, phase: pausedPhase, pauseReason: recoveredRun.pauseReason ?? "recovery", updatedAt: this.now().toISOString() }, "recovery-paused", {
 						kind: reconciliation.kind, message: reconciliation.message,
 					});
 				}
@@ -1245,7 +1278,10 @@ export class WorkflowController {
 			if (active.phase !== "paused") return yield* Effect.fail(new Error("workflow_control resume requires an owned paused run."));
 			const activeItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
 			if (activeItem?.status === "blocked") return yield* Effect.fail(new Error("Resolve the active worker blocker before resuming Ticket Flow."));
-			const reconciliation = yield* reconcileRecovery(active, this.tmux, this.active?.protocol?.isVerified ?? false);
+			const { pauseReason: _pauseReason, ...withoutPauseReason } = active;
+			const explicitlyResuming = yield* this.persist({ ...withoutPauseReason, updatedAt: this.now().toISOString() }, "run-resume-requested", { previousPauseReason: active.pauseReason });
+			const protocol = this.active?.protocol;
+			const reconciliation = yield* reconcileRecovery(explicitlyResuming, this.tmux, protocol?.isVerified ? protocol.identity : undefined);
 			if (!reconciliation.safe) return yield* Effect.fail(new Error(`Recovery is ${reconciliation.kind}: ${reconciliation.message}`));
 			return yield* this.continueRecoveryInternal(reconciliation);
 		}));
@@ -1256,7 +1292,7 @@ export class WorkflowController {
 			const active = yield* this.requireRun();
 			const phase = yield* transitionRun(active.phase, "paused");
 			return yield* this.persist(
-				{ ...active, phase, updatedAt: this.now().toISOString() },
+				{ ...active, phase, pauseReason: "user", updatedAt: this.now().toISOString() },
 				"run-paused",
 				{ from: active.phase },
 			);

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowCommand } from "./command.ts";
+import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowCommand, RECOVERY_KICKOFF } from "./command.ts";
 import { WorkflowController } from "./controller.ts";
 import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts";
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
@@ -91,6 +91,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 					const recovered = await recoverWithConfirmation(controller, ctx);
 					updateStatus(ctx, recovered);
 					pi.appendEntry("ticket-flow-state", { run: recovered });
+					pi.sendUserMessage(RECOVERY_KICKOFF);
 					return;
 				}
 				const run = await Effect.runPromise(controller.startRun({
