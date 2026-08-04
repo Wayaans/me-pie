@@ -13,6 +13,7 @@ import { saveRun } from "../ticket-flow/state-store.ts";
 import { ProtocolClient } from "../ticket-flow/protocol/client.ts";
 import { readWorkflowToken, workflowTokenPath } from "../ticket-flow/protocol/runtime.ts";
 import { reconcileRecovery } from "../ticket-flow/recovery.ts";
+import { resolveRecoveryIssue } from "../ticket-flow/orchestrator/lifecycle.ts";
 import { WorkerReportRuntime } from "../ticket-flow/worker/report.ts";
 
 const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const };
@@ -210,6 +211,17 @@ test("missing and reused windows pause recovery and are never closed", async () 
 		const replacement = new WorkflowController(makeToolState().pi, undefined, undefined, tmux as never);
 		const recovered = await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: `${state}-run`, sessionId: "session-one" }));
 		assert.equal(recovered.phase, "paused"); assert.equal(tmux.created, 1); assert.equal(tmux.closed, 0);
-		await Effect.runPromise(replacement.shutdown()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
+		let prompted = false;
+		const keptPaused = await resolveRecoveryIssue(replacement, recovered, {
+			hasUI: true,
+			signal: undefined,
+			ui: { select: async () => { prompted = true; return `Keep paused: ${recovered.recoveryIssue!.message}`; } },
+		} as never);
+		assert.equal(prompted, true); assert.equal(keptPaused.phase, "paused");
+		const stopped = await Effect.runPromise(replacement.stop());
+		assert.equal(stopped.phase, "stopped"); assert.equal(tmux.closed, 0);
+		const resolved = await Effect.runPromise(pathsForProject(project, `${state}-run`, agent));
+		assert.equal(fs.existsSync(path.join(resolved.paths.rootDir, `${resolved.paths.projectId}.lock`)), false);
+		fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 	}
 });

@@ -156,6 +156,7 @@ export const WorkflowRunSchema = Schema.Struct({
 	orchestratorSessionId: Schema.optionalKey(Schema.String),
 	phase: RunPhaseSchema,
 	pauseReason: Schema.optionalKey(Schema.Literals(["user", "blocker", "recovery"])),
+	recoveryIssue: Schema.optionalKey(Schema.Struct({ kind: Schema.String, message: Schema.String })),
 	createdAt: Schema.String,
 	updatedAt: Schema.String,
 	plan: WorkflowPlanSchema,

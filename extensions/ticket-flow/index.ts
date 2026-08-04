@@ -91,7 +91,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 					const recovered = await recoverWithConfirmation(controller, ctx);
 					updateStatus(ctx, recovered);
 					pi.appendEntry("ticket-flow-state", { run: recovered });
-					pi.sendUserMessage(RECOVERY_KICKOFF);
+					if (recovered.phase !== "stopped") pi.sendUserMessage(RECOVERY_KICKOFF);
 					return;
 				}
 				const run = await Effect.runPromise(controller.startRun({

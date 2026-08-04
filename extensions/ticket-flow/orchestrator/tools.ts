@@ -5,7 +5,7 @@ import { Effect } from "effect";
 import type { WorkflowPlan, WorkflowRun } from "../domain.ts";
 import { THINKING_LEVELS, WORK_ITEM_STATUSES } from "../domain.ts";
 import type { WorkflowController } from "../controller.ts";
-import { confirmActiveWorkerStop, recoverWithConfirmation } from "./lifecycle.ts";
+import { confirmActiveWorkerStop, recoverWithConfirmation, resolveRecoveryIssue } from "./lifecycle.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
@@ -303,12 +303,13 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 					return result("Ticket Flow stopped; the project lock and orchestrator tool restriction were released.", run);
 				}
 				case "resume": {
-					const run = await runController(controller.resume(), signal);
-					return result("Ticket Flow reconciled and resumed without creating a duplicate worker.", run);
+					const resumed = await runController(controller.resume(), signal);
+					const run = await resolveRecoveryIssue(controller, resumed, ctx);
+					return result(run.phase === "paused" ? "Ticket Flow remains paused after reconciliation." : "Ticket Flow reconciled and resumed without creating a duplicate worker.", run);
 				}
 				case "recover": {
 					const run = await recoverWithConfirmation(controller, ctx);
-					return result("Ticket Flow recovered from its last durable checkpoint.", run);
+					return result(run.phase === "paused" ? "Ticket Flow recovery remains paused after user review." : "Ticket Flow recovered from its last durable checkpoint.", run);
 				}
 			}
 		},

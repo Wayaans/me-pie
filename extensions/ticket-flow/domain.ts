@@ -212,6 +212,11 @@ export interface TmuxWindowState {
 	readonly socketPath: string;
 }
 
+export interface RecoveryIssue {
+	readonly kind: string;
+	readonly message: string;
+}
+
 export interface WorkflowRun {
 	readonly id: string;
 	readonly projectId: string;
@@ -221,6 +226,7 @@ export interface WorkflowRun {
 	readonly orchestratorSessionId?: string;
 	readonly phase: RunPhase;
 	readonly pauseReason?: "user" | "blocker" | "recovery";
+	readonly recoveryIssue?: RecoveryIssue;
 	readonly createdAt: string;
 	readonly updatedAt: string;
 	readonly plan: WorkflowPlan;

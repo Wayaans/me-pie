@@ -35,6 +35,20 @@ export async function confirmActiveWorkerStop(controller: WorkflowController, ct
 	);
 }
 
+export async function resolveRecoveryIssue(controller: WorkflowController, run: NonNullable<WorkflowController["activeRun"]>, ctx: ExtensionContext) {
+	if (!run.recoveryIssue) return run;
+	if (!ctx.hasUI) return run;
+	const choice = await ctx.ui.select(
+		"Ticket Flow recovery needs a decision",
+		[
+			`Keep paused: ${run.recoveryIssue.message}`,
+			"Stop safely without closing an unverified tmux window",
+		],
+	);
+	if (choice === "Stop safely without closing an unverified tmux window") return Effect.runPromise(controller.stop(), { signal: ctx.signal });
+	return run;
+}
+
 export async function recoverWithConfirmation(controller: WorkflowController, ctx: ExtensionContext) {
 	const sessionId = ctx.sessionManager.getSessionId();
 	const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, sessionId), { signal: ctx.signal });
@@ -50,10 +64,11 @@ export async function recoverWithConfirmation(controller: WorkflowController, ct
 		);
 		if (!allowAmbiguousTakeover) throw new Error("Ticket Flow recovery was cancelled.");
 	}
-	return Effect.runPromise(controller.recover({
+	const recovered = await Effect.runPromise(controller.recover({
 		cwd: ctx.cwd,
 		runId: candidate.run.id,
 		...(sessionId === undefined ? {} : { sessionId }),
 		...(allowAmbiguousTakeover ? { allowAmbiguousTakeover: true } : {}),
 	}), { signal: ctx.signal });
+	return resolveRecoveryIssue(controller, recovered, ctx);
 }
