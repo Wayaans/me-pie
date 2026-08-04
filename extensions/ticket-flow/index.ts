@@ -62,6 +62,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		});
 		pi.on("session_shutdown", async () => {
 			if (!lifecycle) return;
+			// Shutdown cleanup must finish even when the turn AbortSignal is already aborted.
 			await Effect.runPromise(lifecycle.shutdown());
 		});
 		return;
@@ -82,7 +83,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 				const command = parseTicketFlowCommand(args);
 				assertCommandPrerequisites({ mode: ctx.mode, tmux: process.env.TMUX });
 				await Effect.runPromise(controller.verifyTmux(), { signal: ctx.signal });
-				const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, ctx.sessionManager.getSessionId()));
+				const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, ctx.sessionManager.getSessionId()), { signal: ctx.signal });
 				if (discovery.runs.length > 0) {
 					if (!ctx.hasUI) throw new Error("An unfinished Ticket Flow run exists; use workflow_control recover in an interactive session.");
 					const choice = await ctx.ui.select("Ticket Flow run already exists", ["Recover existing run", "Cancel"]);
@@ -116,6 +117,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		// Detachment is cleanup itself and must not be cancelled by a stale turn signal.
 		await Effect.runPromise(controller.shutdown());
 		updateStatus(ctx, undefined);
 	});

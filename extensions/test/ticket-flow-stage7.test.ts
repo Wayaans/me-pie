@@ -84,10 +84,27 @@ test("orchestrator reload preserves the worker and recovers the same socket with
 	assert.equal(tmux.closed, 0); assert.equal(fs.existsSync(workflowTokenPath(resolved.paths.runDir)), true); assert.equal(fs.existsSync(path.join(resolved.paths.rootDir, `${resolved.paths.projectId}.lock`)), true);
 	const replacement = new WorkflowController(tools().pi, undefined, undefined, tmux as never);
 	const recovered = await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "reload-run", sessionId: "session-one" }));
-	await eventually(() => client.isVerified);
+	assert.equal(recovered.phase, "paused", "recovery waits for an authenticated worker handshake");
+	await eventually(() => client.isVerified && replacement.activeRun?.phase === "executing");
 	assert.equal(recovered.activeWorkItemId, "one"); assert.equal(tmux.created, 1); assert.equal(prompts.length, 1);
 	await Effect.runPromise(client.shutdown()); await Effect.runPromise(replacement.stop());
 	fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
+});
+
+test("recovery rejects a different Pi worker session even with the correct token and profile", async () => {
+	const project = temporary("ticket-flow-stage7-session-project-"); const agent = temporary("ticket-flow-stage7-session-agent-"); const tmux = new FakeTmux();
+	const { controller, run } = await startExecuting(project, agent, "session-run", tmux);
+	const resolved = await Effect.runPromise(pathsForProject(project, "session-run", agent));
+	const token = await Effect.runPromise(readWorkflowToken(resolved.paths.runDir));
+	const original = new ProtocolClient({ socketPath: run.workflowSocketPath!, identity: { runId: "session-run", workItemId: "one", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high", sessionId: "worker-original" }, token, onDelegate: () => undefined, onFeedback: () => undefined, onShutdown: () => undefined });
+	await Effect.runPromise(original.start()); await eventually(() => original.authoritativeContext !== undefined);
+	await Effect.runPromise(original.shutdown()); await Effect.runPromise(controller.shutdown());
+	const replacement = new WorkflowController(tools().pi, undefined, undefined, tmux as never);
+	await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "session-run", sessionId: "session-one" }));
+	const impostor = new ProtocolClient({ socketPath: run.workflowSocketPath!, identity: { runId: "session-run", workItemId: "one", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high", sessionId: "worker-other" }, token, onDelegate: () => undefined, onFeedback: () => undefined, onShutdown: () => undefined, retryDelaysMs: [10] });
+	await Effect.runPromise(impostor.start()); await eventually(() => impostor.isStopped);
+	assert.equal(replacement.activeRun?.phase, "paused"); assert.equal(tmux.created, 1);
+	await Effect.runPromise(replacement.shutdown()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 
 test("pause and resume preserve a connected worker and never spawn a second window", async () => {
@@ -125,7 +142,7 @@ test("dead matching owners are taken over and every takeover is recorded", async
 	const resolved = await Effect.runPromise(pathsForProject(project, "stale-run", agent));
 	const ownerFile = path.join(resolved.paths.rootDir, `${resolved.paths.projectId}.lock`, "owner.json");
 	const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8")); fs.writeFileSync(ownerFile, JSON.stringify({ ...owner, pid: 999_999_999 }));
-	const status = await Effect.runPromise(inspectProjectLock(resolved.paths.rootDir, resolved.paths.projectId, { runId: "stale-run", liveness: { isAlive: () => false } }));
+	const status = await Effect.runPromise(inspectProjectLock(resolved.paths.rootDir, resolved.paths.projectId, { runId: "stale-run", expectedOwnerSessionId: "session-one", liveness: { isAlive: () => false } }));
 	assert.equal(status.state, "stale");
 	const replacement = new WorkflowController(tools().pi, undefined, undefined, tmux as never);
 	await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "stale-run", sessionId: "session-two" }));

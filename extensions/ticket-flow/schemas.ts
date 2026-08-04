@@ -153,6 +153,7 @@ export const WorkflowRunSchema = Schema.Struct({
 	projectId: Schema.String,
 	projectPath: Schema.String,
 	originalPrompt: Schema.String,
+	orchestratorSessionId: Schema.optionalKey(Schema.String),
 	phase: RunPhaseSchema,
 	createdAt: Schema.String,
 	updatedAt: Schema.String,

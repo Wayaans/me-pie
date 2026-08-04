@@ -82,7 +82,7 @@ function decodeLockOwner(input: unknown): LockOwner | undefined {
 export function inspectProjectLock(
 	rootDir: string,
 	projectId: string,
-	options: { readonly runId?: string; readonly sessionId?: string; readonly fs?: LockFileSystem; readonly liveness?: ProcessLiveness } = {},
+	options: { readonly runId?: string; readonly sessionId?: string; readonly expectedOwnerSessionId?: string; readonly fs?: LockFileSystem; readonly liveness?: ProcessLiveness } = {},
 ): Effect.Effect<ProjectLockStatus> {
 	const fs = options.fs ?? nodeLockFileSystem;
 	const lockPath = path.join(rootDir, `${projectId}.lock`);
@@ -105,7 +105,10 @@ export function inspectProjectLock(
 		if (options.runId !== undefined && owner.runId !== options.runId) {
 			return { state: "ambiguous", owner, reason: "The dead lock names a different run." } as const;
 		}
-		return { state: "stale", owner, reason: "The lock owner is dead and its run metadata matches." } as const;
+		if (options.expectedOwnerSessionId === undefined || owner.sessionId !== options.expectedOwnerSessionId) {
+			return { state: "ambiguous", owner, reason: "The dead lock cannot be corroborated by persisted Pi session identity." } as const;
+		}
+		return { state: "stale", owner, reason: "The dead owner matches the persisted run and Pi session identity." } as const;
 	});
 }
 
@@ -211,6 +214,7 @@ export function recoverProjectLock(
 	options: {
 		readonly sessionId?: string;
 		readonly allowAmbiguousTakeover?: boolean;
+		readonly expectedOwnerSessionId?: string;
 		readonly fs?: LockFileSystem;
 		readonly liveness?: ProcessLiveness;
 	} = {},
@@ -222,6 +226,7 @@ export function recoverProjectLock(
 		const status = yield* inspectProjectLock(rootDir, projectId, {
 			runId,
 			...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+			...(options.expectedOwnerSessionId === undefined ? {} : { expectedOwnerSessionId: options.expectedOwnerSessionId }),
 			fs,
 			...(options.liveness === undefined ? {} : { liveness: options.liveness }),
 		});

@@ -199,13 +199,16 @@ test("workflow tools dispatch legal actions and reject unavailable runtimes", as
 		status: () => Effect.succeed("status"),
 		pause: () => Effect.sync(() => { calls.push("pause"); return { ...run, phase: "paused" as const }; }),
 		stop: () => Effect.sync(() => { calls.push("stop"); return { ...run, phase: "stopped" as const }; }),
+		resume: () => Effect.sync(() => { calls.push("resume"); return { ...run, phase: "executing" as const }; }),
+		discover: () => Effect.succeed({ runs: [{ run, paths: {}, lock: { state: "missing" as const } }], invalidRunIds: [] }),
+		recover: () => Effect.sync(() => { calls.push("recover"); return { ...run, phase: "executing" as const }; }),
 		startWorker: () => Effect.sync(() => { calls.push("startWorker"); return { ...run, phase: "executing" as const }; }),
 		readWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
 		closeWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
 		waitWorker: () => Effect.fail(new Error("Stage 4 fake runtime unavailable")),
 		sendWorkerFeedback: () => Effect.fail(new Error("Stage 4 fake runtime unavailable")),
 	};
-	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: Record<string, unknown>) => Promise<unknown> };
+	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, context?: unknown) => Promise<unknown> };
 	const tools = new Map<string, CapturedTool>();
 	registerOrchestratorTools({
 		registerTool: (definition: CapturedTool) => { tools.set(definition.name, definition); },
@@ -226,9 +229,11 @@ test("workflow tools dispatch legal actions and reject unavailable runtimes", as
 	for (const action of ["inspect", "accept", "revise", "block"]) {
 		await assert.rejects(tools.get("workflow_review_report")!.execute("id", { action, workItemId: "domain" }), /No worker report/);
 	}
-	for (const action of ["resume", "recover"]) {
-		await assert.rejects(tools.get("workflow_control")!.execute("id", { action }), /Stage 7/);
-	}
+	await tools.get("workflow_control")!.execute("id", { action: "resume" });
+	await tools.get("workflow_control")!.execute("id", { action: "recover" }, undefined, undefined, {
+		cwd: "/project", hasUI: false, signal: undefined, sessionManager: { getSessionId: () => "session" },
+	});
+	assert.deepEqual(calls.slice(-2), ["resume", "recover"]);
 });
 
 test("status output is bounded by lines and bytes", () => {

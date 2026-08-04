@@ -11,7 +11,7 @@ export async function discoverOrchestratorRecovery(
 		ctx.cwd,
 		undefined,
 		ctx.sessionManager.getSessionId(),
-	));
+	), { signal: ctx.signal });
 	if (ctx.hasUI && discovery.runs.length > 0) {
 		const newest = discovery.runs[0]!;
 		ctx.ui.notify(
@@ -37,7 +37,7 @@ export async function confirmActiveWorkerStop(controller: WorkflowController, ct
 
 export async function recoverWithConfirmation(controller: WorkflowController, ctx: ExtensionContext) {
 	const sessionId = ctx.sessionManager.getSessionId();
-	const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, sessionId));
+	const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, sessionId), { signal: ctx.signal });
 	if (discovery.runs.length === 0) throw new Error("No recoverable Ticket Flow run exists for this project.");
 	if (discovery.runs.length > 1) throw new Error("Multiple unfinished Ticket Flow runs exist; resolve the conflict with /ticket-flow.");
 	const candidate = discovery.runs[0]!;
@@ -55,5 +55,5 @@ export async function recoverWithConfirmation(controller: WorkflowController, ct
 		runId: candidate.run.id,
 		...(sessionId === undefined ? {} : { sessionId }),
 		...(allowAmbiguousTakeover ? { allowAmbiguousTakeover: true } : {}),
-	}));
+	}), { signal: ctx.signal });
 }

@@ -59,11 +59,16 @@ export function discoverUnfinishedRuns(
 			const lock = yield* inspectProjectLock(paths.rootDir, paths.projectId, {
 				runId: loaded.success.id,
 				...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+				...(loaded.success.orchestratorSessionId === undefined ? {} : { expectedOwnerSessionId: loaded.success.orchestratorSessionId }),
 			});
 			runs.push({ run: loaded.success, paths, lock });
 		}
 		return { runs: runs.sort((left, right) => right.run.updatedAt.localeCompare(left.run.updatedAt)), invalidRunIds };
 	});
+}
+
+function hasDurablePendingReport(status: WorkflowRun["plan"]["workItems"][number]["status"]): boolean {
+	return status === "report-review" || status === "report-pending" || status === "completed";
 }
 
 function requestedProfileMatches(run: WorkflowRun): boolean {
@@ -101,17 +106,19 @@ export function reconcileRecovery(
 		const inspection = yield* tmux.inspectWindow(run.tmux);
 		if (inspection.state === "foreign") return { kind: "foreign-tmux-id", safe: false, message: inspection.message ?? "The tmux ID was reused by an unrelated window.", tmux: inspection } as const;
 		if (inspection.state === "ambiguous") return { kind: "ambiguous", safe: false, message: inspection.message ?? "Tmux ownership could not be established.", tmux: inspection } as const;
-		if (inspection.state === "missing") {
-			if (item.status === "report-review" || item.status === "report-pending" || item.status === "completed") {
-				return { kind: "worker-exited-pending-report", safe: true, message: "The worker exited, but its durable report remains reviewable.", tmux: inspection } as const;
+		if (inspection.state === "missing" || inspection.state === "exited") {
+			if (hasDurablePendingReport(item.status)) {
+				return {
+					kind: "worker-exited-pending-report", safe: true,
+					message: inspection.state === "missing" ? "The worker exited, but its durable report remains reviewable." : "The worker exited after persisting a report.",
+					tmux: inspection,
+				} as const;
 			}
-			return { kind: "window-missing", safe: false, message: "The owned tmux worker window is missing.", tmux: inspection } as const;
-		}
-		if (inspection.state === "exited") {
-			if (item.status === "report-review" || item.status === "report-pending" || item.status === "completed") {
-				return { kind: "worker-exited-pending-report", safe: true, message: "The worker exited after persisting a report.", tmux: inspection } as const;
-			}
-			return { kind: "window-missing", safe: false, message: "The worker pane exited before a durable report was available.", tmux: inspection } as const;
+			return {
+				kind: "window-missing", safe: false,
+				message: inspection.state === "missing" ? "The owned tmux worker window is missing." : "The worker pane exited before a durable report was available.",
+				tmux: inspection,
+			} as const;
 		}
 		if (!protocolConnected) return { kind: "worker-alive-disconnected", safe: true, message: "The verified owned worker is alive and should reconnect to the recreated socket.", tmux: inspection } as const;
 		return { kind: "safe-to-resume", safe: true, message: "Tmux ownership and native worker identity are verified.", tmux: inspection } as const;

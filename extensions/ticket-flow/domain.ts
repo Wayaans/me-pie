@@ -217,6 +217,8 @@ export interface WorkflowRun {
 	readonly projectId: string;
 	readonly projectPath: string;
 	readonly originalPrompt: string;
+	/** Pi session that most recently acquired or recovered orchestration ownership. */
+	readonly orchestratorSessionId?: string;
 	readonly phase: RunPhase;
 	readonly createdAt: string;
 	readonly updatedAt: string;

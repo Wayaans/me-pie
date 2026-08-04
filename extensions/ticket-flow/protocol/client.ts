@@ -2,7 +2,7 @@ import net, { type Socket } from "node:net";
 import { Effect, Fiber, Queue } from "effect";
 import type { AuthoritativeWorkerContext, WorkerFeedback, WorkerIdentity } from "../domain.ts";
 import { encodeJsonLine, JsonLineFramer } from "./framing.ts";
-import { WorkerSocketReconnect } from "../worker/reconnect.ts";
+import { validateWorkerReconnectPath, workerReconnectDelay } from "../worker/reconnect.ts";
 import {
 	decodeFeedback,
 	decodeProtocolMessage,
@@ -51,8 +51,8 @@ export class ProtocolClient {
 	private readonly submissionWaiters = new Map<string, SubmissionWaiter>();
 	private readonly sentWorkerEventIds = new Set<string>();
 	private readonly seen = new Map<string, string>();
-	private readonly reconnect: WorkerSocketReconnect;
-	constructor(readonly options: ProtocolClientOptions) { this.reconnect = new WorkerSocketReconnect(options.socketPath); }
+	private readonly reconnectSocketPath: string;
+	constructor(readonly options: ProtocolClientOptions) { this.reconnectSocketPath = validateWorkerReconnectPath(options.socketPath); }
 	get isVerified(): boolean { return this.verified; }
 	get isStopped(): boolean { return this.stopped; }
 	get authoritativeContext(): AuthoritativeWorkerContext | undefined { return this.context; }
@@ -77,7 +77,7 @@ export class ProtocolClient {
 	}
 	private connect(attempt: number): void {
 		if (this.stopped || this.socket) return;
-		const socket = net.createConnection(this.reconnect.path()); this.socket = socket;
+		const socket = net.createConnection(this.reconnectSocketPath); this.socket = socket;
 		const framer = new JsonLineFramer();
 		socket.once("connect", () => {
 			const { identity } = this.options;
@@ -109,7 +109,7 @@ export class ProtocolClient {
 		});
 	}
 	private schedule(attempt: number): void {
-		const delay = this.reconnect.delay(attempt, this.options.retryDelaysMs);
+		const delay = workerReconnectDelay(attempt, this.options.retryDelaysMs);
 		this.retry = setTimeout(() => { this.retry = undefined; this.connect(attempt); }, delay);
 	}
 	private write(message: ProtocolEnvelope): void { if (this.socket && !this.socket.destroyed) this.socket.write(encodeJsonLine(message)); }

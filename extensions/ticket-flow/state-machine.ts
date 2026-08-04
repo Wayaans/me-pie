@@ -153,6 +153,9 @@ export function validatePlan(plan: WorkflowPlan): Effect.Effect<void, Validation
 export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationError> {
 	return Effect.gen(function* () {
 		yield* validatePlan(run.plan);
+		if (run.orchestratorSessionId !== undefined && !run.orchestratorSessionId.trim()) {
+			return yield* fail("orchestrator session ID must not be empty", "orchestratorSessionId");
+		}
 		if (["ready", "executing", "completed"].includes(run.phase) && !run.plan.finalized) {
 			return yield* fail(`${run.phase} run must have a finalized plan`, "plan.finalized");
 		}
