@@ -5,6 +5,7 @@ import { Effect } from "effect";
 import type { WorkflowPlan, WorkflowRun } from "../domain.ts";
 import { THINKING_LEVELS, WORK_ITEM_STATUSES } from "../domain.ts";
 import type { WorkflowController } from "../controller.ts";
+import { confirmActiveWorkerStop, recoverWithConfirmation } from "./lifecycle.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
@@ -285,10 +286,10 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 	pi.registerTool({
 		name: "workflow_control",
 		label: "Workflow Control",
-		description: "Show bounded run status, pause planning, or stop the current Ticket Flow run.",
+		description: "Show bounded run status, durably pause/resume, gracefully stop, or recover a Ticket Flow run.",
 		parameters: WorkflowControlParameters,
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			switch (params.action) {
 				case "status":
 					return result(await runController(controller.status(), signal), controller.activeRun);
@@ -297,13 +298,18 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 					return result("Ticket Flow paused.", run);
 				}
 				case "stop": {
+					if (!await confirmActiveWorkerStop(controller, ctx)) throw new Error("Ticket Flow stop was cancelled.");
 					const run = await runController(controller.stop(), signal);
 					return result("Ticket Flow stopped; the project lock and orchestrator tool restriction were released.", run);
 				}
-				case "resume":
-					throw new Error("workflow_control resume is reserved for Stage 7 recovery.");
-				case "recover":
-					throw new Error("workflow_control recover is reserved for Stage 7 recovery.");
+				case "resume": {
+					const run = await runController(controller.resume(), signal);
+					return result("Ticket Flow reconciled and resumed without creating a duplicate worker.", run);
+				}
+				case "recover": {
+					const run = await recoverWithConfirmation(controller, ctx);
+					return result("Ticket Flow recovered from its last durable checkpoint.", run);
+				}
 			}
 		},
 	});

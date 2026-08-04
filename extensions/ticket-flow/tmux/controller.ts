@@ -64,6 +64,11 @@ export interface CloseWindowResult {
 	readonly alreadyExited: boolean;
 }
 
+export interface TmuxWindowInspection {
+	readonly state: "alive" | "exited" | "missing" | "foreign" | "ambiguous";
+	readonly message?: string;
+}
+
 interface OwnershipRecord {
 	readonly serverSocketPath: string;
 	readonly sessionId: string;
@@ -299,6 +304,23 @@ export class TmuxController {
 			if (!ownership) return yield* Effect.fail(new UnexpectedTmuxOutputError({ operation: "inspect worker window", output: result.stdout }));
 			return ownership;
 		});
+	}
+
+	inspectWindow(handle: TmuxWindowHandle): Effect.Effect<TmuxWindowInspection> {
+		return this.inspect(handle).pipe(
+			Effect.map((ownership): TmuxWindowInspection => {
+				if (!ownership) return { state: "missing" };
+				const matches = ownership.serverSocketPath === handle.serverSocketPath
+					&& ownership.sessionId === handle.sessionId
+					&& ownership.windowId === handle.windowId
+					&& ownership.paneId === handle.paneId
+					&& ownership.runId === handle.runId
+					&& ownership.workItemId === handle.workItemId;
+				if (!matches) return { state: "foreign", message: "The recorded tmux ID now belongs to another window." };
+				return { state: ownership.paneDead ? "exited" : "alive" };
+			}),
+			Effect.catch((cause) => Effect.succeed({ state: "ambiguous", message: cause instanceof Error ? cause.message : String(cause) } as const)),
+		);
 	}
 
 	private assertOwned(handle: TmuxWindowHandle, ownership: OwnershipRecord) {

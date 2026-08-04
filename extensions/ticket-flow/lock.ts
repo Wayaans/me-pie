@@ -20,6 +20,21 @@ export interface ProjectLock {
 	readonly release: () => Effect.Effect<void, PersistenceError>;
 }
 
+export type ProjectLockStatus =
+	| { readonly state: "missing" }
+	| { readonly state: "owned" | "live" | "stale" | "ambiguous"; readonly owner?: LockOwner; readonly reason: string };
+
+export interface ProcessLiveness {
+	readonly isAlive: (pid: number) => boolean;
+}
+
+export const nodeProcessLiveness: ProcessLiveness = {
+	isAlive: (pid) => {
+		try { process.kill(pid, 0); return true; }
+		catch (cause) { return (cause as NodeJS.ErrnoException).code !== "ESRCH"; }
+	},
+};
+
 export interface LockFileSystem extends StateFileSystem {
 	readonly removeDirectory: (directory: string) => Promise<void>;
 }
@@ -51,6 +66,47 @@ async function readOwner(ownerPath: string, fs: LockFileSystem): Promise<unknown
 	} catch {
 		return undefined;
 	}
+}
+
+function decodeLockOwner(input: unknown): LockOwner | undefined {
+	if (typeof input !== "object" || input === null) return undefined;
+	const candidate = input as Partial<LockOwner>;
+	if (candidate.version !== SCHEMA_VERSION || typeof candidate.runId !== "string" || !candidate.runId
+		|| typeof candidate.acquisitionId !== "string" || !candidate.acquisitionId
+		|| !Number.isSafeInteger(candidate.pid) || (candidate.pid ?? 0) <= 0
+		|| typeof candidate.createdAt !== "string"
+		|| (candidate.sessionId !== undefined && typeof candidate.sessionId !== "string")) return undefined;
+	return candidate as LockOwner;
+}
+
+export function inspectProjectLock(
+	rootDir: string,
+	projectId: string,
+	options: { readonly runId?: string; readonly sessionId?: string; readonly fs?: LockFileSystem; readonly liveness?: ProcessLiveness } = {},
+): Effect.Effect<ProjectLockStatus> {
+	const fs = options.fs ?? nodeLockFileSystem;
+	const lockPath = path.join(rootDir, `${projectId}.lock`);
+	const ownerPath = path.join(lockPath, "owner.json");
+	return Effect.promise(async () => {
+		const input = await readOwner(ownerPath, fs);
+		if (input === undefined) {
+			try { await fs.readText(ownerPath); } catch (cause) {
+				if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { state: "missing" } as const;
+			}
+			return { state: "ambiguous", reason: "The lock exists without valid owner metadata." } as const;
+		}
+		const owner = decodeLockOwner(input);
+		if (!owner) return { state: "ambiguous", reason: "The lock owner schema is invalid." } as const;
+		if (owner.pid === process.pid && owner.runId === options.runId && (options.sessionId === undefined || owner.sessionId === options.sessionId)) {
+			return { state: "owned", owner, reason: "This live Pi session already owns the lock." } as const;
+		}
+		const alive = (options.liveness ?? nodeProcessLiveness).isAlive(owner.pid);
+		if (alive) return { state: "live", owner, reason: "The recorded owner process is still alive." } as const;
+		if (options.runId !== undefined && owner.runId !== options.runId) {
+			return { state: "ambiguous", owner, reason: "The dead lock names a different run." } as const;
+		}
+		return { state: "stale", owner, reason: "The lock owner is dead and its run metadata matches." } as const;
+	});
 }
 
 function releaseLock(
@@ -146,4 +202,66 @@ export function acquireProjectLock(
 	});
 
 	return Effect.acquireRelease(acquire, (lock) => lock.release().pipe(Effect.catch(() => Effect.void)));
+}
+
+export function recoverProjectLock(
+	rootDir: string,
+	projectId: string,
+	runId: string,
+	options: {
+		readonly sessionId?: string;
+		readonly allowAmbiguousTakeover?: boolean;
+		readonly fs?: LockFileSystem;
+		readonly liveness?: ProcessLiveness;
+	} = {},
+): Effect.Effect<{ readonly lock: ProjectLock; readonly takeover: "none" | "stale" | "approved" }, LockContentionError | PersistenceError, Scope.Scope> {
+	const fs = options.fs ?? nodeLockFileSystem;
+	const lockPath = path.join(rootDir, `${projectId}.lock`);
+	const ownerPath = path.join(lockPath, "owner.json");
+	return Effect.gen(function* () {
+		const status = yield* inspectProjectLock(rootDir, projectId, {
+			runId,
+			...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+			fs,
+			...(options.liveness === undefined ? {} : { liveness: options.liveness }),
+		});
+		if (status.state === "owned" && status.owner) {
+			let released = false;
+			const release = () => {
+				if (released) return Effect.void;
+				released = true;
+				return releaseLock(lockPath, ownerPath, status.owner!, fs);
+			};
+			const lock = { path: lockPath, owner: status.owner, release } satisfies ProjectLock;
+			yield* Effect.addFinalizer(() => release().pipe(Effect.catch(() => Effect.void)));
+			return { lock, takeover: "none" as const };
+		}
+		if (status.state === "live") return yield* Effect.fail(new LockContentionError({ path: lockPath, owner: status.owner }));
+		if (status.state === "ambiguous" && !options.allowAmbiguousTakeover) {
+			return yield* Effect.fail(new LockContentionError({ path: lockPath, ...(status.owner === undefined ? {} : { owner: status.owner }) }));
+		}
+		if (status.state === "stale" || status.state === "ambiguous") {
+			const expectedOwnerText = yield* Effect.tryPromise({
+				try: () => fs.readText(ownerPath),
+				catch: (cause) => new PersistenceError({ operation: "snapshot project lock owner", path: ownerPath, cause }),
+			});
+			yield* Effect.tryPromise({
+				try: async () => {
+					if (await fs.readText(ownerPath) !== expectedOwnerText) throw new Error("Project lock ownership changed during recovery.");
+					await fs.removeDirectory(lockPath);
+				},
+				catch: (cause) => new PersistenceError({ operation: "take over project lock", path: lockPath, cause }),
+			});
+			const lock = yield* acquireProjectLock(rootDir, projectId, runId, {
+				...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+				fs,
+			});
+			return { lock, takeover: status.state === "stale" ? "stale" as const : "approved" as const };
+		}
+		const lock = yield* acquireProjectLock(rootDir, projectId, runId, {
+			...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+			fs,
+		});
+		return { lock, takeover: "none" as const };
+	});
 }

@@ -11,11 +11,11 @@ import type {
 } from "./domain.ts";
 import { createRunId } from "./domain.ts";
 import { appendEvent, makeWorkflowEvent, replayEvents } from "./event-store.ts";
-import { acquireProjectLock, type ProjectLock } from "./lock.ts";
+import { acquireProjectLock, recoverProjectLock, type ProjectLock } from "./lock.ts";
 import { pathsForProject, type WorkflowPaths } from "./paths.ts";
 import { normalizePlan, transitionRun, transitionWorkItem, validatePlan } from "./state-machine.ts";
 import type { PersistenceError, ValidationError } from "./errors.ts";
-import { saveRun } from "./state-store.ts";
+import { loadRun, saveRun } from "./state-store.ts";
 import { TmuxController } from "./tmux/controller.ts";
 import { readWorkflowToken, removeWorkflowToken, workflowSocketPath, writeWorkflowToken } from "./protocol/runtime.ts";
 import { ProtocolServer, type ProtocolRejection } from "./protocol/server.ts";
@@ -23,6 +23,7 @@ import type { WorkflowProtocolEvent } from "./protocol/messages.ts";
 import { makeAuthoritativeWorkerContext, requirementId } from "./worker/context.ts";
 import { persistReportAttempt, persistAcceptedReport, readLatestReportAttempt, readReportAttempt, validateWorkerReport } from "./worker/report.ts";
 import { applyCompletionStrategy, type CompletionApplicationResult } from "./completion.ts";
+import { discoverUnfinishedRuns, reconcileRecovery, type RecoveryDiscovery, type RecoveryReconciliation } from "./recovery.ts";
 
 export const WORKFLOW_TOOL_NAMES = [
 	"workflow_plan",
@@ -48,6 +49,14 @@ export interface StartRunInput {
 	readonly prompt: string;
 	readonly sessionId?: string;
 	readonly agentDir?: string;
+}
+
+export interface RecoverRunInput {
+	readonly cwd: string;
+	readonly sessionId?: string;
+	readonly agentDir?: string;
+	readonly runId?: string;
+	readonly allowAmbiguousTakeover?: boolean;
 }
 
 export interface BlockReportOptions {
@@ -192,6 +201,13 @@ export class WorkflowController {
 		return this.tmux.detect();
 	}
 
+	discover(cwd: string, agentDir?: string, sessionId?: string): Effect.Effect<RecoveryDiscovery, Error> {
+		return discoverUnfinishedRuns(cwd, {
+			...(agentDir === undefined ? {} : { agentDir }),
+			...(sessionId === undefined ? {} : { sessionId }),
+		});
+	}
+
 	private serialize<A, E, R>(operation: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
 		return this.coordinator.withPermits(1)(operation);
 	}
@@ -229,12 +245,16 @@ export class WorkflowController {
 		});
 	}
 
+	private detach(activeState: ActiveRun): void {
+		if (this.active === activeState) this.active = undefined;
+		const previous = activeState.run.planning.previousActiveTools;
+		const restricted = activeState.run.planning.restrictedActiveTools;
+		if (previous && restricted) restoreToolsConservatively(this.pi, previous, restricted);
+	}
+
 	private release(activeState: ActiveRun) {
 		return Effect.gen({ self: this }, function* () {
-			if (this.active === activeState) this.active = undefined;
-			const previous = activeState.run.planning.previousActiveTools;
-			const restricted = activeState.run.planning.restrictedActiveTools;
-			if (previous && restricted) restoreToolsConservatively(this.pi, previous, restricted);
+			this.detach(activeState);
 			yield* Scope.close(activeState.scope, Exit.void);
 		});
 	}
@@ -438,6 +458,28 @@ export class WorkflowController {
 		});
 	}
 
+	private startRecoveredProtocol(activeState: ActiveRun) {
+		return Effect.gen({ self: this }, function* () {
+			const run = activeState.run;
+			if (activeState.protocol || !run.activeWorkItemId || !run.requestedLaunchProfile || !run.workflowSocketPath) return;
+			const token = yield* readWorkflowToken(activeState.paths.runDir);
+			activeState.workerToken = token;
+			const server = new ProtocolServer({
+				socketPath: run.workflowSocketPath,
+				runId: run.id,
+				workItemId: run.activeWorkItemId,
+				token,
+				profile: run.requestedLaunchProfile,
+				onEvent: (event) => Effect.runPromise(this.receiveProtocolEvent(event)),
+				onAcknowledgement: (receipt) => Effect.runPromise(this.acknowledgeProtocolCommand(receipt.requestId)),
+				onRejected: (rejection) => Effect.runPromise(this.rejectProtocolWorker(rejection)),
+			});
+			yield* server.start();
+			yield* Scope.addFinalizer(activeState.scope, server.shutdown());
+			activeState.protocol = server;
+		});
+	}
+
 	private rejectProtocolWorker(rejection: ProtocolRejection) {
 		return this.serialize(this.rejectProtocolWorkerInternal(rejection));
 	}
@@ -504,14 +546,19 @@ export class WorkflowController {
 					return yield* Effect.fail(new Error("Authenticated worker does not match the active work item."));
 				}
 				const item = active.plan.workItems.find((candidate) => candidate.id === event.identity.workItemId);
-				if (!item || (item.status !== "verifying-worker" && item.status !== "running")) {
+				if (!item || !["verifying-worker", "running", "report-pending", "report-review", "report-revision", "blocked"].includes(item.status)) {
 					return yield* Effect.fail(new Error("Worker connection arrived in an invalid workflow state."));
 				}
 				const server = this.active?.protocol;
 				if (!server) return yield* Effect.fail(new Error("Native protocol server disappeared before delegation."));
-				if (item.status === "running") {
+				if (item.status === "running" || item.status === "report-review" || item.status === "report-pending" || item.status === "report-revision" || item.status === "blocked") {
 					const reconnected = yield* makeWorkflowEvent(active.id, "worker-reconnected", { workItemId: item.id, messageId: event.messageId });
 					yield* appendEvent(this.active!.paths.eventsFile, reconnected);
+					const pendingDelegate = (active.protocolCommands ?? []).find((command) => command.type === "delegate" && !command.acknowledged);
+					if (pendingDelegate && item.status === "running") {
+						const context = makeAuthoritativeWorkerContext(active, item, event.identity);
+						server.send("delegate", { prompt: item.delegationPrompt, context, requestId: pendingDelegate.requestId }, pendingDelegate.messageId);
+					}
 					return;
 				}
 				const delegate = { type: "delegate" as const, requestId: crypto.randomUUID(), messageId: crypto.randomUUID(), acknowledged: false };
@@ -706,7 +753,10 @@ export class WorkflowController {
 				...(messageId === undefined ? {} : { messageId }),
 			});
 			if (protocol?.isVerified && command !== undefined) {
-				const receipt = protocol.send("shutdown", { requestId: command.requestId }, command.messageId);
+				const receipt = yield* Effect.try({
+					try: () => protocol.send("shutdown", { requestId: command.requestId }, command.messageId),
+					catch: () => undefined,
+				});
 				if (receipt) yield* Effect.tryPromise({
 					try: () => waitWithTimeout((waitSignal) => protocol.waitForAcknowledgement(receipt.requestId, waitSignal), undefined, 2_000),
 					catch: () => undefined,
@@ -863,7 +913,7 @@ export class WorkflowController {
 				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
 			});
 			const acceptingAt = this.now().toISOString();
-			const acceptingCheckpoint: ProgressionCheckpoint = { operation: "accept", stage: "accepting", workItemId, updatedAt: acceptingAt, reportAttempt: attempt.attempt };
+			const acceptingCheckpoint: ProgressionCheckpoint = { operation: "accept", stage: "accepting", workItemId, updatedAt: acceptingAt, reportAttempt: attempt.attempt, comment: acceptedComment };
 			yield* this.persist({ ...active, updatedAt: acceptingAt, progression: acceptingCheckpoint }, "report-accepting", { workItemId, reportAttempt: attempt.attempt });
 			const completedAt = this.now().toISOString();
 			const acceptedReportPath = yield* persistAcceptedReport(this.active!.paths, attempt, completedAt, signal);
@@ -1074,6 +1124,107 @@ export class WorkflowController {
 		});
 	}
 
+	private recoveryTargetPhase(run: WorkflowRun): WorkflowRun["phase"] {
+		const activeItem = run.activeWorkItemId === undefined ? undefined : run.plan.workItems.find((item) => item.id === run.activeWorkItemId);
+		if (activeItem?.status === "blocked") return "paused";
+		if (run.activeWorkItemId) return "executing";
+		if (run.plan.finalized) return "ready";
+		return run.planning.unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing";
+	}
+
+	private continueRecoveryInternal(reconciliation: RecoveryReconciliation) {
+		return Effect.gen({ self: this }, function* () {
+			let active = yield* this.requireRun();
+			const activeState = this.active!;
+			if (active.activeWorkItemId && reconciliation.tmux?.state === "alive" && !activeState.protocol) {
+				yield* this.startRecoveredProtocol(activeState);
+			}
+			const target = this.recoveryTargetPhase(active);
+			const resumed: WorkflowRun = { ...active, phase: yield* transitionRun(active.phase, target), updatedAt: this.now().toISOString() };
+			active = yield* this.persist(resumed, "run-resumed", { reconciliation: reconciliation.kind, targetPhase: target });
+			const activeItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			if (activeItem?.status === "report-pending") {
+				const report = yield* readLatestReportAttempt(activeState.paths, activeItem.id);
+				if (report) {
+					const reviewStatus = yield* transitionWorkItem(activeItem.status, "report-review");
+					active = yield* this.persist({
+						...active,
+						updatedAt: this.now().toISOString(),
+						plan: { ...active.plan, workItems: active.plan.workItems.map((item) => item.id === activeItem.id ? { ...item, status: reviewStatus } : item) },
+					}, "pending-report-recovered", { workItemId: activeItem.id, attempt: report.attempt });
+				}
+			}
+			const currentItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			if (active.progression?.operation === "accept" && active.progression.comment && currentItem?.status === "report-review") {
+				return yield* this.acceptReportInternal(currentItem.id, active.progression.comment);
+			}
+			if (currentItem?.status === "completed") return yield* this.continueAfterCompletedInternal(currentItem.id);
+			if (active.progression?.operation === "close" && active.activeWorkItemId && active.tmux) {
+				return (yield* this.closeWorkerInternal(active.activeWorkItemId, false, false)).run;
+			}
+			if (!active.activeWorkItemId) {
+				const next = this.nextReadyWorkItem();
+				if (next && active.phase === "ready") return yield* this.startWorkerInternal(next.id);
+			}
+			return active;
+		});
+	}
+
+	recover(input: RecoverRunInput) {
+		return this.serialize(Effect.gen({ self: this }, function* () {
+			if (this.active) return yield* Effect.fail(new Error(`Ticket Flow run ${this.active.run.id} is already active.`));
+			const discovery = yield* this.discover(input.cwd, input.agentDir, input.sessionId);
+			const candidates = input.runId === undefined ? discovery.runs : discovery.runs.filter((candidate) => candidate.run.id === input.runId);
+			if (candidates.length === 0) return yield* Effect.fail(new Error("No recoverable Ticket Flow run exists for this project."));
+			if (candidates.length > 1 && input.runId === undefined) return yield* Effect.fail(new Error("Multiple unfinished runs exist; recovery requires an explicit run ID."));
+			const candidate = candidates[0]!;
+			const scope = yield* Scope.make();
+			return yield* Effect.gen({ self: this }, function* () {
+				const recovered = yield* Scope.provide(scope)(recoverProjectLock(candidate.paths.rootDir, candidate.paths.projectId, candidate.run.id, {
+					...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+					...(input.allowAmbiguousTakeover === undefined ? {} : { allowAmbiguousTakeover: input.allowAmbiguousTakeover }),
+				}));
+				const loaded = yield* loadRun(candidate.paths);
+				const previousActiveTools = this.pi.getActiveTools();
+				const restrictedActiveTools = restrictedToolList(previousActiveTools);
+				const recoveredRun: WorkflowRun = {
+					...loaded,
+					planning: { ...loaded.planning, previousActiveTools, restrictedActiveTools },
+					updatedAt: this.now().toISOString(),
+				};
+				const activeState: ActiveRun = { run: recoveredRun, paths: candidate.paths, lock: recovered.lock, scope };
+				this.active = activeState;
+				this.pi.setActiveTools(restrictedActiveTools);
+				yield* this.persist(recoveredRun, recovered.takeover === "none" ? "run-recovery-started" : "lock-taken-over", {
+					takeover: recovered.takeover,
+					previousOwnerState: candidate.lock.state,
+				});
+				const reconciliation = yield* reconcileRecovery(recoveredRun, this.tmux, false);
+				if (!reconciliation.safe) {
+					const pausedPhase = recoveredRun.phase === "paused" || recoveredRun.phase === "failed"
+						? recoveredRun.phase
+						: yield* transitionRun(recoveredRun.phase, "paused");
+					return yield* this.persist({ ...recoveredRun, phase: pausedPhase, updatedAt: this.now().toISOString() }, "recovery-paused", {
+						kind: reconciliation.kind, message: reconciliation.message,
+					});
+				}
+				return yield* this.continueRecoveryInternal(reconciliation);
+			}).pipe(Effect.onError(() => this.active ? this.release(this.active) : Scope.close(scope, Exit.void)));
+		}));
+	}
+
+	resume() {
+		return this.serialize(Effect.gen({ self: this }, function* () {
+			const active = yield* this.requireRun();
+			if (active.phase !== "paused") return yield* Effect.fail(new Error("workflow_control resume requires an owned paused run."));
+			const activeItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			if (activeItem?.status === "blocked") return yield* Effect.fail(new Error("Resolve the active worker blocker before resuming Ticket Flow."));
+			const reconciliation = yield* reconcileRecovery(active, this.tmux, this.active?.protocol?.isVerified ?? false);
+			if (!reconciliation.safe) return yield* Effect.fail(new Error(`Recovery is ${reconciliation.kind}: ${reconciliation.message}`));
+			return yield* this.continueRecoveryInternal(reconciliation);
+		}));
+	}
+
 	pause() {
 		return this.serialize(Effect.gen({ self: this }, function* () {
 			const active = yield* this.requireRun();
@@ -1119,17 +1270,13 @@ export class WorkflowController {
 		return this.serialize(Effect.gen({ self: this }, function* () {
 			const activeState = this.active;
 			if (!activeState) return;
-			const close = activeState.run.tmux && activeState.run.activeWorkItemId
-				? this.tmux.closeWindow(activeState.run.tmux).pipe(
-					Effect.catch(() => this.tmux.closeWindow(activeState.run.tmux!, true)),
-					Effect.catch(() => Effect.void),
-				)
-				: Effect.void;
-			yield* close.pipe(
-				Effect.ensuring(activeState.protocol?.shutdown() ?? Effect.void),
-				Effect.ensuring(removeWorkflowToken(activeState.paths.runDir)),
-				Effect.ensuring(this.release(activeState)),
-			);
+			// A session reload or orchestrator exit detaches only local resources.
+			// The worker, token, tmux window, durable state, and lock remain intact
+			// for authenticated recovery by this session or a proven stale takeover.
+			yield* activeState.protocol?.shutdown() ?? Effect.void;
+			delete activeState.protocol;
+			delete activeState.workerToken;
+			this.detach(activeState);
 		}));
 	}
 

@@ -1,5 +1,7 @@
 # Stage 7: Recovery and lifecycle control
 
+**Status: Complete**
+
 ## Objective
 
 Make workflows survive Pi reloads, orchestrator restarts, socket loss, and tmux detachment without duplicating workers or damaging unrelated windows. Complete pause, resume, stop, and recover behavior.

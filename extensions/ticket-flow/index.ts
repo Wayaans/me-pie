@@ -4,6 +4,7 @@ import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowComman
 import { WorkflowController } from "./controller.ts";
 import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts";
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
+import { discoverOrchestratorRecovery, recoverWithConfirmation } from "./orchestrator/lifecycle.ts";
 import { detectWorkflowRole, isTicketFlowInvocation } from "./role.ts";
 import type { WorkflowRun } from "./domain.ts";
 import { prepareWorkerLifecycle, type WorkerLifecycle } from "./worker/lifecycle.ts";
@@ -59,15 +60,20 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 			if (ctx.hasUI) ctx.ui.notify("A Ticket Flow worker cannot start a nested workflow.", "error");
 			return { action: "handled" as const };
 		});
-		pi.on("session_shutdown", async (_event, ctx) => {
+		pi.on("session_shutdown", async () => {
 			if (!lifecycle) return;
-			await Effect.runPromise(lifecycle.shutdown(), { signal: ctx.signal });
+			await Effect.runPromise(lifecycle.shutdown());
 		});
 		return;
 	}
 
 	const controller = new WorkflowController(pi, undefined, undefined, options.tmux);
 	registerOrchestratorTools(pi, controller);
+
+	pi.on("session_start", async (_event, ctx) => {
+		try { await discoverOrchestratorRecovery(controller, ctx); }
+		catch (error) { notifyError(ctx, error); }
+	});
 
 	pi.registerCommand("ticket-flow", {
 		description: "Analyze and orchestrate tickets in a tmux-backed Ticket Flow run",
@@ -76,6 +82,16 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 				const command = parseTicketFlowCommand(args);
 				assertCommandPrerequisites({ mode: ctx.mode, tmux: process.env.TMUX });
 				await Effect.runPromise(controller.verifyTmux(), { signal: ctx.signal });
+				const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, ctx.sessionManager.getSessionId()));
+				if (discovery.runs.length > 0) {
+					if (!ctx.hasUI) throw new Error("An unfinished Ticket Flow run exists; use workflow_control recover in an interactive session.");
+					const choice = await ctx.ui.select("Ticket Flow run already exists", ["Recover existing run", "Cancel"]);
+					if (choice !== "Recover existing run") return;
+					const recovered = await recoverWithConfirmation(controller, ctx);
+					updateStatus(ctx, recovered);
+					pi.appendEntry("ticket-flow-state", { run: recovered });
+					return;
+				}
 				const run = await Effect.runPromise(controller.startRun({
 					cwd: ctx.cwd,
 					prompt: command.prompt,
@@ -100,7 +116,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		await Effect.runPromise(controller.shutdown(), { signal: ctx.signal });
+		await Effect.runPromise(controller.shutdown());
 		updateStatus(ctx, undefined);
 	});
 }
