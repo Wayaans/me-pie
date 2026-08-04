@@ -14,6 +14,7 @@ import { loadRun } from "../ticket-flow/state-store.ts";
 import { WorkerReportRuntime } from "../ticket-flow/worker/report.ts";
 
 const defaultProfile: PiLaunchProfile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" };
+let harnessSequence = 0;
 
 function workItem(id: string, order: number, overrides: Partial<WorkItem> = {}): WorkItem {
 	return {
@@ -101,7 +102,7 @@ class DeterministicTmux {
 class IntegrationHarness {
 	readonly project = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage8-project-"));
 	readonly agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage8-agent-"));
-	readonly runId = `stage8-${crypto.randomUUID()}`;
+	readonly runId = `stage8-${++harnessSequence}`;
 	readonly tmux = new DeterministicTmux();
 	readonly clients: ProtocolClient[] = [];
 	readonly initialTools = ["read", "bash", "edit", "ask_me"];
@@ -112,20 +113,20 @@ class IntegrationHarness {
 		return new WorkflowController({
 			getActiveTools: () => [...this.tools],
 			setActiveTools: (names) => { this.tools = [...names]; },
-		}, undefined, () => this.runId, this.tmux as never);
+		}, () => new Date("2026-01-01T00:00:00.000Z"), () => this.runId, this.tmux as never);
 	}
 
 	get activeTools(): readonly string[] { return this.tools; }
 
-	async begin(items: readonly WorkItem[], startWorker = true): Promise<void> {
+	async begin(items: readonly WorkItem[]): Promise<void> {
 		await Effect.runPromise(this.controller.startRun({ cwd: this.project, prompt: "deterministic stage 8 integration", agentDir: this.agentDir, sessionId: "orchestrator-session" }));
 		await Effect.runPromise(this.controller.savePlan({ summary: "Stage 8 integration", workItems: items, userResolutions: [], finalized: false }));
 		await Effect.runPromise(this.controller.finalizePlan());
-		if (startWorker) await Effect.runPromise(this.controller.startWorker([...items].sort((left, right) => left.order - right.order)[0]!.id));
+		await Effect.runPromise(this.controller.startWorker([...items].sort((left, right) => left.order - right.order)[0]!.id));
 	}
 
 	async connect(workItemId: string, overrides: Partial<WorkerIdentity> = {}): Promise<ProtocolClient> {
-		const resolved = await Effect.runPromise(pathsForProject(this.project, this.runId, this.agentDir));
+		const workflowPaths = await Effect.runPromise(pathsForProject(this.project, this.runId, this.agentDir));
 		const item = this.controller.activeRun!.plan.workItems.find((candidate) => candidate.id === workItemId)!;
 		const [provider, model] = item.launchProfile!.model!.split("/", 2) as [string, string];
 		const identity: WorkerIdentity = {
@@ -140,7 +141,7 @@ class IntegrationHarness {
 		const client = new ProtocolClient({
 			socketPath: this.controller.activeRun!.workflowSocketPath!,
 			identity,
-			token: await Effect.runPromise(readWorkflowToken(resolved.paths.runDir)),
+			token: await Effect.runPromise(readWorkflowToken(workflowPaths.paths.runDir)),
 			onDelegate: () => undefined,
 			onFeedback: () => undefined,
 			onShutdown: () => undefined,
@@ -273,8 +274,8 @@ test("7. progress is recorded before a valid completion report", async () => wit
 	const client = await harness.connectReady(item.id);
 	await new WorkerReportRuntime(client).submit({ status: "progress", summary: "Half complete", filesChanged: [] }, client.authoritativeContext!);
 	await harness.submitCompleted(client);
-	const resolved = await Effect.runPromise(pathsForProject(harness.project, harness.runId, harness.agentDir));
-	const events = await Effect.runPromise(replayEvents(resolved.paths.eventsFile));
+	const workflowPaths = await Effect.runPromise(pathsForProject(harness.project, harness.runId, harness.agentDir));
+	const events = await Effect.runPromise(replayEvents(workflowPaths.paths.eventsFile));
 	assert.ok(events.findIndex(({ type }) => type === "worker-progress") < events.findIndex(({ type }) => type === "worker-report"));
 	assert.equal(harness.controller.activeRun?.plan.workItems[0]?.status, "report-review");
 	harness.assertNoProjectMetadata();
@@ -284,6 +285,16 @@ test("8. an invalid-for-review report is revised and accepted in the same worker
 	const item = workItem("revision", 1);
 	await harness.begin([item]);
 	const client = await harness.connectReady(item.id);
+	const runtime = new WorkerReportRuntime(client);
+	await assert.rejects(runtime.submit({
+		status: "completed",
+		summary: "Invalid report missing required results and checks",
+		filesChanged: [],
+		filesChangedExplanation: "No files changed",
+		caveats: [],
+		blockers: [],
+	}, client.authoritativeContext!), /requires requirement results/);
+	assert.equal(harness.controller.activeRun?.plan.workItems[0]?.status, "running");
 	await harness.submitCompleted(client, "Initial report lacks enough narrative evidence");
 	await Effect.runPromise(harness.controller.reviseReport(item.id, "Provide concrete evidence", ["requirement-1"]));
 	assert.equal(harness.tmux.created.length, 1);
@@ -318,7 +329,8 @@ test("10. a worker crash before reporting pauses recovery without spawning a dup
 	const item = workItem("crash", 1);
 	await harness.begin([item]);
 	const client = await harness.connectReady(item.id);
-	await Effect.runPromise(client.shutdown());
+	const transport = client as unknown as { socket?: { destroy(error?: Error): void } };
+	transport.socket?.destroy(new Error("simulated abrupt worker crash"));
 	harness.tmux.inspection = "missing";
 	await Effect.runPromise(harness.controller.shutdown());
 	await harness.replaceController();
@@ -345,11 +357,11 @@ test("12. a final report is durable before orchestrator acceptance", async () =>
 	await harness.begin([item]);
 	const client = await harness.connectReady(item.id);
 	await harness.submitCompleted(client);
-	const resolved = await Effect.runPromise(pathsForProject(harness.project, harness.runId, harness.agentDir));
-	const reportPath = path.join(resolved.paths.reportsDir, "durable-report-attempt-1.json");
+	const workflowPaths = await Effect.runPromise(pathsForProject(harness.project, harness.runId, harness.agentDir));
+	const reportPath = path.join(workflowPaths.paths.reportsDir, "durable-report-attempt-1.json");
 	assert.equal(fs.existsSync(reportPath), true);
 	assert.equal(fs.statSync(reportPath).mode & 0o777, 0o600);
-	const persisted = await Effect.runPromise(loadRun(resolved.paths));
+	const persisted = await Effect.runPromise(loadRun(workflowPaths.paths));
 	assert.equal(persisted.plan.workItems[0]?.status, "report-review");
 	assert.equal(persisted.plan.workItems[0]?.completion, undefined);
 	harness.assertNoProjectMetadata();

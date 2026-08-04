@@ -129,7 +129,7 @@ Changing `PI_CODING_AGENT_DIR` changes which state root Pi can discover.
 
 ## Development validation
 
-Default tests use deterministic filesystem, tmux, transport, clock, and ID fakes. They do not require a live tmux server or model credentials.
+Default tests use isolated temporary state, deterministic clock/ID inputs, and fake tmux controllers; native transport integration stays local. They do not require a live tmux server or model credentials.
 
 ```bash
 bun install
