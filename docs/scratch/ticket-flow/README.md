@@ -26,6 +26,8 @@ This directory breaks Ticket Flow into eight implementation stages. Ticket Flow 
 7. [Recovery and lifecycle control](./07-recovery-and-lifecycle.md)
 8. [Validation and release readiness](./08-validation.md)
 
+User operation and recovery are documented in [`extensions/ticket-flow/README.md`](../../../extensions/ticket-flow/README.md). The opt-in release checklist is [`tmux-smoke.md`](./tmux-smoke.md).
+
 ## Dependency order
 
 Implement the stages in order. Each stage may add tests for its own behavior, while Stage 8 closes integration gaps and adds end-to-end coverage. Do not defer all testing to Stage 8.

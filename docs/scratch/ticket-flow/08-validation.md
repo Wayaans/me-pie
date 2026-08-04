@@ -1,5 +1,7 @@
 # Stage 8: Validation and release readiness
 
+**Status: Complete**
+
 ## Objective
 
 Close integration gaps, harden failure behavior, document operation, and prove the complete AFK workflow from free-form planning through sequential completion and recovery.
