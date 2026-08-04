@@ -17,6 +17,18 @@ const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const }
 function temporarySocket(name: string): string { const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage4-")); return path.join(directory, `${name}.sock`); }
 function identity(overrides: Partial<{ runId: string; workItemId: string; provider: string; model: string; thinking: "high" }> = {}) { return { runId: "run-stage4", workItemId: "item", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" as const, ...overrides }; }
 function connected(overrides: Record<string, unknown> = {}): ProtocolEnvelope { const worker = identity(); return makeMessage(worker.runId, worker.workItemId, "worker-connected", { token: "secret", provider: worker.provider, model: worker.model, thinking: worker.thinking, ...overrides }); }
+function delegation(prompt: string, requestId: string) {
+	return {
+		prompt,
+		requestId,
+		context: {
+			runId: "run-stage4", workItemId: "item", workItemTitle: "Item", sourcePaths: ["ticket.md"], specificationPaths: ["spec.md"],
+			requirements: [{ id: "requirement-1", requirement: "Implement it" }], userResolutions: [], delegationPrompt: prompt,
+			requestedLaunchProfile: profile, actualLaunchProfile: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" },
+			expectedReport: { schemaVersion: 1, statuses: ["progress", "completed", "blocked", "failed"], commonFields: ["status", "summary"], completedRequirements: ["all requirements"] }, truncated: false,
+		},
+	};
+}
 async function rawSocket(socketPath: string): Promise<net.Socket> { return new Promise((resolve, reject) => { const socket = net.createConnection(socketPath); socket.once("connect", () => resolve(socket)); socket.once("error", reject); }); }
 async function eventually(predicate: () => boolean, ms = 1_000): Promise<void> { const until = Date.now() + ms; while (!predicate()) { if (Date.now() >= until) throw new Error("Timed out waiting for condition"); await new Promise((resolve) => setTimeout(resolve, 10)); } }
 
@@ -53,13 +65,13 @@ test("successful authenticated handshake rejects duplicate peers and permits nat
 	const client = new ProtocolClient({ socketPath, identity: identity(), token: "secret", onDelegate: (prompt) => { prompts.push(prompt); }, onFeedback: () => undefined, onShutdown: () => undefined, retryDelaysMs: [10] });
 	await Effect.runPromise(client.start()); await eventually(() => server.isVerified && client.isVerified);
 	const duplicate = await rawSocket(socketPath); await new Promise<void>((resolve) => duplicate.once("close", resolve));
-	server.send("delegate", { prompt: "/implement only this", requestId: "delegate-1" }, "delivery-1"); await eventually(() => prompts.length === 1);
-	server.send("delegate", { prompt: "/implement only this", requestId: "delegate-1" }, "delivery-1"); await new Promise((resolve) => setTimeout(resolve, 20));
+	server.send("delegate", delegation("/implement only this", "delegate-1"), "delivery-1"); await eventually(() => prompts.length === 1);
+	server.send("delegate", delegation("/implement only this", "delegate-1"), "delivery-1"); await new Promise((resolve) => setTimeout(resolve, 20));
 	assert.equal(prompts.length, 1, "duplicate delivery with the same message ID is idempotent");
 	await eventually(() => events.includes("worker-ready"));
 	assert.equal(events[0], "worker-connected");
 	assert.ok(events.includes("worker-ready"));
-	server.send("delegate", { prompt: "/different second ticket", requestId: "delegate-2" }, "delivery-2");
+	server.send("delegate", delegation("/different second ticket", "delegate-2"), "delivery-2");
 	await eventually(() => !client.isVerified);
 	assert.equal(prompts.length, 1, "a conflicting second delegation is rejected");
 	await Effect.runPromise(client.shutdown()); await Effect.runPromise(server.shutdown()); fs.rmSync(path.dirname(socketPath), { recursive: true, force: true });

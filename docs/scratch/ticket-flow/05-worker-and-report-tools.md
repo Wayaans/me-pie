@@ -1,5 +1,7 @@
 # Stage 5: Worker and report tools
 
+**Status: Complete**
+
 ## Objective
 
 Implement the two worker-role tools, define the structured report contract, persist report attempts, and expose native worker events to orchestrator waits.

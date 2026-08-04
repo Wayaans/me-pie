@@ -1,8 +1,10 @@
 import path from "node:path";
 import { Data, Effect } from "effect";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { THINKING_LEVELS, type PiLaunchProfile } from "../domain.ts";
+import { THINKING_LEVELS, type AuthoritativeWorkerContext, type PiLaunchProfile, type WorkerFeedback, type WorkerReport } from "../domain.ts";
 import { workerIdentityFromContext, WorkerProtocolRuntime } from "../protocol/runtime.ts";
+import { WorkerContextRuntime } from "./context.ts";
+import { type ReportValidationResult, WorkerReportRuntime } from "./report.ts";
 
 export interface WorkerStartupEnvironment {
 	readonly runId: string;
@@ -61,6 +63,8 @@ export class WorkerLifecycle {
 	private started = false;
 	private released = false;
 	private readonly runtime = new WorkerProtocolRuntime();
+	private contextRuntime: WorkerContextRuntime | undefined;
+	private reportRuntime: WorkerReportRuntime | undefined;
 
 	constructor(readonly environment: WorkerStartupEnvironment) {}
 
@@ -81,7 +85,10 @@ export class WorkerLifecycle {
 					onDelegate: (prompt) => pi.sendUserMessage(prompt, context.isIdle() ? undefined : { deliverAs: "followUp" }),
 					onFeedback: (message) => pi.sendUserMessage(message, context.isIdle() ? undefined : { deliverAs: "followUp" }),
 					onShutdown: () => context.shutdown(),
-				})
+				}).pipe(Effect.tap((client) => Effect.sync(() => {
+					this.contextRuntime = new WorkerContextRuntime(client);
+					this.reportRuntime = new WorkerReportRuntime(client);
+				})))
 				: Effect.void),
 			Effect.as(this),
 			Effect.tap(() => Effect.sync(() => { this.started = true; })),
@@ -90,9 +97,26 @@ export class WorkerLifecycle {
 
 	shutdown(): Effect.Effect<void> {
 		return this.runtime.shutdown().pipe(Effect.ensuring(Effect.sync(() => {
+			this.contextRuntime = undefined;
+			this.reportRuntime = undefined;
 			this.released = true;
 			this.started = false;
 		})));
+	}
+
+	getContext(): AuthoritativeWorkerContext {
+		if (!this.contextRuntime) throw new WorkerLifecycleError({ message: "Worker native protocol has not started." });
+		return this.contextRuntime.get();
+	}
+
+	waitForFeedback(signal?: AbortSignal, timeoutMs?: number): Promise<WorkerFeedback> {
+		if (!this.contextRuntime) return Promise.reject(new WorkerLifecycleError({ message: "Worker native protocol has not started." }));
+		return this.contextRuntime.waitForFeedback(signal, timeoutMs);
+	}
+
+	submitReport(report: WorkerReport, signal?: AbortSignal): Promise<ReportValidationResult> {
+		if (!this.reportRuntime) return Promise.reject(new WorkerLifecycleError({ message: "Worker native protocol has not started." }));
+		return this.reportRuntime.submit(report, this.getContext(), signal);
 	}
 
 	get isStarted(): boolean { return this.started; }

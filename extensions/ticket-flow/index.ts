@@ -7,7 +7,21 @@ import { registerOrchestratorTools } from "./orchestrator/tools.ts";
 import { detectWorkflowRole, isTicketFlowInvocation } from "./role.ts";
 import type { WorkflowRun } from "./domain.ts";
 import { prepareWorkerLifecycle, type WorkerLifecycle } from "./worker/lifecycle.ts";
+import { registerWorkerTools } from "./worker/tools.ts";
 import { TmuxController } from "./tmux/controller.ts";
+
+export const WORKER_SYSTEM_PROMPT = `## Ticket Flow worker role
+
+- Work only on the delegated work item.
+- Use normal tools and follow all project instructions.
+- Call workflow_context after context loss or whenever the delegated scope is uncertain.
+- Call workflow_submit_report for progress, blockers, failure, and final completion.
+- Do not mark ticket files complete; the orchestrator owns completion recording.
+- Do not claim a check passed unless you ran it.`;
+
+export function appendWorkerSystemPrompt(systemPrompt: string): string {
+	return `${systemPrompt}\n\n${WORKER_SYSTEM_PROMPT}`;
+}
 
 export function workflowFooterStatus(run: WorkflowRun): string {
 	if (run.phase === "ready") return `ticket-flow · ready · ${run.plan.workItems.length} items`;
@@ -34,10 +48,12 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	const role = detectWorkflowRole();
 	if (role === "worker") {
 		let lifecycle: WorkerLifecycle | undefined;
+		registerWorkerTools(pi, () => lifecycle);
 		pi.on("session_start", async (_event, ctx) => {
 			lifecycle = await Effect.runPromise(prepareWorkerLifecycle(), { signal: ctx.signal });
 			await Effect.runPromise(lifecycle.start(pi, ctx), { signal: ctx.signal });
 		});
+		pi.on("before_agent_start", (event) => ({ systemPrompt: appendWorkerSystemPrompt(event.systemPrompt) }));
 		pi.on("input", (event, ctx) => {
 			if (!isTicketFlowInvocation(event.text)) return;
 			if (ctx.hasUI) ctx.ui.notify("A Ticket Flow worker cannot start a nested workflow.", "error");

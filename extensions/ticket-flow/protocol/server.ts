@@ -22,12 +22,15 @@ export interface CommandReceipt { readonly requestId: string; readonly messageId
 export class ProtocolServerError extends Error { constructor(message: string) { super(message); this.name = "ProtocolServerError"; } }
 interface Waiter { readonly predicate: (event: WorkflowProtocolEvent) => boolean; readonly resolve: (event: WorkflowProtocolEvent) => void; readonly reject: (cause: unknown) => void; }
 interface AcknowledgementWaiter { readonly resolve: () => void; readonly reject: (cause: unknown) => void; }
-interface PendingCommand { readonly receipt: CommandReceipt; readonly type: "delegate" | "feedback" | "shutdown"; readonly payload: Record<string, string>; acknowledged: boolean; readonly waiters: Set<AcknowledgementWaiter>; }
+interface PendingCommand { readonly receipt: CommandReceipt; readonly type: "delegate" | "feedback" | "shutdown"; readonly payload: Record<string, unknown>; acknowledged: boolean; readonly waiters: Set<AcknowledgementWaiter>; }
 type IncomingMessage =
 	| { readonly type: "message"; readonly socket: Socket; readonly message: ProtocolEnvelope }
 	| { readonly type: "closed"; readonly socket: Socket };
 function expectedProfile(profile: PiLaunchProfile): { provider: string; model: string } { const slash = profile.model.indexOf("/"); return { provider: profile.model.slice(0, slash), model: profile.model.slice(slash + 1) }; }
-function commandPayload(payload: Record<string, string> | Record<string, never>): payload is Record<string, string> { return "requestId" in payload; }
+function commandPayload(payload: Record<string, unknown>): payload is Record<string, unknown> & { readonly requestId: string } { return typeof payload.requestId === "string"; }
+function requiresWorkerAcknowledgement(type: ProtocolEnvelope["type"]): boolean {
+	return type === "worker-progress" || type === "worker-report" || type === "worker-blocked" || type === "worker-failed";
+}
 
 export class ProtocolServer {
 	private server: net.Server | undefined;
@@ -118,7 +121,9 @@ export class ProtocolServer {
 		const previous = this.seenIncoming.get(message.messageId);
 		if (previous !== undefined) {
 			if (previous !== serialized) return this.reject(socket);
-			if (message.type === "worker-connected" && this.verified) this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+			if ((message.type === "worker-connected" && this.verified) || requiresWorkerAcknowledgement(message.type)) {
+				this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+			}
 			return;
 		}
 		this.seenIncoming.set(message.messageId, serialized);
@@ -147,7 +152,12 @@ export class ProtocolServer {
 			}
 			if (message.runId !== this.options.runId || message.workItemId !== this.options.workItemId) throw new ProtocolServerError("Worker message identity changed after verification");
 			if (message.type === "accepted") { await this.acceptAcknowledgement((message.payload as { requestId: string }).requestId); return; }
-			const event = toWorkflowEvent(message); if (event) { this.emit(event); await this.options.onEvent?.(event); }
+			const event = toWorkflowEvent(message);
+			if (event) {
+				await this.options.onEvent?.(event);
+				this.emit(event);
+				if (requiresWorkerAcknowledgement(message.type)) this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+			}
 		} catch { this.reject(socket); }
 	}
 	private reject(socket: Socket): void {
@@ -176,7 +186,7 @@ export class ProtocolServer {
 		});
 	}
 	private write(message: ProtocolEnvelope): void { if (!this.peer || this.peer.destroyed) throw new ProtocolServerError("Native worker socket is unavailable"); this.peer.write(encodeJsonLine(message)); }
-	send(type: "delegate" | "feedback" | "accepted" | "shutdown" | "ping", payload: Record<string, string> | Record<string, never>, messageId: string = crypto.randomUUID()): CommandReceipt | undefined {
+	send(type: "delegate" | "feedback" | "accepted" | "shutdown" | "ping", payload: Record<string, unknown>, messageId: string = crypto.randomUUID()): CommandReceipt | undefined {
 		if (!this.verified) throw new ProtocolServerError("Cannot send before worker profile verification");
 		if (type !== "delegate" && type !== "feedback" && type !== "shutdown") { this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, messageId)); return undefined; }
 		if (!commandPayload(payload) || typeof payload.requestId !== "string") throw new ProtocolServerError(`${type} requires a request ID`);

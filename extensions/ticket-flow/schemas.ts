@@ -56,15 +56,17 @@ export const WorkflowPlanSchema = Schema.Struct({
 });
 
 export const RequirementResultSchema = Schema.Struct({
-	requirement: Schema.String,
-	result: Schema.Literals(["satisfied", "unsatisfied", "not-applicable"]),
+	requirementId: Schema.optionalKey(Schema.String),
+	requirement: Schema.optionalKey(Schema.String),
+	result: Schema.Literals(["satisfied", "not-satisfied", "not-applicable"]),
 	evidence: Schema.String,
 });
 
 export const CheckResultSchema = Schema.Struct({
 	command: Schema.String,
-	result: Schema.Literals(["passed", "failed", "skipped"]),
+	result: Schema.Literals(["passed", "failed", "not-run"]),
 	output: Schema.optionalKey(Schema.String),
+	reason: Schema.optionalKey(Schema.String),
 });
 
 export const WorkerReportSchema = Schema.Struct({
@@ -72,10 +74,12 @@ export const WorkerReportSchema = Schema.Struct({
 	summary: Schema.String,
 	requirements: Schema.optionalKey(Schema.Array(RequirementResultSchema)),
 	filesChanged: Schema.optionalKey(Schema.Array(Schema.String)),
+	filesChangedExplanation: Schema.optionalKey(Schema.String),
 	checks: Schema.optionalKey(Schema.Array(CheckResultSchema)),
 	caveats: Schema.optionalKey(Schema.Array(Schema.String)),
 	blockers: Schema.optionalKey(Schema.Array(Schema.String)),
 	questions: Schema.optionalKey(Schema.Array(Schema.String)),
+	userInterventionRequired: Schema.optionalKey(Schema.Boolean),
 });
 
 export const TmuxWindowStateSchema = Schema.Struct({

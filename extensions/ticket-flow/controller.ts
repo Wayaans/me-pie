@@ -16,6 +16,8 @@ import { TmuxController } from "./tmux/controller.ts";
 import { readWorkflowToken, removeWorkflowToken, workflowSocketPath, writeWorkflowToken } from "./protocol/runtime.ts";
 import { ProtocolServer, type ProtocolRejection } from "./protocol/server.ts";
 import type { WorkflowProtocolEvent } from "./protocol/messages.ts";
+import { makeAuthoritativeWorkerContext, requirementId } from "./worker/context.ts";
+import { persistReportAttempt, validateWorkerReport } from "./worker/report.ts";
 
 export const WORKFLOW_TOOL_NAMES = [
 	"workflow_plan",
@@ -460,13 +462,62 @@ export class WorkflowController {
 					workItemId: item.id, requestedLaunchProfile: active.requestedLaunchProfile,
 					actualLaunchProfile: { provider: event.identity.provider, model: event.identity.model, thinking: event.identity.thinking },
 				});
-				server.send("delegate", { prompt: item.delegationPrompt, requestId: delegate.requestId }, delegate.messageId);
+				const context = makeAuthoritativeWorkerContext(next, item, event.identity);
+				server.send("delegate", { prompt: item.delegationPrompt, context, requestId: delegate.requestId }, delegate.messageId);
 				return;
 			}
 			const state = this.active;
 			if (!state || active.activeWorkItemId !== event.workItemId) return yield* Effect.fail(new Error("Worker event does not match the active work item."));
-			const workflowEvent = yield* makeWorkflowEvent(active.id, event.type, { workItemId: event.workItemId, payload: event.payload, messageId: event.messageId });
-			yield* appendEvent(state.paths.eventsFile, workflowEvent);
+			const item = active.plan.workItems.find((candidate) => candidate.id === event.workItemId);
+			if (!item) return yield* Effect.fail(new Error("Worker event references an unknown work item."));
+			if (event.type === "worker-ready" || event.type === "worker-shutdown") {
+				const workflowEvent = yield* makeWorkflowEvent(active.id, event.type, { workItemId: event.workItemId, messageId: event.messageId });
+				yield* appendEvent(state.paths.eventsFile, workflowEvent);
+				return;
+			}
+			const report = event.payload.report;
+			const requirements = item.requirements.map((requirement, index) => ({ id: requirementId(index), requirement }));
+			const validation = validateWorkerReport(report, requirements);
+			if (event.type === "worker-progress") {
+				const workflowEvent = yield* makeWorkflowEvent(active.id, event.type, { workItemId: event.workItemId, payload: event.payload, messageId: event.messageId });
+				yield* appendEvent(state.paths.eventsFile, workflowEvent);
+				return;
+			}
+			if (!active.worker || !active.requestedLaunchProfile) return yield* Effect.fail(new Error("Final report arrived without authenticated worker launch metadata."));
+			const persisted = yield* persistReportAttempt({
+				paths: state.paths,
+				runId: active.id,
+				workItemId: item.id,
+				submittedAt: this.now().toISOString(),
+				identity: active.worker,
+				requestedLaunchProfile: active.requestedLaunchProfile,
+				report,
+			});
+			let status = item.status;
+			if (event.type === "worker-report") {
+				status = yield* transitionWorkItem(status, "report-pending");
+				status = yield* transitionWorkItem(status, "report-review");
+			} else if (event.type === "worker-blocked") {
+				status = yield* transitionWorkItem(status, "blocked");
+			}
+			const phase = event.type === "worker-blocked"
+				? yield* transitionRun(active.phase, "paused")
+				: event.type === "worker-failed"
+					? yield* transitionRun(active.phase, "failed")
+					: active.phase;
+			const next: WorkflowRun = {
+				...active,
+				phase,
+				updatedAt: this.now().toISOString(),
+				plan: { ...active.plan, workItems: active.plan.workItems.map((candidate) => candidate.id === item.id ? { ...candidate, status } : candidate) },
+			};
+			yield* this.persist(next, event.type, {
+				workItemId: event.workItemId,
+				messageId: event.messageId,
+				reportAttempt: persisted.attempt.attempt,
+				reportFile: persisted.path,
+				validation,
+			});
 		});
 	}
 
@@ -478,7 +529,7 @@ export class WorkflowController {
 			const server = this.active?.protocol;
 			if (!server) return yield* Effect.fail(new Error("Native worker protocol is not running."));
 			const event = yield* Effect.tryPromise({
-				try: () => waitWithTimeout((waitSignal) => server.wait((candidate) => until === "any" || (until === "connected" && candidate.type === "worker-connected") || (until === "ready" && candidate.type === "worker-ready") || (until === "progress" && candidate.type === "worker-progress") || (until === "report" && candidate.type === "worker-report") || (until === "blocked" && candidate.type === "worker-blocked") || (until === "exit" && candidate.type === "worker-shutdown"), waitSignal), signal, timeoutMs),
+				try: () => waitWithTimeout((waitSignal) => server.wait((candidate) => until === "any" || (until === "connected" && candidate.type === "worker-connected") || (until === "ready" && candidate.type === "worker-ready") || (until === "progress" && candidate.type === "worker-progress") || (until === "report" && (candidate.type === "worker-report" || candidate.type === "worker-failed")) || (until === "blocked" && candidate.type === "worker-blocked") || (until === "exit" && candidate.type === "worker-shutdown"), waitSignal), signal, timeoutMs),
 				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
 			});
 			return boundStatusOutput(JSON.stringify(event));
@@ -503,7 +554,7 @@ export class WorkflowController {
 				updatedAt: this.now().toISOString(),
 				protocolCommands: [...(active.protocolCommands ?? []), command],
 			}, "worker-feedback-sending", { workItemId, requestId: command.requestId, messageId: command.messageId });
-			server.send("feedback", { message, requestId: command.requestId }, command.messageId);
+			server.send("feedback", { kind: "message", message, requestId: command.requestId }, command.messageId);
 			yield* Effect.tryPromise({
 				try: () => waitWithTimeout((waitSignal) => server.waitForAcknowledgement(command.requestId, waitSignal), signal, 2_000),
 				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),

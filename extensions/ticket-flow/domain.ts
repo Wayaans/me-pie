@@ -80,16 +80,23 @@ export interface WorkerIdentity {
 	readonly sessionFile?: string;
 }
 
-export interface RequirementResult {
+export interface PlannedRequirement {
+	readonly id: string;
 	readonly requirement: string;
-	readonly result: "satisfied" | "unsatisfied" | "not-applicable";
+}
+
+export interface RequirementResult {
+	readonly requirementId?: string;
+	readonly requirement?: string;
+	readonly result: "satisfied" | "not-satisfied" | "not-applicable";
 	readonly evidence: string;
 }
 
 export interface CheckResult {
 	readonly command: string;
-	readonly result: "passed" | "failed" | "skipped";
+	readonly result: "passed" | "failed" | "not-run";
 	readonly output?: string;
+	readonly reason?: string;
 }
 
 export interface WorkerReport {
@@ -97,11 +104,40 @@ export interface WorkerReport {
 	readonly summary: string;
 	readonly requirements?: readonly RequirementResult[];
 	readonly filesChanged?: readonly string[];
+	readonly filesChangedExplanation?: string;
 	readonly checks?: readonly CheckResult[];
 	readonly caveats?: readonly string[];
 	readonly blockers?: readonly string[];
 	readonly questions?: readonly string[];
+	readonly userInterventionRequired?: boolean;
 }
+
+export interface ExpectedReportContract {
+	readonly schemaVersion: number;
+	readonly statuses: readonly WorkerReport["status"][];
+	readonly commonFields: readonly string[];
+	readonly completedRequirements: readonly string[];
+}
+
+export interface AuthoritativeWorkerContext {
+	readonly runId: string;
+	readonly workItemId: string;
+	readonly workItemTitle: string;
+	readonly sourcePaths: readonly string[];
+	readonly specificationPaths: readonly string[];
+	readonly requirements: readonly PlannedRequirement[];
+	readonly userResolutions: readonly UserResolution[];
+	readonly delegationPrompt: string;
+	readonly requestedLaunchProfile: PiLaunchProfile;
+	readonly actualLaunchProfile: PiLaunchProfile & { readonly provider: string };
+	readonly expectedReport: ExpectedReportContract;
+	readonly truncated: boolean;
+}
+
+export type WorkerFeedback =
+	| { readonly type: "accepted" }
+	| { readonly type: "feedback"; readonly kind: "message" | "revision" | "user-answer"; readonly message: string; readonly missingRequirements?: readonly string[]; readonly questions?: readonly string[] }
+	| { readonly type: "shutdown" };
 
 export type PlanChange =
 	| { readonly type: "set-summary"; readonly summary: string }

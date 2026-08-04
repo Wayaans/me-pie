@@ -312,7 +312,7 @@ test("system-prompt injection is active only while a command-created run exists"
 	}
 });
 
-test("worker role excludes commands and workflow tools and rejects nested startup", () => {
+test("worker role registers only worker workflow tools and rejects nested startup", () => {
 	const previousRole = process.env.MEPIE_WORKFLOW_ROLE;
 	process.env.MEPIE_WORKFLOW_ROLE = "worker";
 	try {
@@ -326,7 +326,7 @@ test("worker role excludes commands and workflow tools and rejects nested startu
 		};
 		ticketFlow(fake as unknown as ExtensionAPI);
 		assert.deepEqual(commands, []);
-		assert.deepEqual(tools, []);
+		assert.deepEqual(tools, ["workflow_context", "workflow_submit_report"]);
 		const notices: string[] = [];
 		const ctx = { hasUI: true, ui: { notify: (message: string) => notices.push(message) } } as unknown as ExtensionContext;
 		assert.deepEqual(inputHandler?.({ text: "/ticket-flow tmux nested" }, ctx), { action: "handled" });
