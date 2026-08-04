@@ -26,6 +26,26 @@ export const CompletionStrategySchema = Schema.Union([
 	Schema.Struct({ type: Schema.Literal("move-file"), from: Schema.String, to: Schema.String }),
 ]);
 
+export const WorkerIdentitySchema = Schema.Struct({
+	runId: Schema.String,
+	workItemId: Schema.String,
+	provider: Schema.String,
+	model: Schema.String,
+	thinking: ThinkingLevelSchema,
+	sessionId: Schema.optionalKey(Schema.String),
+	sessionFile: Schema.optionalKey(Schema.String),
+});
+
+export const CompletionRecordSchema = Schema.Struct({
+	acceptedAttempt: Schema.Number,
+	acceptedReportPath: Schema.String,
+	comment: Schema.String,
+	completedAt: Schema.String,
+	strategy: CompletionStrategySchema,
+	worker: Schema.optionalKey(WorkerIdentitySchema),
+	requestedLaunchProfile: Schema.optionalKey(Schema.Struct({ model: Schema.String, thinking: ThinkingLevelSchema })),
+});
+
 export const UserResolutionSchema = Schema.Struct({
 	id: Schema.String,
 	question: Schema.String,
@@ -45,6 +65,7 @@ export const WorkItemSchema = Schema.Struct({
 	delegationPrompt: Schema.String,
 	launchProfile: Schema.optionalKey(PiLaunchProfileSchema),
 	completionStrategy: Schema.optionalKey(CompletionStrategySchema),
+	completion: Schema.optionalKey(CompletionRecordSchema),
 	status: WorkItemStatusSchema,
 });
 
@@ -94,16 +115,6 @@ export const TmuxWindowStateSchema = Schema.Struct({
 	socketPath: Schema.String,
 });
 
-export const WorkerIdentitySchema = Schema.Struct({
-	runId: Schema.String,
-	workItemId: Schema.String,
-	provider: Schema.String,
-	model: Schema.String,
-	thinking: ThinkingLevelSchema,
-	sessionId: Schema.optionalKey(Schema.String),
-	sessionFile: Schema.optionalKey(Schema.String),
-});
-
 const PlanChangeSchema = Schema.Union([
 	Schema.Struct({ type: Schema.Literal("set-summary"), summary: Schema.String }),
 	Schema.Struct({ type: Schema.Literal("upsert-work-item"), workItem: WorkItemSchema }),
@@ -111,6 +122,24 @@ const PlanChangeSchema = Schema.Union([
 	Schema.Struct({ type: Schema.Literal("set-user-resolutions"), userResolutions: Schema.Array(UserResolutionSchema) }),
 	Schema.Struct({ type: Schema.Literal("set-unresolved-questions"), questions: Schema.Array(Schema.String) }),
 ]);
+
+const ProgressionCheckpointSchema = Schema.Struct({
+	operation: Schema.Literals(["accept", "block", "revision", "close"]),
+	stage: Schema.String,
+	workItemId: Schema.String,
+	updatedAt: Schema.String,
+	reportAttempt: Schema.optionalKey(Schema.Number),
+	comment: Schema.optionalKey(Schema.String),
+	completion: Schema.optionalKey(CompletionRecordSchema),
+});
+
+const WorkflowBlockerSchema = Schema.Struct({
+	workItemId: Schema.String,
+	message: Schema.String,
+	questions: Schema.Array(Schema.String),
+	reportedAt: Schema.String,
+	resolvedAt: Schema.optionalKey(Schema.String),
+});
 
 const PlanningDetailsSchema = Schema.Struct({
 	unresolvedQuestions: Schema.Array(Schema.String),
@@ -140,6 +169,8 @@ export const WorkflowRunSchema = Schema.Struct({
 	}))),
 	tmux: Schema.optionalKey(TmuxWindowStateSchema),
 	worker: Schema.optionalKey(WorkerIdentitySchema),
+	progression: Schema.optionalKey(ProgressionCheckpointSchema),
+	blockers: Schema.optionalKey(Schema.Array(WorkflowBlockerSchema)),
 });
 
 export const StateDocumentSchema = Schema.Struct({ version: Schema.Literal(SCHEMA_VERSION), run: WorkflowRunSchema });

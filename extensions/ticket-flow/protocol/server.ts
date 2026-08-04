@@ -154,6 +154,15 @@ export class ProtocolServer {
 			if (message.type === "accepted") { await this.acceptAcknowledgement((message.payload as { requestId: string }).requestId); return; }
 			const event = toWorkflowEvent(message);
 			if (event) {
+				// Shutdown is a transport-level lifecycle notification. Do not await
+				// the serialized controller callback before processing the command
+				// acknowledgement: the controller may be waiting for that ack while
+				// holding its progression permit.
+				if (event.type === "worker-shutdown") {
+					this.emit(event);
+					void Promise.resolve(this.options.onEvent?.(event)).catch(() => undefined);
+					return;
+				}
 				await this.options.onEvent?.(event);
 				this.emit(event);
 				if (requiresWorkerAcknowledgement(message.type)) this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
@@ -211,9 +220,12 @@ export class ProtocolServer {
 		if (!command) throw new ProtocolServerError("Acknowledgement does not match a pending command");
 		if (command.acknowledged) return;
 		command.acknowledged = true;
-		await this.options.onAcknowledgement?.(command.receipt);
+		// Resolve transport waiters before persisting the acknowledgement. The
+		// controller may be holding its progression permit while waiting for this
+		// receipt; persisting first would deadlock that serialized operation.
 		for (const waiter of command.waiters) waiter.resolve();
 		command.waiters.clear();
+		await this.options.onAcknowledgement?.(command.receipt);
 	}
 	waitForAcknowledgement(requestId: string, signal?: AbortSignal): Promise<CommandReceipt> {
 		const command = this.pendingCommands.get(requestId); if (!command) return Promise.reject(new ProtocolServerError("Unknown command request ID"));

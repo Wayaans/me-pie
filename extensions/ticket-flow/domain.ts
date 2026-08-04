@@ -48,6 +48,39 @@ export interface UserResolution {
 	readonly resolvedAt: string;
 }
 
+/** Durable metadata written when an orchestrator accepts a worker report. */
+export interface CompletionRecord {
+	readonly acceptedAttempt: number;
+	readonly acceptedReportPath: string;
+	readonly comment: string;
+	readonly completedAt: string;
+	readonly strategy: CompletionStrategy;
+	readonly worker?: WorkerIdentity;
+	readonly requestedLaunchProfile?: PiLaunchProfile;
+}
+
+/**
+ * A durable boundary around progression side effects. Reports and terminal
+ * captures stay in their own files and are not copied into the run snapshot.
+ */
+export interface ProgressionCheckpoint {
+	readonly operation: "accept" | "block" | "revision" | "close";
+	readonly stage: string;
+	readonly workItemId: string;
+	readonly updatedAt: string;
+	readonly reportAttempt?: number;
+	readonly comment?: string;
+	readonly completion?: CompletionRecord;
+}
+
+export interface WorkflowBlocker {
+	readonly workItemId: string;
+	readonly message: string;
+	readonly questions: readonly string[];
+	readonly reportedAt: string;
+	readonly resolvedAt?: string;
+}
+
 export interface WorkItem {
 	readonly id: string;
 	readonly title: string;
@@ -60,6 +93,8 @@ export interface WorkItem {
 	readonly delegationPrompt: string;
 	readonly launchProfile?: Partial<PiLaunchProfile>;
 	readonly completionStrategy?: CompletionStrategy;
+	/** Present for accepted items; absent while the item is still in progress. */
+	readonly completion?: CompletionRecord;
 	readonly status: WorkItemStatus;
 }
 
@@ -195,6 +230,9 @@ export interface WorkflowRun {
 	readonly protocolCommands?: readonly ProtocolCommandState[];
 	readonly tmux?: TmuxWindowState;
 	readonly worker?: WorkerIdentity;
+	/** Last durable progression boundary, used to make external steps recoverable. */
+	readonly progression?: ProgressionCheckpoint;
+	readonly blockers?: readonly WorkflowBlocker[];
 }
 
 export function createRunId(): string {

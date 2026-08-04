@@ -44,6 +44,11 @@ function persistenceFailure(operation: string, filePath: string, cause: unknown)
 	return new PersistenceError({ operation, path: filePath, cause });
 }
 
+function throwIfAborted(...signals: readonly (AbortSignal | undefined)[]): void {
+	const signal = signals.find((candidate) => candidate?.aborted);
+	if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+}
+
 const SECRET_KEY_PARTS = ["apikey", "authorization", "credential", "password", "secret", "token"];
 const SECRET_ASSIGNMENT = /(?:api[-_ ]?key|access[-_ ]?token|client[-_ ]?secret|authorization|password)\s*[:=]\s*\S+/i;
 
@@ -93,13 +98,17 @@ export function deterministicJsonLine(value: unknown): string {
 export function ensureRunDirectories(
 	paths: WorkflowPaths,
 	fs: StateFileSystem = nodeStateFileSystem,
+	signal?: AbortSignal,
 ): Effect.Effect<void, PersistenceError> {
 	return Effect.forEach(
 		[paths.rootDir, paths.projectDir, paths.runDir, paths.reportsDir],
 		(directory) => Effect.tryPromise({
-			try: async () => {
+			try: async (effectSignal) => {
+				throwIfAborted(signal, effectSignal);
 				await fs.mkdir(directory, { recursive: true, mode: DIRECTORY_MODE });
+				throwIfAborted(signal, effectSignal);
 				await fs.chmod(directory, DIRECTORY_MODE);
+				throwIfAborted(signal, effectSignal);
 			},
 			catch: (cause) => persistenceFailure("create secure directory", directory, cause),
 		}),
@@ -111,6 +120,7 @@ export function atomicWriteJson(
 	filePath: string,
 	value: unknown,
 	fs: StateFileSystem = nodeStateFileSystem,
+	signal?: AbortSignal,
 ): Effect.Effect<void, PersistenceError> {
 	return Effect.gen(function* () {
 		const content = yield* Effect.try({
@@ -120,14 +130,21 @@ export function atomicWriteJson(
 		const temporaryPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${crypto.randomUUID()}.tmp`);
 		let handle: WritableFile | undefined;
 		const write = Effect.tryPromise({
-			try: async () => {
+			try: async (effectSignal) => {
+				throwIfAborted(signal, effectSignal);
 				handle = await fs.openExclusive(temporaryPath, FILE_MODE);
+				throwIfAborted(signal, effectSignal);
 				await handle.writeFile(content);
+				throwIfAborted(signal, effectSignal);
 				await handle.sync();
+				throwIfAborted(signal, effectSignal);
 				await handle.close();
 				handle = undefined;
+				throwIfAborted(signal, effectSignal);
 				await fs.rename(temporaryPath, filePath);
+				throwIfAborted(signal, effectSignal);
 				await fs.chmod(filePath, FILE_MODE);
+				throwIfAborted(signal, effectSignal);
 			},
 			catch: (cause) => persistenceFailure("atomically write JSON", filePath, cause),
 		});

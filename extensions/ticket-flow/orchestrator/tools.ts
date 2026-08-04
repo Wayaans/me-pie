@@ -40,6 +40,18 @@ const WorkItemSchema = StrictObject({
 	delegationPrompt: Type.String(),
 	launchProfile: Type.Optional(LaunchProfileSchema),
 	completionStrategy: Type.Optional(CompletionStrategySchema),
+	completion: Type.Optional(StrictObject({
+		acceptedAttempt: Type.Integer({ minimum: 1 }),
+		acceptedReportPath: Type.String(),
+		comment: Type.String(),
+		completedAt: Type.String(),
+		strategy: CompletionStrategySchema,
+		worker: Type.Optional(StrictObject({
+			runId: Type.String(), workItemId: Type.String(), provider: Type.String(), model: Type.String(), thinking: ThinkingSchema,
+			sessionId: Type.Optional(Type.String()), sessionFile: Type.Optional(Type.String()),
+		})),
+		requestedLaunchProfile: Type.Optional(StrictObject({ model: Type.String(), thinking: ThinkingSchema })),
+	})),
 	status: WorkItemStatusSchema,
 });
 const WorkflowPlanSchema = StrictObject({
@@ -79,6 +91,7 @@ export const WorkflowReviewReportParameters = StrictObject({
 	feedback: Type.Optional(Type.String()),
 	missingRequirements: Type.Optional(Type.Array(Type.String())),
 	questions: Type.Optional(Type.Array(Type.String())),
+	answers: Type.Optional(Type.Array(Type.String())),
 });
 
 export const WorkflowControlParameters = StrictObject({
@@ -101,9 +114,22 @@ function runController<A, E>(operation: Effect.Effect<A, E>, signal: AbortSignal
 	return Effect.runPromise(operation, { signal });
 }
 
-function requireOnly<T>(value: T | undefined, name: string): T {
-	if (value === undefined) throw new Error(`workflow_plan ${name} is required for this action.`);
+function requireOnly<T>(value: T | undefined, name: string, tool = "workflow_plan"): T {
+	if (value === undefined) throw new Error(`${tool} ${name} is required for this action.`);
 	return value;
+}
+
+const NO_REPORT_ERROR = "No worker report exists before Stage 5 native reporting.";
+
+function reviewController(controller: WorkflowController): controller is WorkflowController & {
+	readonly inspectReport: WorkflowController["inspectReport"];
+	readonly acceptReport: WorkflowController["acceptReport"];
+	readonly reviseReport: WorkflowController["reviseReport"];
+	readonly blockReport: WorkflowController["blockReport"];
+	readonly resumeBlockedWorker: WorkflowController["resumeBlockedWorker"];
+} {
+	const candidate = controller as unknown as Record<string, unknown>;
+	return ["inspectReport", "acceptReport", "reviseReport", "blockReport", "resumeBlockedWorker"].every((name) => typeof candidate[name] === "function");
 }
 
 export function registerOrchestratorTools(pi: ExtensionAPI, controller: WorkflowController): void {
@@ -136,10 +162,12 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 						throw new Error("workflow_plan finalize does not accept plan data or changes.");
 					}
 					const ready = await runController(controller.finalizePlan(), signal);
-					const first = ready.plan.workItems.find((item) =>
-						(item.status === "planned" || item.status === "ready" || item.status === "interrupted")
-						&& item.dependsOn.every((dependencyId) => ready.plan.workItems.find((candidate) => candidate.id === dependencyId)?.status === "completed")
-					);
+					const first = typeof (controller as unknown as { nextReadyWorkItem?: unknown }).nextReadyWorkItem === "function"
+						? controller.nextReadyWorkItem()
+						: ready.plan.workItems.find((item) =>
+							(item.status === "planned" || item.status === "ready" || item.status === "interrupted")
+							&& item.dependsOn.every((dependencyId) => ready.plan.workItems.find((candidate) => candidate.id === dependencyId)?.status === "completed")
+						);
 					const run = first === undefined
 						? ready
 						: await runController(controller.startWorker(first.id), signal);
@@ -155,7 +183,7 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 		description: "Start, wait for, inspect, send feedback to, or close the authenticated workflow-owned Pi worker.",
 		parameters: WorkflowWorkerParameters,
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, onUpdate) {
 			switch (params.action) {
 				case "delegate": {
 					if (params.message !== undefined) throw new Error("workflow_worker delegate uses the planned delegation prompt; use send for feedback.");
@@ -172,12 +200,14 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 				}
 				case "wait": {
 					if (params.message !== undefined || params.lines !== undefined) throw new Error("workflow_worker wait does not accept message or lines.");
+					onUpdate?.(result(`Waiting for ${params.until ?? "any"} from ${params.workItemId}...`, controller.activeRun));
 					const output = await runController(controller.waitWorker(params.workItemId, params.until, signal, params.timeoutMs), signal);
+					onUpdate?.(result(output, controller.activeRun));
 					return result(output, controller.activeRun);
 				}
 				case "send": {
 					if (params.until !== undefined || params.lines !== undefined) throw new Error("workflow_worker send accepts only feedback text.");
-					const run = await runController(controller.sendWorkerFeedback(params.workItemId, requireOnly(params.message, "message"), signal), signal);
+					const run = await runController(controller.sendWorkerFeedback(params.workItemId, requireOnly(params.message, "message", "workflow_worker"), signal), signal);
 					return result("Sent native feedback to the verified worker Pi session.", run);
 				}
 			}
@@ -187,11 +217,68 @@ export function registerOrchestratorTools(pi: ExtensionAPI, controller: Workflow
 	pi.registerTool({
 		name: "workflow_review_report",
 		label: "Workflow Review Report",
-		description: "Inspect or review a worker report. Native reports become available in Stage 5.",
+		description: "Inspect an immutable worker report attempt, accept it with an orchestrator comment, request a revision, or pause for a blocker. For blocker questions, call ask_me separately and repeat block with ordered answers.",
 		parameters: WorkflowReviewReportParameters,
 		executionMode: "sequential",
-		async execute() {
-			throw new Error("No worker report exists before Stage 5 native reporting.");
+		async execute(_toolCallId, params, signal) {
+			if (!reviewController(controller)) throw new Error(NO_REPORT_ERROR);
+			switch (params.action) {
+				case "inspect": {
+					if (params.comment !== undefined || params.feedback !== undefined || params.missingRequirements !== undefined || params.questions !== undefined || params.answers !== undefined) {
+						throw new Error("workflow_review_report inspect accepts only workItemId.");
+					}
+					const output = await runController(controller.inspectReport(params.workItemId, signal), signal);
+					return result(output, controller.activeRun);
+				}
+				case "accept": {
+					if (params.feedback !== undefined || params.missingRequirements !== undefined || params.questions !== undefined || params.answers !== undefined) {
+						throw new Error("workflow_review_report accept accepts only an orchestrator comment.");
+					}
+					const run = await runController(controller.acceptReport(params.workItemId, requireOnly(params.comment, "comment", "workflow_review_report"), signal), signal);
+					const next = run.phase === "completed"
+						? "Run completed."
+						: run.activeWorkItemId === undefined
+							? "Report accepted; no worker is currently active."
+							: `Report accepted; ${run.activeWorkItemId} was delegated automatically.`;
+					return result(next, run);
+				}
+				case "revise": {
+					if (params.comment !== undefined || params.questions !== undefined || params.answers !== undefined) {
+						throw new Error("workflow_review_report revise accepts feedback and optional missingRequirements.");
+					}
+					const run = await runController(controller.reviseReport(
+						params.workItemId,
+						requireOnly(params.feedback, "feedback", "workflow_review_report"),
+						params.missingRequirements ?? [],
+						signal,
+					), signal);
+					return result("Revision feedback was sent to the same worker Pi session.", run);
+				}
+				case "block": {
+					if (params.comment !== undefined || params.missingRequirements !== undefined) {
+						throw new Error("workflow_review_report block accepts feedback, questions, and answers.");
+					}
+					const questions = params.questions ?? [];
+					const answers = params.answers;
+					if (answers !== undefined && (questions.length === 0 || answers.length !== questions.length)) {
+						throw new Error("workflow_review_report block answers must match the supplied questions; call ask_me first when answers are absent.");
+					}
+					const blocked = await runController(controller.blockReport(params.workItemId, {
+						...(params.feedback === undefined ? {} : { message: params.feedback }),
+						...(questions.length === 0 ? {} : { questions }),
+					}, signal), signal);
+					if (answers === undefined) {
+						// Extensions cannot invoke another registered tool through ExtensionAPI;
+						// return an explicit continuation for the orchestrator to call ask_me.
+						const prompt = questions.length === 0
+							? "Worker blocker recorded; Ticket Flow is paused."
+							: `Worker blocker recorded; call ask_me with these questions, then repeat workflow_review_report block with the exact questions and answers:\n${questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}`;
+						return result(prompt, blocked);
+					}
+					const resumed = await runController(controller.resumeBlockedWorker(params.workItemId, questions, answers, signal), signal);
+					return result("Blocker answers were recorded and sent to the same worker Pi session.", resumed);
+				}
+			}
 		},
 	});
 

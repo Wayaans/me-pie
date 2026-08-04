@@ -8,7 +8,7 @@ const RUN_TRANSITIONS: Readonly<Record<RunPhase, readonly RunPhase[]>> = {
 	"awaiting-user": ["analyzing", "ready", "paused", "failed", "stopped"],
 	ready: ["executing", "paused", "failed", "stopped"],
 	executing: ["completed", "paused", "failed", "stopped"],
-	paused: ["analyzing", "awaiting-user", "ready", "executing", "failed", "stopped"],
+	paused: ["analyzing", "awaiting-user", "ready", "executing", "completed", "failed", "stopped"],
 	completed: [],
 	failed: [],
 	stopped: [],
@@ -107,6 +107,14 @@ function validateFinalizedItem(item: WorkItem): Effect.Effect<void, ValidationEr
 	}
 	if (!THINKING_LEVELS.includes(item.launchProfile.thinking)) return fail("unsupported thinking level", item.id);
 	if (!item.completionStrategy) return fail("finalized item must have a completion strategy", item.id);
+	const strategy = item.completionStrategy;
+	if ((strategy.type === "append-markdown" || strategy.type === "frontmatter") && !strategy.path.trim()) {
+		return fail("completion strategy target path must not be empty", item.id);
+	}
+	if (strategy.type === "frontmatter" && !strategy.field.trim()) return fail("frontmatter completion field must not be empty", item.id);
+	if ((strategy.type === "rename-file" || strategy.type === "move-file") && (!strategy.from.trim() || !strategy.to.trim())) {
+		return fail("file completion source and destination must not be empty", item.id);
+	}
 	return Effect.void;
 }
 
@@ -193,12 +201,20 @@ export function validateRun(run: WorkflowRun): Effect.Effect<void, ValidationErr
 		if (activeItems.length === 1 && run.activeWorkItemId !== activeItems[0]?.id) {
 			return yield* fail("active worker state must match the run's active work item", "activeWorkItemId");
 		}
-		if (activeItems.length === 0 && (run.requestedLaunchProfile !== undefined || run.workflowSocketPath !== undefined || run.tmux !== undefined)) {
+		const ownedTerminalItem = run.activeWorkItemId !== undefined && (byId.get(run.activeWorkItemId)?.status === "completed" || byId.get(run.activeWorkItemId)?.status === "failed");
+		if (activeItems.length === 0 && !ownedTerminalItem && (run.requestedLaunchProfile !== undefined || run.workflowSocketPath !== undefined || run.tmux !== undefined)) {
 			return yield* fail("worker launch metadata requires an active work-item state", "activeWorkItemId");
 		}
 	});
 }
 
 export function normalizePlan(plan: WorkflowPlan): WorkflowPlan {
-	return { ...plan, workItems: [...plan.workItems].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)) };
+	return {
+		...plan,
+		workItems: [...plan.workItems]
+			.map((item) => item.completionStrategy === undefined
+				? { ...item, completionStrategy: { type: "ledger-only" as const } }
+				: item)
+			.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+	};
 }

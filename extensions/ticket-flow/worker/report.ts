@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { Effect } from "effect";
 import type {
@@ -55,6 +55,11 @@ export interface ReportValidationResult {
 function requireText(value: string | undefined, field: string): string {
 	if (value === undefined || !value.trim()) throw new Error(`${field} must be non-empty.`);
 	return value;
+}
+
+function throwIfAborted(...signals: readonly (AbortSignal | undefined)[]): void {
+	const signal = signals.find((candidate) => candidate?.aborted);
+	if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
 }
 
 function ensureTextArray(values: readonly string[] | undefined, field: string, required: boolean): readonly string[] {
@@ -157,9 +162,14 @@ export function safeReportItemId(workItemId: string): string {
 	return `${readable || "item"}-${hash}`;
 }
 
-async function nextAttempt(reportsDirectory: string, safeId: string): Promise<number> {
+async function nextAttempt(reportsDirectory: string, safeId: string, signal?: AbortSignal): Promise<number> {
+	throwIfAborted(signal);
 	let names: readonly string[] = [];
-	try { names = await readdir(reportsDirectory); } catch (cause) {
+	try {
+		names = await readdir(reportsDirectory);
+		throwIfAborted(signal);
+	} catch (cause) {
+		throwIfAborted(signal);
 		if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
 	}
 	const escaped = safeId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -170,17 +180,23 @@ async function nextAttempt(reportsDirectory: string, safeId: string): Promise<nu
 	}, 0) + 1;
 }
 
-export function persistReportAttempt(input: PersistReportInput): Effect.Effect<{ readonly path: string; readonly attempt: WorkerReportAttempt }, Error> {
+export function persistReportAttempt(input: PersistReportInput, signal?: AbortSignal): Effect.Effect<{ readonly path: string; readonly attempt: WorkerReportAttempt }, Error> {
 	return Effect.gen(function* () {
+		throwIfAborted(signal);
 		if (input.identity.runId !== input.runId || input.identity.workItemId !== input.workItemId) {
 			return yield* Effect.fail(new Error("Worker identity does not match the report destination."));
 		}
 		if (input.report.status === "progress") return yield* Effect.fail(new Error("Progress reports are events and are not persisted as final attempts."));
 		if (containsCredential(input.report)) return yield* Effect.fail(new Error("Worker reports must not contain credentials."));
-		yield* ensureRunDirectories(input.paths);
+		yield* ensureRunDirectories(input.paths, undefined, signal);
 		const safeId = safeReportItemId(input.workItemId);
 		const attemptNumber = yield* Effect.tryPromise({
-			try: () => nextAttempt(input.paths.reportsDir, safeId),
+			try: async (effectSignal) => {
+				throwIfAborted(signal, effectSignal);
+				const attempt = await nextAttempt(input.paths.reportsDir, safeId, effectSignal);
+				throwIfAborted(signal, effectSignal);
+				return attempt;
+			},
 			catch: (cause) => new Error(`Could not determine report attempt number: ${cause instanceof Error ? cause.message : String(cause)}`),
 		});
 		const attempt: WorkerReportAttempt = {
@@ -198,17 +214,87 @@ export function persistReportAttempt(input: PersistReportInput): Effect.Effect<{
 			report: input.report,
 		};
 		const destination = path.join(input.paths.reportsDir, `${safeId}-attempt-${attemptNumber}.json`);
-		yield* atomicWriteJson(destination, attempt);
+		throwIfAborted(signal);
+		yield* atomicWriteJson(destination, attempt, undefined, signal);
 		return { path: destination, attempt };
 	});
 }
 
-export function persistAcceptedReport(paths: WorkflowPaths, attempt: WorkerReportAttempt, acceptedAt: string): Effect.Effect<string, Error> {
+function reportAttemptPath(paths: WorkflowPaths, workItemId: string, attemptNumber: number): string {
+	return path.join(paths.reportsDir, `${safeReportItemId(workItemId)}-attempt-${attemptNumber}.json`);
+}
+
+export function readReportAttempt(
+	paths: WorkflowPaths,
+	workItemId: string,
+	attemptNumber: number,
+	signal?: AbortSignal,
+): Effect.Effect<WorkerReportAttempt, Error> {
 	return Effect.gen(function* () {
-		yield* ensureRunDirectories(paths);
+		if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1) return yield* Effect.fail(new Error("Report attempt number must be a positive integer."));
+		throwIfAborted(signal);
+		const filePath = reportAttemptPath(paths, workItemId, attemptNumber);
+		const value = yield* Effect.tryPromise({
+			try: async (effectSignal) => {
+				throwIfAborted(signal, effectSignal);
+				const content = await readFile(filePath, { encoding: "utf8", signal: effectSignal });
+				throwIfAborted(signal, effectSignal);
+				return JSON.parse(content) as unknown;
+			},
+			catch: (cause) => new Error(`Could not read report attempt ${attemptNumber}: ${cause instanceof Error ? cause.message : String(cause)}`),
+		});
+		throwIfAborted(signal);
+		if (value === null || typeof value !== "object") return yield* Effect.fail(new Error("Report attempt is not an object."));
+		const attempt = value as WorkerReportAttempt;
+		if (attempt.runId === undefined || attempt.workItemId !== workItemId || attempt.attempt !== attemptNumber) {
+			return yield* Effect.fail(new Error("Report attempt identity or numbering is invalid."));
+		}
+		return attempt;
+	});
+}
+
+export function readLatestReportAttempt(
+	paths: WorkflowPaths,
+	workItemId: string,
+	signal?: AbortSignal,
+): Effect.Effect<WorkerReportAttempt | undefined, Error> {
+	return Effect.gen(function* () {
+		const safeId = safeReportItemId(workItemId);
+		const names = yield* Effect.tryPromise({
+			try: async (effectSignal) => {
+				throwIfAborted(signal, effectSignal);
+				try {
+					const values = await readdir(paths.reportsDir);
+					throwIfAborted(signal, effectSignal);
+					return values;
+				} catch (cause) {
+					throwIfAborted(signal, effectSignal);
+					if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
+					throw cause;
+				}
+			},
+			catch: (cause) => new Error(`Could not list report attempts: ${cause instanceof Error ? cause.message : String(cause)}`),
+		});
+		const escaped = safeId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const pattern = new RegExp(`^${escaped}-attempt-(\\d+)\\.json$`);
+		const attempts = names
+			.map((name) => ({ name, match: name.match(pattern) }))
+			.filter((entry): entry is { readonly name: string; readonly match: RegExpMatchArray } => entry.match !== null)
+			.sort((left, right) => Number(right.match[1]) - Number(left.match[1]));
+		const latest = attempts[0];
+		if (!latest) return undefined;
+		return yield* readReportAttempt(paths, workItemId, Number(latest.match[1]), signal);
+	});
+}
+
+export function persistAcceptedReport(paths: WorkflowPaths, attempt: WorkerReportAttempt, acceptedAt: string, signal?: AbortSignal): Effect.Effect<string, Error> {
+	return Effect.gen(function* () {
+		throwIfAborted(signal);
+		yield* ensureRunDirectories(paths, undefined, signal);
 		const destination = path.join(paths.reportsDir, `${safeReportItemId(attempt.workItemId)}-accepted.json`);
 		const accepted: AcceptedWorkerReport = { ...attempt, acceptedAt };
-		yield* atomicWriteJson(destination, accepted);
+		throwIfAborted(signal);
+		yield* atomicWriteJson(destination, accepted, undefined, signal);
 		return destination;
 	});
 }
