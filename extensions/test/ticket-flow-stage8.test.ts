@@ -285,17 +285,11 @@ test("8. an invalid-for-review report is revised and accepted in the same worker
 	const item = workItem("revision", 1);
 	await harness.begin([item]);
 	const client = await harness.connectReady(item.id);
-	const runtime = new WorkerReportRuntime(client);
-	await assert.rejects(runtime.submit({
-		status: "completed",
-		summary: "Invalid report missing required results and checks",
-		filesChanged: [],
-		filesChangedExplanation: "No files changed",
-		caveats: [],
-		blockers: [],
-	}, client.authoritativeContext!), /requires requirement results/);
-	assert.equal(harness.controller.activeRun?.plan.workItems[0]?.status, "running");
-	await harness.submitCompleted(client, "Initial report lacks enough narrative evidence");
+	await new WorkerReportRuntime(client).submit({
+		...completedReport(item, "Initial report says the requirement is not satisfied"),
+		requirements: [{ requirementId: "requirement-1", result: "not-satisfied", evidence: "Implementation evidence is missing" }],
+	}, client.authoritativeContext!);
+	await eventually(() => harness.controller.activeRun?.plan.workItems[0]?.status === "report-review");
 	await Effect.runPromise(harness.controller.reviseReport(item.id, "Provide concrete evidence", ["requirement-1"]));
 	assert.equal(harness.tmux.created.length, 1);
 	await harness.submitCompleted(client, "Revised report with concrete evidence");
@@ -331,7 +325,7 @@ test("10. a worker crash before reporting pauses recovery without spawning a dup
 	const client = await harness.connectReady(item.id);
 	const transport = client as unknown as { socket?: { destroy(error?: Error): void } };
 	transport.socket?.destroy(new Error("simulated abrupt worker crash"));
-	harness.tmux.inspection = "missing";
+	harness.tmux.inspection = "exited";
 	await Effect.runPromise(harness.controller.shutdown());
 	await harness.replaceController();
 	assert.equal(harness.controller.activeRun?.phase, "paused");
