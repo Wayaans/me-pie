@@ -105,9 +105,10 @@ export class AskMeQuestionnaire implements Focusable {
 				{ value: "no", label: "No" },
 			];
 		}
-		const options: DisplayOption[] = [...question.options];
-		if (question.allowOther) options.push({ value: "__other__", label: "Write another answer", custom: true });
-		return options;
+		return [
+			...question.options,
+			{ value: "__other__", label: "Write another answer", custom: true },
+		];
 	}
 
 	private loadCurrentEditor(): void {

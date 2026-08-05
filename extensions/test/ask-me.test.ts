@@ -38,7 +38,6 @@ test("ask-me normalizes a mixed questionnaire and recommendation", () => {
 	const request = normalizeAskMeRequest(mixedInput);
 	assert.equal(request.displayType, "questionnaire");
 	assert.equal(request.questions[0]?.required, true);
-	assert.equal(request.questions[0]?.allowOther, false);
 	assert.deepEqual(request.questions[0]?.recommendation, {
 		answer: "postgres",
 		reason: "Production requires concurrent writes.",
@@ -144,6 +143,7 @@ test("ask-me questionnaire never renders lines wider than the terminal", () => {
 		{ matches: () => false } as never,
 		() => {},
 	);
+	assert.match(component.render(100).join("\n"), /Write another answer/);
 	for (const width of [1, 12, 40, 100]) {
 		for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width);
 	}
@@ -210,6 +210,43 @@ test("ask-me RPC cancellation is not mistaken for skipping an optional question"
 		} as never,
 	) as { details: AskMeDetails };
 	assert.equal(result.details.status, "cancelled");
+});
+
+test("ask-me RPC always offers and accepts a custom selection answer", async () => {
+	const tool = captureTool();
+	let displayedOptions: string[] = [];
+	const result = await tool.execute(
+		"tool-1",
+		{
+			questions: [{
+				id: "database",
+				type: "selection",
+				question: "Which database?",
+				options: [{ value: "postgres", label: "PostgreSQL" }],
+			}],
+		},
+		undefined,
+		undefined,
+		{
+			mode: "rpc",
+			hasUI: true,
+			ui: {
+				select: async (_title: string, options: string[]) => {
+					displayedOptions = options;
+					return options.find((option) => option.includes("Write another answer"));
+				},
+				input: async () => "SQLite",
+				notify() {},
+			},
+		} as never,
+	) as { details: AskMeDetails };
+	assert.ok(displayedOptions.some((option) => option.includes("Write another answer")));
+	assert.deepEqual(result.details.answers, [{
+		id: "database",
+		value: "SQLite",
+		label: "SQLite",
+		source: "typed",
+	}]);
 });
 
 test("ask-me RPC exposes an explicit skip action for optional questions", async () => {

@@ -30,9 +30,6 @@ const AskMeQuestionSchema = Type.Object({
 		minItems: 1,
 		maxItems: 20,
 	})),
-	allowOther: Type.Optional(Type.Boolean({
-		description: "Allow a custom answer for a selection question (default: false)",
-	})),
 	required: Type.Optional(Type.Boolean({ description: "Require an answer before submission (default: true)" })),
 	recommendation: Type.Optional(AskMeRecommendationSchema),
 });
@@ -69,7 +66,6 @@ export interface AskMeQuestion {
 	question: string;
 	detail?: string;
 	options: AskMeOption[];
-	allowOther: boolean;
 	required: boolean;
 	recommendation?: AskMeRecommendation;
 }
@@ -171,7 +167,6 @@ export function normalizeAskMeRequest(input: AskMeParamsInput): AskMeRequest {
 			question,
 			...(detail ? { detail } : {}),
 			options,
-			allowOther: rawQuestion.type === "selection" && rawQuestion.allowOther === true,
 			required: rawQuestion.required !== false,
 			...(recommendation ? { recommendation } : {}),
 		} satisfies AskMeQuestion;
