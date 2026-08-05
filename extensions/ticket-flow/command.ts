@@ -1,7 +1,6 @@
-export interface TicketFlowCommand {
-	readonly backend: "tmux";
-	readonly prompt: string;
-}
+export type TicketFlowCommand =
+	| { readonly backend: "tmux"; readonly prompt: string }
+	| { readonly action: "status" | "pause" | "resume" | "stop"; };
 
 export interface CommandPrerequisites {
 	readonly mode: string;
@@ -11,12 +10,17 @@ export interface CommandPrerequisites {
 export function parseTicketFlowCommand(args: string): TicketFlowCommand {
 	const input = args.trim();
 	const tokenEnd = input.search(/\s/);
-	const backend = tokenEnd === -1 ? input : input.slice(0, tokenEnd);
-	if (backend !== "tmux") {
-		if (!backend) throw new Error("Usage: /ticket-flow tmux <prompt>");
-		throw new Error(`Unsupported Ticket Flow backend: ${backend}. Only tmux is supported.`);
+	const command = tokenEnd === -1 ? input : input.slice(0, tokenEnd);
+	const remainder = tokenEnd === -1 ? "" : input.slice(tokenEnd).trim();
+	if (command === "status" || command === "pause" || command === "resume" || command === "stop") {
+		if (remainder) throw new Error(`/${command} does not accept arguments.`);
+		return { action: command };
 	}
-	const prompt = input.slice(backend.length).trim();
+	if (command !== "tmux") {
+		if (!command) throw new Error("Usage: /ticket-flow status|pause|resume|stop or /ticket-flow tmux <prompt>");
+		throw new Error(`Unsupported Ticket Flow command: ${command}. Use status, pause, resume, stop, or tmux.`);
+	}
+	const prompt = input.slice(command.length).trim();
 	if (!prompt) throw new Error("Ticket Flow requires a non-empty prompt after 'tmux'.");
 	return { backend: "tmux", prompt };
 }
@@ -28,4 +32,4 @@ export function assertCommandPrerequisites(input: CommandPrerequisites): void {
 
 export const ORCHESTRATOR_KICKOFF = "Begin Ticket Flow analysis. Interpret the original workflow prompt, read all referenced ticket and specification material, resolve known user questions, save a normalized plan, and finalize it only when every invariant is satisfied.";
 
-export const RECOVERY_KICKOFF = "Ticket Flow recovery is attached. Call workflow_control status, preserve any explicit user pause, and continue only from the reported durable checkpoint using workflow tools.";
+export const RECOVERY_KICKOFF = "Ticket Flow recovery is attached. Call workflow_plan get, preserve any explicit user pause, and continue only from the reported durable checkpoint using workflow_delegate.";

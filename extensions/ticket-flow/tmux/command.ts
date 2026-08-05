@@ -59,6 +59,8 @@ export interface WorkerEnvironmentInput {
 	readonly runId: string;
 	readonly workItemId: string;
 	readonly profile: PiLaunchProfile;
+	/** Launch metadata is intentionally carried outside the prompt. */
+	readonly kind?: "implementation" | "audit" | "fix";
 	readonly socketPath: string;
 	readonly token: string;
 }
@@ -70,13 +72,19 @@ export function buildWorkerEnvironment(input: WorkerEnvironmentInput): Readonly<
 		MEPIE_WORKFLOW_ITEM_ID: input.workItemId,
 		MEPIE_WORKFLOW_REQUESTED_MODEL: input.profile.model,
 		MEPIE_WORKFLOW_REQUESTED_THINKING: input.profile.thinking,
+		...(input.kind === undefined ? {} : { MEPIE_WORKFLOW_WORKER_KIND: input.kind }),
 		MEPIE_WORKFLOW_SOCKET: input.socketPath,
 		MEPIE_WORKFLOW_TOKEN: input.token,
 	};
 }
 
-export function buildPiArguments(profile: PiLaunchProfile, packageRoot: string): readonly string[] {
-	return ["--model", profile.model, "--thinking", profile.thinking, "--extension", packageRoot];
+export function buildPiArguments(profile: PiLaunchProfile, packageRoot: string, options: { readonly readOnly?: boolean } = {}): readonly string[] {
+	return [
+		"--model", profile.model,
+		"--thinking", profile.thinking,
+		...(options.readOnly ? ["--tools", "read,grep,find,ls"] : []),
+		"--extension", packageRoot,
+	];
 }
 
 export function buildLauncherScript(

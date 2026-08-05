@@ -18,9 +18,9 @@ import ticketFlow from "../ticket-flow/index.ts";
 import { appendOrchestratorSystemPrompt, ORCHESTRATOR_SYSTEM_PROMPT } from "../ticket-flow/orchestrator/system-prompt.ts";
 import {
 	WorkflowControlParameters,
+	WorkflowDelegateParameters,
 	WorkflowPlanParameters,
 	WorkflowReviewReportParameters,
-	WorkflowWorkerParameters,
 	registerOrchestratorTools,
 } from "../ticket-flow/orchestrator/tools.ts";
 import { detectWorkflowRole } from "../ticket-flow/role.ts";
@@ -53,7 +53,7 @@ function item(overrides: Partial<WorkItem> = {}): WorkItem {
 }
 
 function plan(workItems: readonly WorkItem[] = [item()]): WorkflowPlan {
-	return { summary: "Implement domain", workItems, userResolutions: [], finalized: false };
+	return { summary: "Implement domain", auditProfile: { model: "openai-codex/gpt-5.6-sol", thinking: "medium" }, workItems, userResolutions: [], finalized: false };
 }
 
 function fakeToolPi(activeTools = ["read", "bash", "edit", "ask_me", "other"]): {
@@ -102,7 +102,7 @@ test("run creation persists the prompt, acquires the lock, and restricts tools",
 	assert.equal(run.phase, "analyzing");
 	assert.equal(fs.existsSync(path.join(agentDir, "state", "ticket-flow", `${run.projectId}.lock`)), true);
 	assert.equal(fs.existsSync(path.join(agentDir, "state", "ticket-flow", run.projectId, run.id, "state.json")), true);
-	assert.deepEqual(tools.active(), ["read", "ask_me", "workflow_plan", "workflow_worker", "workflow_review_report", "workflow_control"]);
+	assert.deepEqual(tools.active(), ["read", "ask_me", "workflow_plan", "workflow_delegate"]);
 	await runEffect(controller.stop());
 	assert.deepEqual(tools.active(), ["read", "bash", "edit", "ask_me", "other"]);
 	assert.equal(fs.existsSync(path.join(agentDir, "state", "ticket-flow", `${run.projectId}.lock`)), false);
@@ -121,7 +121,7 @@ test("plan finalization rejects missing launch profiles and unresolved questions
 	await assert.rejects(runEffect(controller.finalizePlan()), /explicit model and thinking level/);
 	await runEffect(controller.savePlan(plan(), ["Which API behavior?"]));
 	await assert.rejects(runEffect(controller.finalizePlan()), /unresolved user question/);
-	await runEffect(controller.updatePlan([{ type: "set-unresolved-questions", questions: [] }]));
+	await runEffect(controller.updatePlan([{ type: "set-user-resolutions", userResolutions: [{ id: "answer-api", question: "Which API behavior?", answer: "Use the strict API.", resolvedAt: "2026-01-01T00:00:00.000Z" }] }]));
 	const ready = await runEffect(controller.finalizePlan());
 	assert.equal(ready.phase, "ready");
 	assert.equal(ready.plan.finalized, true);
@@ -159,81 +159,47 @@ test("tool restriction restores only when no unrelated extension changed the act
 });
 
 test("workflow tool schemas are strict and expose every legal action", () => {
-	for (const action of ["save", "update", "finalize"]) {
+	for (const action of ["get", "save", "update"]) {
 		assert.equal(Check(WorkflowPlanParameters, { action }), true);
 	}
-	for (const action of ["delegate", "wait", "read", "send", "close"]) {
-		assert.equal(Check(WorkflowWorkerParameters, { action, workItemId: "domain" }), true);
+	for (const action of ["start", "wait", "send", "accept", "revise", "close"]) {
+		assert.equal(Check(WorkflowDelegateParameters, { action, workItemId: "domain" }), true);
 	}
-	for (const action of ["inspect", "accept", "revise", "block"]) {
-		assert.equal(Check(WorkflowReviewReportParameters, { action, workItemId: "domain" }), true);
-	}
-	for (const action of ["status", "pause", "resume", "stop", "recover"]) {
+	assert.equal(Check(WorkflowReviewReportParameters, { action: "accept", workItemId: "domain" }), true, "legacy report schema remains decodable but is not registered");
+	for (const action of ["status", "pause", "resume", "stop"]) {
 		assert.equal(Check(WorkflowControlParameters, { action }), true);
 	}
 	assert.equal(Check(WorkflowControlParameters, { action: "status", extra: true }), false);
-	assert.equal(Check(WorkflowWorkerParameters, { action: "spawn", workItemId: "domain" }), false);
+	assert.equal(Check(WorkflowDelegateParameters, { action: "spawn", workItemId: "domain" }), false);
 });
 
-test("workflow tools dispatch legal actions and reject unavailable runtimes", async () => {
+test("workflow tools dispatch only the explicit plan/delegate surface", async () => {
 	const calls: string[] = [];
-	const run = {
-		id: "run-tools",
-		projectId: "a".repeat(64),
-		projectPath: "/project",
-		originalPrompt: "plan",
-		phase: "analyzing" as const,
-		createdAt: "2026-01-01T00:00:00.000Z",
-		updatedAt: "2026-01-01T00:00:00.000Z",
-		plan: plan(),
-		planning: { unresolvedQuestions: [], changes: [] },
-	};
+	const run = { id: "run-tools", projectId: "a".repeat(64), projectPath: "/project", originalPrompt: "plan", phase: "analyzing" as const, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", plan: plan(), planning: { unresolvedQuestions: [], changes: [] } };
 	const controller = {
 		activeRun: run,
 		savePlan: () => Effect.sync(() => { calls.push("save"); return run; }),
 		updatePlan: () => Effect.sync(() => { calls.push("update"); return run; }),
-		finalizePlan: () => Effect.sync(() => {
-			calls.push("finalize");
-			return { ...run, phase: "ready" as const, plan: { ...run.plan, finalized: true } };
-		}),
-		status: () => Effect.succeed("status"),
-		pause: () => Effect.sync(() => { calls.push("pause"); return { ...run, phase: "paused" as const }; }),
-		stop: () => Effect.sync(() => { calls.push("stop"); return { ...run, phase: "stopped" as const }; }),
-		resume: () => Effect.sync(() => { calls.push("resume"); return { ...run, phase: "executing" as const }; }),
-		discover: () => Effect.succeed({ runs: [{ run, paths: {}, lock: { state: "missing" as const } }], invalidRunIds: [] }),
-		recover: () => Effect.sync(() => { calls.push("recover"); return { ...run, phase: "executing" as const }; }),
-		startWorker: () => Effect.sync(() => { calls.push("startWorker"); return { ...run, phase: "executing" as const }; }),
-		readWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
-		closeWorker: () => Effect.fail(new Error("Stage 3 fake runtime unavailable")),
-		waitWorker: () => Effect.fail(new Error("Stage 4 fake runtime unavailable")),
-		sendWorkerFeedback: () => Effect.fail(new Error("Stage 4 fake runtime unavailable")),
+		delegateStart: () => Effect.sync(() => { calls.push("start"); return { ...run, phase: "executing" as const }; }),
+		waitWorker: () => Effect.fail(new Error("wait unavailable")),
+		sendWorkerFeedback: () => Effect.sync(() => { calls.push("send"); return run; }),
+		acceptReport: () => Effect.sync(() => { calls.push("accept"); return run; }),
+		reviseReport: () => Effect.sync(() => { calls.push("revise"); return run; }),
+		closeWorker: () => Effect.sync(() => { calls.push("close"); return { run, closeResult: { forced: false, alreadyExited: false } }; }),
 	};
 	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, context?: unknown) => Promise<unknown> };
 	const tools = new Map<string, CapturedTool>();
-	registerOrchestratorTools({
-		registerTool: (definition: CapturedTool) => { tools.set(definition.name, definition); },
-	} as unknown as ExtensionAPI, controller as unknown as WorkflowController);
+	registerOrchestratorTools({ registerTool: (definition: CapturedTool) => { tools.set(definition.name, definition); } } as unknown as ExtensionAPI, controller as unknown as WorkflowController);
+	assert.deepEqual([...tools.keys()], ["workflow_plan", "workflow_delegate"]);
 	await tools.get("workflow_plan")?.execute("id", { action: "save", plan: run.plan });
 	await tools.get("workflow_plan")?.execute("id", { action: "update", changes: [{ type: "set-summary", summary: "next" }] });
-	await tools.get("workflow_plan")?.execute("id", { action: "finalize" });
-	await tools.get("workflow_control")?.execute("id", { action: "pause" });
-	await tools.get("workflow_control")?.execute("id", { action: "stop" });
-	assert.deepEqual(calls, ["save", "update", "finalize", "startWorker", "pause", "stop"]);
-	await tools.get("workflow_worker")!.execute("id", { action: "delegate", workItemId: "domain" });
-	for (const action of ["read", "close"]) {
-		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain" }), /Stage 3/);
-	}
-	for (const action of ["wait", "send"] as const) {
-		await assert.rejects(tools.get("workflow_worker")!.execute("id", { action, workItemId: "domain", ...(action === "send" ? { message: "feedback" } : {}) }), /Stage 4/);
-	}
-	for (const action of ["inspect", "accept", "revise", "block"]) {
-		await assert.rejects(tools.get("workflow_review_report")!.execute("id", { action, workItemId: "domain" }), /No worker report/);
-	}
-	await tools.get("workflow_control")!.execute("id", { action: "resume" });
-	await tools.get("workflow_control")!.execute("id", { action: "recover" }, undefined, undefined, {
-		cwd: "/project", hasUI: false, signal: undefined, sessionManager: { getSessionId: () => "session" },
-	});
-	assert.deepEqual(calls.slice(-2), ["resume", "recover"]);
+	await tools.get("workflow_delegate")?.execute("id", { action: "start", workItemId: "domain" });
+	await tools.get("workflow_delegate")?.execute("id", { action: "send", workItemId: "domain", message: "feedback" });
+	await tools.get("workflow_delegate")?.execute("id", { action: "accept", workItemId: "domain", comment: "accepted" });
+	await tools.get("workflow_delegate")?.execute("id", { action: "revise", workItemId: "domain", feedback: "more evidence" });
+	await tools.get("workflow_delegate")?.execute("id", { action: "close", workItemId: "domain" });
+	assert.deepEqual(calls, ["save", "update", "start", "send", "accept", "revise", "close"]);
+	await assert.rejects(tools.get("workflow_delegate")!.execute("id", { action: "wait", workItemId: "domain" }), /wait unavailable/);
 });
 
 test("status output is bounded by lines and bytes", () => {
@@ -251,7 +217,7 @@ test("orchestrator instructions append without replacing the original prompt", (
 	assert.ok(appended.startsWith(original));
 	assert.ok(appended.includes(ORCHESTRATOR_SYSTEM_PROMPT));
 	assert.match(appended, /Never implement/);
-	assert.match(appended, /explicit provider\/model/);
+	assert.match(appended, /exact provider\/model/);
 });
 
 test("system-prompt injection is active only while a command-created run exists", async () => {
@@ -331,11 +297,11 @@ test("worker role registers only worker workflow tools and rejects nested startu
 		};
 		ticketFlow(fake as unknown as ExtensionAPI);
 		assert.deepEqual(commands, []);
-		assert.deepEqual(tools, ["workflow_context", "workflow_submit_report"]);
+		assert.deepEqual(tools, ["workflow_worker"]);
 		const notices: string[] = [];
 		const ctx = { hasUI: true, ui: { notify: (message: string) => notices.push(message) } } as unknown as ExtensionContext;
 		assert.deepEqual(inputHandler?.({ text: "/ticket-flow tmux nested" }, ctx), { action: "handled" });
-		assert.match(notices[0] ?? "", /cannot start a nested workflow/);
+		assert.match(notices[0] ?? "", /cannot start or control a nested workflow/i);
 	} finally {
 		if (previousRole === undefined) delete process.env.MEPIE_WORKFLOW_ROLE;
 		else process.env.MEPIE_WORKFLOW_ROLE = previousRole;

@@ -8,7 +8,7 @@ export const EXPECTED_REPORT_CONTRACT: AuthoritativeWorkerContext["expectedRepor
 	schemaVersion: REPORT_SCHEMA_VERSION,
 	statuses: ["progress", "completed", "blocked", "failed"],
 	commonFields: [
-		"status", "summary", "requirements", "filesChanged", "filesChangedExplanation", "checks",
+		"status", "summary", "commitIds", "auditVerdicts", "auditFindings", "requirements", "filesChanged", "filesChangedExplanation", "checks",
 		"caveats", "blockers", "questions", "userInterventionRequired",
 	],
 	completedRequirements: [
@@ -81,6 +81,8 @@ export function makeAuthoritativeWorkerContext(run: WorkflowRun, item: WorkItem,
 	if (identity.runId !== run.id || identity.workItemId !== item.id) throw new Error("Worker identity does not match authoritative workflow context.");
 	return boundAuthoritativeContext({
 		runId: run.id,
+		...(item.kind === undefined ? {} : { workItemKind: item.kind }),
+		...(item.readOnly === undefined ? {} : { readOnly: item.readOnly }),
 		workItemId: item.id,
 		workItemTitle: item.title,
 		sourcePaths: item.sourcePaths,

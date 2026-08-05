@@ -15,7 +15,7 @@ export async function discoverOrchestratorRecovery(
 	if (ctx.hasUI && discovery.runs.length > 0) {
 		const newest = discovery.runs[0]!;
 		ctx.ui.notify(
-			`Recoverable Ticket Flow run ${newest.run.id} exists (${newest.run.phase}). Use workflow_control recover or /ticket-flow conflict handling.`,
+			`Recoverable Ticket Flow run ${newest.run.id} exists (${newest.run.phase}). Use /ticket-flow status or /ticket-flow tmux after reviewing the recoverable run.`,
 			"warning",
 		);
 	}

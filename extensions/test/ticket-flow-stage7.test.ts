@@ -47,7 +47,7 @@ async function startExecuting(project: string, agent: string, runId: string, tmu
 	const toolState = makeToolState();
 	const controller = new WorkflowController(toolState.pi, undefined, () => runId, tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "recover me", agentDir: agent, sessionId }));
-	await Effect.runPromise(controller.savePlan({ summary: "one", workItems: [makeWorkItem()], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "one", auditProfile: profile, workItems: [makeWorkItem()], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const run = await Effect.runPromise(controller.startWorker("one"));
 	return { controller, run, toolState };
@@ -153,7 +153,7 @@ test("a worker exit after report submission preserves report review across later
 	await Effect.runPromise(replacement.stop()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 
-test("an accepted item resumes its durable worker-close checkpoint after recovery", async () => {
+test("recovery rejects a forged completed item without an immutable accepted report", async () => {
 	const project = makeTemporaryDirectory("ticket-flow-stage7-close-project-"); const agent = makeTemporaryDirectory("ticket-flow-stage7-close-agent-"); const tmux = new FakeTmux();
 	const { controller, run } = await startExecuting(project, agent, "close-run", tmux);
 	const resolved = await Effect.runPromise(pathsForProject(project, "close-run", agent));
@@ -170,9 +170,8 @@ test("an accepted item resumes its durable worker-close checkpoint after recover
 	(controller as unknown as { active: { run: typeof completed } }).active.run = completed;
 	await Effect.runPromise(controller.shutdown());
 	const replacement = new WorkflowController(makeToolState().pi, undefined, undefined, tmux as never);
-	await Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "close-run", sessionId: "session-one" }));
-	await eventually(() => replacement.activeRun === undefined, 4_000);
-	assert.equal(tmux.closed, 1); assert.equal(tmux.created, 1);
+	await assert.rejects(Effect.runPromise(replacement.recover({ cwd: project, agentDir: agent, runId: "close-run", sessionId: "session-one" })), /accepted report|immutable|report attempt|authenticated/);
+	assert.equal(tmux.closed, 0);
 	await Effect.runPromise(client.shutdown()); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 

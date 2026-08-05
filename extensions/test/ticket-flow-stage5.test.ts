@@ -106,9 +106,9 @@ test("worker tool schemas are strict and render compact labels", () => {
 	assert.equal(Check(WorkflowContextParameters, { action: "get", extra: true }), false);
 	assert.equal(Check(WorkflowSubmitReportParameters, completedReport()), true);
 	assert.equal(Check(WorkflowSubmitReportParameters, { status: "unknown", summary: "no" }), false);
-	assert.equal(workflowContextLabel("get"), "workflow-context · get");
-	assert.equal(workflowReportLabel("progress"), "workflow-report · progress");
-	assert.equal(workflowReportLabel("completed", 2, 2), "workflow-report · completed · 2/2 requirements");
+	assert.equal(workflowContextLabel("get"), "workflow-worker · get");
+	assert.equal(workflowReportLabel("progress"), "workflow-worker · submit · progress");
+	assert.equal(workflowReportLabel("completed", 2, 2), "workflow-worker · submit · completed · 2/2 requirements");
 });
 
 test("authoritative context preserves identity, paths, requirements, and exact delegation while bounding prose", () => {
@@ -236,7 +236,7 @@ test("controller persists only final attempts, transitions completed reports, an
 	let tools = ["read", "bash"];
 	const controller = new WorkflowController({ getActiveTools: () => [...tools], setActiveTools: (next) => { tools = [...next]; } }, () => new Date("2026-01-01T00:00:00.000Z"), () => "run-stage5", tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "stage 5", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "stage 5", workItems: [{ ...workItem(), status: "planned" }], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "stage 5", auditProfile: profile, workItems: [{ ...workItem(), status: "planned" }], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("worker-tools"));
 	const resolved = await Effect.runPromise(pathsForProject(project, "run-stage5", agent));
@@ -275,7 +275,7 @@ test("blocked reports persist an attempt and pause automatic progression", async
 	let tools = ["read"];
 	const controller = new WorkflowController({ getActiveTools: () => [...tools], setActiveTools: (next) => { tools = [...next]; } }, undefined, () => runId, tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "blocked", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "blocked", workItems: [{ ...workItem(), status: "planned" }], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "blocked", auditProfile: profile, workItems: [{ ...workItem(), status: "planned" }], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("worker-tools"));
 	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
@@ -308,7 +308,7 @@ test("failed reports fail the run and satisfy final-report waits", async () => {
 	let tools = ["read"];
 	const controller = new WorkflowController({ getActiveTools: () => [...tools], setActiveTools: (next) => { tools = [...next]; } }, undefined, () => runId, tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "failed", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "failed", workItems: [{ ...workItem(), status: "planned" }], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "failed", auditProfile: profile, workItems: [{ ...workItem(), status: "planned" }], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("worker-tools"));
 	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
@@ -324,15 +324,15 @@ test("failed reports fail the run and satisfy final-report waits", async () => {
 	fs.rmSync(agent, { recursive: true, force: true });
 });
 
-test("transport failures are thrown by workflow_submit_report", async () => {
+test("transport failures are thrown by workflow_worker submit", async () => {
 	const calls: string[] = [];
-	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: WorkerReport, signal?: AbortSignal) => Promise<unknown> };
+	type CapturedTool = { readonly name: string; readonly execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> };
 	const tools = new Map<string, CapturedTool>();
 	registerWorkerTools({ registerTool: (definition: CapturedTool) => tools.set(definition.name, definition) } as unknown as ExtensionAPI, () => ({
 		getContext: () => context(),
 		waitForFeedback: () => Promise.resolve({ type: "accepted" }),
 		submitReport: async () => { calls.push("submit"); throw new Error("native transport unavailable"); },
 	}));
-	await assert.rejects(tools.get("workflow_submit_report")!.execute("id", { status: "progress", summary: "working" }), /native transport unavailable/);
+	await assert.rejects(tools.get("workflow_worker")!.execute("id", { action: "submit", status: "progress", summary: "working" }), /native transport unavailable/);
 	assert.deepEqual(calls, ["submit"]);
 });

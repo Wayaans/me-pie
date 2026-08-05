@@ -120,7 +120,7 @@ class IntegrationHarness {
 
 	async begin(items: readonly WorkItem[]): Promise<void> {
 		await Effect.runPromise(this.controller.startRun({ cwd: this.project, prompt: "deterministic stage 8 integration", agentDir: this.agentDir, sessionId: "orchestrator-session" }));
-		await Effect.runPromise(this.controller.savePlan({ summary: "Stage 8 integration", workItems: items, userResolutions: [], finalized: false }));
+		await Effect.runPromise(this.controller.savePlan({ summary: "Stage 8 integration", auditProfile: defaultProfile, workItems: items, userResolutions: [], finalized: false }));
 		await Effect.runPromise(this.controller.finalizePlan());
 		await Effect.runPromise(this.controller.startWorker([...items].sort((left, right) => left.order - right.order)[0]!.id));
 	}
@@ -195,14 +195,15 @@ test("1. a three-item run delegates and completes strictly sequentially", async 
 		workItem("api", 3, { dependsOn: ["repository"] }),
 	];
 	await harness.begin(items);
-	for (const item of items) {
+	for (const [index, item] of items.entries()) {
 		assert.equal(harness.controller.activeRun?.activeWorkItemId, item.id);
 		const client = await harness.connectReady(item.id);
 		await harness.submitCompleted(client);
 		await Effect.runPromise(harness.controller.acceptReport(item.id, `Accepted ${item.id}`));
+		if (items[index + 1]) await Effect.runPromise(harness.controller.startWorker(items[index + 1]!.id));
 	}
 	assert.deepEqual(harness.tmux.created.map(({ workItemId }) => workItemId), ["domain", "repository", "api"]);
-	assert.equal(harness.controller.activeRun, undefined);
+	assert.equal(harness.controller.activeRun?.phase, "auditing");
 	harness.assertNoProjectMetadata();
 }));
 
@@ -214,6 +215,8 @@ test("2. normalized content order overrides ticket filename order", async () => 
 	assert.deepEqual(firstClient.authoritativeContext?.sourcePaths, ["tickets/03-database.md"]);
 	await harness.submitCompleted(firstClient);
 	await Effect.runPromise(harness.controller.acceptReport("database", "Content dependency accepted"));
+	assert.equal(harness.controller.activeRun?.activeWorkItemId, undefined);
+	await Effect.runPromise(harness.controller.startWorker("api"));
 	assert.equal(harness.controller.activeRun?.activeWorkItemId, "api");
 	harness.assertNoProjectMetadata();
 }));
@@ -226,6 +229,7 @@ test("3. default launch profiles and a per-item override are preserved exactly",
 	const client = await harness.connectReady("default");
 	await harness.submitCompleted(client);
 	await Effect.runPromise(harness.controller.acceptReport("default", "Default profile accepted"));
+	await Effect.runPromise(harness.controller.startWorker("override"));
 	assert.deepEqual(harness.tmux.created.map(({ profile }) => profile), [defaultProfile, override]);
 	harness.assertNoProjectMetadata();
 }));
@@ -391,7 +395,7 @@ test("15. final completion restores the orchestrator's original tool set", async
 	const client = await harness.connectReady(item.id);
 	await harness.submitCompleted(client);
 	const finished = await Effect.runPromise(harness.controller.acceptReport(item.id, "All checks accepted"));
-	assert.equal(finished.phase, "completed");
-	assert.deepEqual(harness.activeTools, harness.initialTools);
+	assert.equal(finished.phase, "auditing");
+	assert.equal(finished.plan.workItems.find((candidate) => candidate.kind === "audit")?.status, "ready");
 	harness.assertNoProjectMetadata();
 }));

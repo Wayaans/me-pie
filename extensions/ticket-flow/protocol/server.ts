@@ -20,9 +20,26 @@ export interface ProtocolServerOptions {
 }
 export interface CommandReceipt { readonly requestId: string; readonly messageId: string; }
 export class ProtocolServerError extends Error { constructor(message: string) { super(message); this.name = "ProtocolServerError"; } }
+
+const MAX_INCOMING_MESSAGES = 1_024;
+const MAX_PENDING_EVENTS = 1_024;
+const MAX_EVENT_HISTORY = 4_096;
+const MAX_SEEN_INCOMING = 8_192;
+const MAX_FAILED_INCOMING = 1_024;
+const MAX_WAITERS = 256;
+const MAX_PENDING_COMMANDS = 256;
+
+/** Callback failures are transient delivery failures, not identity rejections. */
+class ProtocolPersistenceFailure extends Error {
+	constructor(message: string) { super(message); this.name = "ProtocolPersistenceFailure"; }
+}
+class ProtocolTransportFailure extends ProtocolServerError {
+	constructor(message: string) { super(message); this.name = "ProtocolTransportFailure"; }
+}
 interface Waiter { readonly predicate: (event: WorkflowProtocolEvent) => boolean; readonly resolve: (event: WorkflowProtocolEvent) => void; readonly reject: (cause: unknown) => void; }
 interface AcknowledgementWaiter { readonly resolve: () => void; readonly reject: (cause: unknown) => void; }
 interface PendingCommand { readonly receipt: CommandReceipt; readonly type: "delegate" | "feedback" | "shutdown"; readonly payload: Record<string, unknown>; acknowledged: boolean; readonly waiters: Set<AcknowledgementWaiter>; }
+interface ProcessingMessage { readonly serialized: string; readonly promise: Promise<void>; }
 type IncomingMessage =
 	| { readonly type: "message"; readonly socket: Socket; readonly message: ProtocolEnvelope }
 	| { readonly type: "closed"; readonly socket: Socket };
@@ -30,6 +47,9 @@ function expectedProfile(profile: PiLaunchProfile): { provider: string; model: s
 function commandPayload(payload: Record<string, unknown>): payload is Record<string, unknown> & { readonly requestId: string } { return typeof payload.requestId === "string"; }
 function requiresWorkerAcknowledgement(type: ProtocolEnvelope["type"]): boolean {
 	return type === "worker-progress" || type === "worker-report" || type === "worker-blocked" || type === "worker-failed";
+}
+function retriesAfterPersistenceFailure(event: WorkflowProtocolEvent): boolean {
+	return event.type === "worker-progress" || event.type === "worker-report" || event.type === "worker-blocked" || event.type === "worker-failed";
 }
 
 export class ProtocolServer {
@@ -42,8 +62,15 @@ export class ProtocolServer {
 	private readonly events: WorkflowProtocolEvent[] = [];
 	private readonly pendingEvents: WorkflowProtocolEvent[] = [];
 	private readonly waiters = new Set<Waiter>();
+	/** Only successfully processed envelopes belong in this idempotency ledger. */
 	private readonly seenIncoming = new Map<string, string>();
+	/** Failed attempts are not processed IDs, but retain their bytes so a
+	 * conflicting retry cannot be mistaken for the original event. */
+	private readonly failedIncoming = new Map<string, string>();
+	/** Protects callback execution if receive paths ever overlap. */
+	private readonly processingIncoming = new Map<string, ProcessingMessage>();
 	private readonly pendingCommands = new Map<string, PendingCommand>();
+	private handshakePendingSocket: Socket | undefined;
 	constructor(readonly options: ProtocolServerOptions) {}
 	get isVerified(): boolean { return this.verified; }
 	get identity(): WorkerIdentity | undefined { return this.events.find((event) => event.type === "worker-connected")?.identity; }
@@ -51,20 +78,24 @@ export class ProtocolServer {
 	start(): Effect.Effect<void, ProtocolServerError> {
 		return Effect.gen({ self: this }, function* () {
 			if (!this.incoming) {
-				this.incoming = yield* Queue.unbounded<IncomingMessage>();
+				this.incoming = yield* Queue.bounded<IncomingMessage>(MAX_INCOMING_MESSAGES);
 				const consume = Effect.forever(Effect.gen({ self: this }, function* () {
 					const incoming = yield* Queue.take(this.incoming!);
 					if (incoming.type === "closed") {
 						if (this.peer === incoming.socket) {
 							this.peer = undefined;
 							this.verified = false;
+							this.handshakePendingSocket = undefined;
 						}
 						return;
 					}
 					yield* Effect.tryPromise({
 						try: () => this.receive(incoming.socket, incoming.message),
-						catch: () => new ProtocolServerError("Protocol receive error"),
-					}).pipe(Effect.catch(() => Effect.sync(() => this.reject(incoming.socket))));
+						catch: (cause) => cause instanceof Error ? cause : new ProtocolServerError(String(cause)),
+					}).pipe(Effect.catch((cause) => Effect.sync(() => {
+						if (cause instanceof ProtocolPersistenceFailure || cause instanceof ProtocolTransportFailure) this.disconnect(incoming.socket);
+						else this.reject(incoming.socket);
+					})));
 				}));
 				this.processor = Effect.runFork(consume);
 			}
@@ -96,13 +127,24 @@ export class ProtocolServer {
 		} catch (cause) { await rm(ownerPath, { force: true }); throw cause; }
 	}
 	private accept(socket: Socket): void {
+		// A destroyed peer can remain referenced until its queued close event is
+		// consumed. Treat it as disconnected so a worker retry is not rejected
+		// during that small transport-ordering window.
+		if (this.peer?.destroyed) {
+			this.peer = undefined;
+			this.verified = false;
+			this.handshakePendingSocket = undefined;
+		}
 		if (this.closed || this.peer !== undefined) { socket.destroy(); return; }
 		this.peer = socket;
 		const framer = new JsonLineFramer();
 		socket.on("data", (chunk: Buffer) => {
 			try {
 				for (const message of framer.push(chunk)) {
-					if (!this.incoming || !Queue.offerUnsafe(this.incoming, { type: "message", socket, message })) this.reject(socket);
+					if (!this.incoming || !Queue.offerUnsafe(this.incoming, { type: "message", socket, message })) {
+						this.reject(socket);
+						return;
+					}
 				}
 			} catch { void this.options.onRejected?.({ reason: "protocol" }); this.reject(socket); }
 		});
@@ -111,80 +153,201 @@ export class ProtocolServer {
 				if (this.peer === socket) {
 					this.peer = undefined;
 					this.verified = false;
+					this.handshakePendingSocket = undefined;
 				}
 			}
 		});
 		socket.once("error", () => undefined);
 	}
+	private rememberSeen(messageId: string, serialized: string): void {
+		this.failedIncoming.delete(messageId);
+		if (this.seenIncoming.size >= MAX_SEEN_INCOMING) {
+			const oldest = this.seenIncoming.keys().next().value as string | undefined;
+			if (oldest !== undefined) this.seenIncoming.delete(oldest);
+		}
+		this.seenIncoming.set(messageId, serialized);
+	}
+	private rememberFailed(messageId: string, serialized: string): void {
+		if (this.failedIncoming.size >= MAX_FAILED_INCOMING) {
+			const oldest = this.failedIncoming.keys().next().value as string | undefined;
+			if (oldest !== undefined) this.failedIncoming.delete(oldest);
+		}
+		this.failedIncoming.set(messageId, serialized);
+	}
+	private async authenticate(message: ProtocolEnvelope): Promise<WorkerIdentity> {
+		if (message.type !== "worker-connected") throw new ProtocolServerError("Expected a worker-connected handshake");
+		const payload = decodeWorkerConnected(message.payload);
+		const expected = expectedProfile(this.options.profile);
+		const actual: WorkerIdentity = {
+			runId: message.runId, workItemId: message.workItemId, provider: payload.provider, model: payload.model, thinking: payload.thinking,
+			...(payload.sessionId === undefined ? {} : { sessionId: payload.sessionId }), ...(payload.sessionFile === undefined ? {} : { sessionFile: payload.sessionFile }),
+		};
+		const reason: ProtocolRejectionReason | undefined = message.runId !== this.options.runId ? "run"
+			: message.workItemId !== this.options.workItemId ? "work-item"
+			: payload.token !== this.options.token ? "token"
+			: payload.provider !== expected.provider ? "provider"
+			: payload.model !== expected.model ? "model"
+			: payload.thinking !== this.options.profile.thinking ? "thinking"
+			: undefined;
+		if (reason) {
+			await this.options.onRejected?.({ reason, actual });
+			throw new ProtocolServerError(`Worker ${reason} does not match the requested worker`);
+		}
+		return actual;
+	}
+	private async processHandshake(socket: Socket, message: ProtocolEnvelope): Promise<void> {
+		await this.authenticate(message);
+		this.verified = true;
+		this.handshakePendingSocket = socket;
+		try {
+			const event = toWorkflowEvent(message);
+			if (!event) throw new ProtocolServerError("Invalid worker-connected event");
+			await this.processDurableEvent(event);
+		} finally {
+			if (this.handshakePendingSocket === socket) this.handshakePendingSocket = undefined;
+		}
+	}
+	private async processDurableEvent(event: WorkflowProtocolEvent): Promise<void> {
+		try { await this.options.onEvent?.(event); }
+		catch (cause) {
+			const message = cause instanceof Error ? cause.message : String(cause);
+			// Report delivery failures are retriable. Handshake/ready failures
+			// retain the existing explicit rejection behavior for invalid workflow
+			// state or worker identity (for example a different Pi session).
+			if (retriesAfterPersistenceFailure(event)) throw new ProtocolPersistenceFailure(message);
+			throw new ProtocolServerError(message);
+		}
+		this.emit(event);
+	}
+	private async processVerifiedMessage(message: ProtocolEnvelope): Promise<void> {
+		if (message.type === "accepted") {
+			await this.acceptAcknowledgement((message.payload as { requestId: string }).requestId);
+			return;
+		}
+		if (message.type === "ping") return;
+		const event = toWorkflowEvent(message);
+		if (!event) throw new ProtocolServerError("Worker sent an unsupported message");
+		await this.processDurableEvent(event);
+	}
+	private beginShutdownEvent(socket: Socket, message: ProtocolEnvelope, event: WorkflowProtocolEvent, serialized: string): void {
+		const promise = this.processDurableEvent(event);
+		const processing: ProcessingMessage = { serialized, promise };
+		this.processingIncoming.set(message.messageId, processing);
+		void promise.then(() => {
+			this.rememberSeen(message.messageId, serialized);
+		}).catch(() => {
+			this.disconnect(socket);
+		}).finally(() => {
+			if (this.processingIncoming.get(message.messageId) === processing) this.processingIncoming.delete(message.messageId);
+		});
+	}
+	private acknowledgeProcessedDuplicate(socket: Socket, message: ProtocolEnvelope): void {
+		if (message.type === "worker-connected") {
+			this.verified = true;
+			this.writeTo(socket, makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+			this.resendPendingCommands();
+			return;
+		}
+		if (requiresWorkerAcknowledgement(message.type)) this.writeTo(socket, makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+	}
 	private async receive(socket: Socket, message: ProtocolEnvelope): Promise<void> {
+		// A FIN can make the native socket report destroyed before the queued
+		// data frame has been consumed. The peer identity, not that flag, is the
+		// ordering boundary for already-received messages.
+		if (socket !== this.peer) return;
 		const serialized = JSON.stringify(message);
+		if (!this.verified && message.type !== "worker-connected") throw new ProtocolServerError("Worker sent a command before authentication");
 		const previous = this.seenIncoming.get(message.messageId);
 		if (previous !== undefined) {
-			if (previous !== serialized) return this.reject(socket);
-			if ((message.type === "worker-connected" && this.verified) || requiresWorkerAcknowledgement(message.type)) {
-				this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+			if (previous !== serialized) throw new ProtocolServerError("Conflicting duplicate protocol message");
+			if (message.type === "worker-connected") await this.authenticate(message);
+			this.acknowledgeProcessedDuplicate(socket, message);
+			return;
+		}
+		const failed = this.failedIncoming.get(message.messageId);
+		if (failed !== undefined && failed !== serialized) throw new ProtocolServerError("Conflicting duplicate protocol message");
+		const processing = this.processingIncoming.get(message.messageId);
+		if (processing) {
+			if (processing.serialized !== serialized) throw new ProtocolServerError("Conflicting duplicate protocol message");
+			await processing.promise;
+			this.acknowledgeProcessedDuplicate(socket, message);
+			return;
+		}
+		if (!this.verified) {
+			const operation = this.processHandshake(socket, message);
+			const current: ProcessingMessage = { serialized, promise: operation };
+			this.processingIncoming.set(message.messageId, current);
+			try {
+				await operation;
+				// Durable callback completion is the point at which this ID becomes
+				// idempotently processed. A lost ack therefore remains safe to retry.
+				this.rememberSeen(message.messageId, serialized);
+				this.writeTo(socket, makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+				this.resendPendingCommands();
+			} catch (cause) {
+				if (cause instanceof ProtocolPersistenceFailure) this.rememberFailed(message.messageId, serialized);
+				throw cause;
+			} finally {
+				if (this.processingIncoming.get(message.messageId) === current) this.processingIncoming.delete(message.messageId);
 			}
 			return;
 		}
-		this.seenIncoming.set(message.messageId, serialized);
+		if (message.runId !== this.options.runId || message.workItemId !== this.options.workItemId) throw new ProtocolServerError("Worker message identity changed after verification");
+		if (message.type === "worker-connected") throw new ProtocolServerError("Worker sent a second handshake on an authenticated connection");
+		const event = toWorkflowEvent(message);
+		if (event?.type === "worker-shutdown") {
+			// Do not await this callback in the transport consumer: shutdown is sent
+			// before the command acknowledgement and the controller may hold the
+			// progression permit needed by that acknowledgement.
+			this.beginShutdownEvent(socket, message, event, serialized);
+			return;
+		}
+		const operation = this.processVerifiedMessage(message);
+		const current: ProcessingMessage = { serialized, promise: operation };
+		this.processingIncoming.set(message.messageId, current);
 		try {
-			if (!this.verified) {
-				if (message.type !== "worker-connected") throw new ProtocolServerError("Worker sent a command before authentication");
-				const payload = decodeWorkerConnected(message.payload);
-				const expected = expectedProfile(this.options.profile);
-				const actual: WorkerIdentity = { runId: message.runId, workItemId: message.workItemId, provider: payload.provider, model: payload.model, thinking: payload.thinking, ...(payload.sessionId === undefined ? {} : { sessionId: payload.sessionId }), ...(payload.sessionFile === undefined ? {} : { sessionFile: payload.sessionFile }) };
-				const reason: ProtocolRejectionReason | undefined = message.runId !== this.options.runId ? "run"
-					: message.workItemId !== this.options.workItemId ? "work-item"
-					: payload.token !== this.options.token ? "token"
-					: payload.provider !== expected.provider ? "provider"
-					: payload.model !== expected.model ? "model"
-					: payload.thinking !== this.options.profile.thinking ? "thinking"
-					: undefined;
-				if (reason) { await this.options.onRejected?.({ reason, actual }); throw new ProtocolServerError(`Worker ${reason} does not match the requested worker`); }
-				const reconnecting = this.events.some((event) => event.type === "worker-connected");
-				this.verified = true;
-				this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
-				const event = toWorkflowEvent(message)!;
-				this.emit(event);
-				await this.options.onEvent?.(event);
-				if (reconnecting) this.resendPendingCommands();
-				return;
-			}
-			if (message.runId !== this.options.runId || message.workItemId !== this.options.workItemId) throw new ProtocolServerError("Worker message identity changed after verification");
-			if (message.type === "accepted") { await this.acceptAcknowledgement((message.payload as { requestId: string }).requestId); return; }
-			const event = toWorkflowEvent(message);
-			if (event) {
-				// Shutdown is a transport-level lifecycle notification. Do not await
-				// the serialized controller callback before processing the command
-				// acknowledgement: the controller may be waiting for that ack while
-				// holding its progression permit.
-				if (event.type === "worker-shutdown") {
-					this.emit(event);
-					void Promise.resolve(this.options.onEvent?.(event)).catch(() => undefined);
-					return;
-				}
-				await this.options.onEvent?.(event);
-				this.emit(event);
-				if (requiresWorkerAcknowledgement(message.type)) this.write(makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
-			}
-		} catch { this.reject(socket); }
+			await operation;
+			this.rememberSeen(message.messageId, serialized);
+			if (requiresWorkerAcknowledgement(message.type)) this.writeTo(socket, makeMessage(this.options.runId, this.options.workItemId, "accepted", { requestId: message.messageId }));
+		} catch (cause) {
+			if (cause instanceof ProtocolPersistenceFailure) this.rememberFailed(message.messageId, serialized);
+			throw cause;
+		} finally {
+			if (this.processingIncoming.get(message.messageId) === current) this.processingIncoming.delete(message.messageId);
+		}
 	}
 	private reject(socket: Socket): void {
 		try { socket.end(encodeJsonLine(makeMessage(this.options.runId, this.options.workItemId, "shutdown", { requestId: crypto.randomUUID(), reason: "identity-rejected" }))); } catch { socket.destroy(); }
 	}
+	private disconnect(socket: Socket): void {
+		if (this.peer === socket) {
+			this.peer = undefined;
+			this.verified = false;
+			this.handshakePendingSocket = undefined;
+		}
+		socket.destroy();
+	}
 	private emit(event: WorkflowProtocolEvent): void {
+		if (this.events.length >= MAX_EVENT_HISTORY) {
+			const removable = this.events.findIndex((candidate) => candidate.type !== "worker-connected");
+			if (removable >= 0) this.events.splice(removable, 1); else this.events.shift();
+		}
 		this.events.push(event);
-		const waiter = [...this.waiters].find((candidate) => candidate.predicate(event));
+		const waiter = [...this.waiters].find((candidate) => {
+			try { return candidate.predicate(event); } catch { return false; }
+		});
 		if (waiter) {
 			this.waiters.delete(waiter);
 			waiter.resolve(event);
 		} else {
+			if (this.pendingEvents.length >= MAX_PENDING_EVENTS) this.pendingEvents.shift();
 			this.pendingEvents.push(event);
 		}
 	}
 	wait(predicate: (event: WorkflowProtocolEvent) => boolean = () => true, signal?: AbortSignal): Promise<WorkflowProtocolEvent> {
 		const pendingIndex = this.pendingEvents.findIndex(predicate);
 		if (pendingIndex >= 0) return Promise.resolve(this.pendingEvents.splice(pendingIndex, 1)[0]!);
+		if (this.waiters.size >= MAX_WAITERS) return Promise.reject(new ProtocolServerError("Protocol event wait queue is full"));
 		return new Promise((resolve, reject) => {
 			let waiter: Waiter;
 			const abort = () => { this.waiters.delete(waiter); reject(signal?.reason ?? new DOMException("Aborted", "AbortError")); };
@@ -194,7 +357,16 @@ export class ProtocolServer {
 			signal?.addEventListener("abort", abort, { once: true });
 		});
 	}
-	private write(message: ProtocolEnvelope): void { if (!this.peer || this.peer.destroyed) throw new ProtocolServerError("Native worker socket is unavailable"); this.peer.write(encodeJsonLine(message)); }
+	private writeTo(socket: Socket, message: ProtocolEnvelope): void {
+		if (socket !== this.peer || socket.destroyed) throw new ProtocolTransportFailure("Native worker socket is unavailable");
+		try { socket.write(encodeJsonLine(message)); }
+		catch (cause) { throw new ProtocolTransportFailure(cause instanceof Error ? cause.message : String(cause)); }
+	}
+	private write(message: ProtocolEnvelope): void {
+		const peer = this.peer;
+		if (!peer) throw new ProtocolTransportFailure("Native worker socket is unavailable");
+		this.writeTo(peer, message);
+	}
 	send(type: "delegate" | "feedback" | "accepted" | "shutdown" | "ping", payload: Record<string, unknown>, messageId: string = crypto.randomUUID()): CommandReceipt | undefined {
 		if (!this.verified) throw new ProtocolServerError("Cannot send before worker profile verification");
 		if (type !== "delegate" && type !== "feedback" && type !== "shutdown") { this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, messageId)); return undefined; }
@@ -203,10 +375,14 @@ export class ProtocolServer {
 		const existing = this.pendingCommands.get(requestId);
 		if (existing) {
 			if (existing.type !== type || JSON.stringify(existing.payload) !== JSON.stringify(payload)) throw new ProtocolServerError("Conflicting duplicate command request ID");
-			this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, existing.receipt.messageId)); return existing.receipt;
+			if (this.handshakePendingSocket === undefined) this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, existing.receipt.messageId));
+			return existing.receipt;
 		}
+		if (this.pendingCommands.size >= MAX_PENDING_COMMANDS) throw new ProtocolServerError("Protocol command queue is full");
 		const receipt = { requestId, messageId };
-		this.pendingCommands.set(receipt.requestId, { receipt, type, payload, acknowledged: false, waiters: new Set() }); this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, messageId)); return receipt;
+		this.pendingCommands.set(receipt.requestId, { receipt, type, payload, acknowledged: false, waiters: new Set() });
+		if (this.handshakePendingSocket === undefined) this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, messageId));
+		return receipt;
 	}
 	private resendPendingCommands(): void {
 		for (const command of this.pendingCommands.values()) {
@@ -225,7 +401,13 @@ export class ProtocolServer {
 		// receipt; persisting first would deadlock that serialized operation.
 		for (const waiter of command.waiters) waiter.resolve();
 		command.waiters.clear();
-		await this.options.onAcknowledgement?.(command.receipt);
+		try { await this.options.onAcknowledgement?.(command.receipt); }
+		catch (cause) {
+			// The durable callback did not complete. Let reconnect resend the
+			// command so the acknowledgement can be processed again.
+			command.acknowledged = false;
+			throw new ProtocolPersistenceFailure(cause instanceof Error ? cause.message : String(cause));
+		}
 	}
 	waitForAcknowledgement(requestId: string, signal?: AbortSignal): Promise<CommandReceipt> {
 		const command = this.pendingCommands.get(requestId); if (!command) return Promise.reject(new ProtocolServerError("Unknown command request ID"));
@@ -251,7 +433,16 @@ export class ProtocolServer {
 				for (const waiter of command.waiters) waiter.reject(closed);
 				command.waiters.clear();
 			}
+			this.pendingCommands.clear();
+			this.processingIncoming.clear();
+			this.seenIncoming.clear();
+			this.failedIncoming.clear();
+			this.pendingEvents.length = 0;
+			this.events.length = 0;
+			this.handshakePendingSocket = undefined;
 			if (this.peer && !this.peer.destroyed) this.peer.destroy();
+			this.peer = undefined;
+			this.verified = false;
 			const server = this.server;
 			this.server = undefined;
 			if (server) yield* Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve())));

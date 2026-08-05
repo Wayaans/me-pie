@@ -155,7 +155,7 @@ test("protocol-start failure removes token/socket metadata and leaves no spawnin
 	const socketPath = workflowSocketPath(runId); fs.mkdirSync(path.dirname(socketPath), { recursive: true }); fs.writeFileSync(socketPath, "foreign");
 	let tools = ["read"]; const controller = new WorkflowController({ getActiveTools: () => tools, setActiveTools: (next) => { tools = next; } }, undefined, () => runId, {} as never);
 	const item: WorkItem = { id: "item", title: "Item", sourcePaths: ["ticket"], specificationPaths: ["spec"], requirements: ["requirement"], order: 1, orderReason: "first", dependsOn: [], delegationPrompt: "/implement", launchProfile: profile, completionStrategy: { type: "ledger-only" }, status: "planned" };
-	const plan: WorkflowPlan = { summary: "plan", workItems: [item], userResolutions: [], finalized: false };
+	const plan: WorkflowPlan = { summary: "plan", auditProfile: profile, workItems: [item], userResolutions: [], finalized: false };
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "plan", agentDir: agent })); await Effect.runPromise(controller.savePlan(plan)); await Effect.runPromise(controller.finalizePlan());
 	await assert.rejects(Effect.runPromise(controller.startWorker("item")), /stale protocol path/); assert.equal(controller.activeRun?.plan.workItems[0]?.status, "failed"); assert.equal(controller.activeRun?.workflowSocketPath, undefined);
 	const runDirectory = path.join(agent, "state", "ticket-flow", controller.activeRun!.projectId, runId); assert.equal(fs.existsSync(workflowTokenPath(runDirectory)), false);

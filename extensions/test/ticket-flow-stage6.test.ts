@@ -63,7 +63,7 @@ test("stage6 smoke accepts a ledger report and completes the run", async () => {
 	};
 	const controller = new WorkflowController({ getActiveTools: () => ["read"], setActiveTools: () => undefined }, undefined, () => runId, tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "smoke", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "smoke", workItems: [item()], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "smoke", auditProfile: profile, workItems: [item()], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("one"));
 	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
@@ -73,18 +73,19 @@ test("stage6 smoke accepts a ledger report and completes the run", async () => {
 	await new WorkerReportRuntime(client).submit(report(), client.authoritativeContext!);
 	await eventually(() => controller.activeRun?.plan.workItems[0]?.status === "report-review");
 	const accepted = await Effect.runPromise(controller.acceptReport("one", "Reviewed and accepted"));
-	assert.equal(accepted.phase, "completed");
+	assert.equal(accepted.phase, "auditing");
 	assert.equal(accepted.plan.workItems[0]?.status, "completed");
+	assert.equal(accepted.plan.workItems.find((candidate) => candidate.kind === "audit")?.status, "ready");
 	assert.equal(accepted.plan.workItems[0]?.completion?.comment, "Reviewed and accepted");
 	const persisted = await Effect.runPromise(loadRun(resolved.paths));
 	assert.equal(persisted.plan.workItems[0]?.completion?.acceptedAttempt, 1);
-	assert.equal(controller.activeRun, undefined);
+	assert.equal(controller.activeRun?.phase, "auditing");
 	await Effect.runPromise(client.shutdown());
 	await Effect.runPromise(controller.shutdown());
 	fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 
-test("acceptance serializes completion and automatically delegates the next dependency-ready item", async () => {
+test("acceptance leaves the next dependency-ready item for explicit delegation", async () => {
 	const project = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage6-sequence-project-"));
 	const agent = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage6-sequence-agent-"));
 	const runId = "stage6-sequence";
@@ -100,7 +101,7 @@ test("acceptance serializes completion and automatically delegates the next depe
 	const first = item();
 	const second = item({ id: "two", title: "Two", order: 2, dependsOn: ["one"], delegationPrompt: "/implement two" });
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "sequence", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "sequence", workItems: [first, second], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "sequence", auditProfile: profile, workItems: [first, second], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("one"));
 	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
@@ -115,48 +116,38 @@ test("acceptance serializes completion and automatically delegates the next depe
 	await new WorkerReportRuntime(firstClient).submit(report(), firstClient.authoritativeContext!);
 	await eventually(() => controller.activeRun?.plan.workItems.find((candidate) => candidate.id === "one")?.status === "report-review");
 	const afterFirst = await Effect.runPromise(controller.acceptReport("one", "Accepted first"));
-	assert.equal(afterFirst.activeWorkItemId, "two");
+	assert.equal(afterFirst.activeWorkItemId, undefined);
 	assert.equal(afterFirst.plan.workItems.find((candidate) => candidate.id === "one")?.status, "completed");
-	assert.equal(afterFirst.plan.workItems.find((candidate) => candidate.id === "two")?.status, "verifying-worker");
+	assert.equal(afterFirst.plan.workItems.find((candidate) => candidate.id === "two")?.status, "ready");
 	await Effect.runPromise(firstClient.shutdown());
-	const secondClient = await connect("two", afterFirst.workflowSocketPath!);
+	const explicitlyStarted = await Effect.runPromise(controller.startWorker("two"));
+	assert.equal(explicitlyStarted.plan.workItems.find((candidate) => candidate.id === "two")?.status, "verifying-worker");
+	const secondClient = await connect("two", explicitlyStarted.workflowSocketPath!);
 	await new WorkerReportRuntime(secondClient).submit(report(), secondClient.authoritativeContext!);
 	await eventually(() => controller.activeRun?.plan.workItems.find((candidate) => candidate.id === "two")?.status === "report-review");
 	const finished = await Effect.runPromise(controller.acceptReport("two", "Accepted second"));
-	assert.equal(finished.phase, "completed");
-	assert.equal(finished.plan.workItems.every((candidate) => candidate.status === "completed"), true);
+	assert.equal(finished.phase, "auditing");
+	assert.equal(finished.plan.workItems.filter((candidate) => candidate.kind !== "audit").every((candidate) => candidate.status === "completed"), true);
+	assert.equal(finished.plan.workItems.find((candidate) => candidate.kind === "audit")?.status, "ready");
 	await Effect.runPromise(secondClient.shutdown());
 	await Effect.runPromise(controller.shutdown());
 	fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
 });
 
-test("acceptance fails instead of completing with failed work remaining", async () => {
+test("finalized plans reject forged active or terminal work-item states", async () => {
 	const project = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage6-paused-project-"));
 	const agent = fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-stage6-paused-agent-"));
 	const runId = "stage6-paused";
-	const identity: WorkerIdentity = { runId, workItemId: "one", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" };
-	const tmux = {
-		createWorkerWindow: (input: { socketPath: string }) => Effect.succeed({ runId, workItemId: "one", serverSocketPath: "/tmp/tmux.sock", sessionId: "$1", sessionName: "main", windowId: "@1", paneId: "%1", displayName: "tf-01-one", socketPath: input.socketPath }),
-		closeWindow: () => Effect.succeed({ forced: false, alreadyExited: false }), detect: () => Effect.void, capturePane: () => Effect.succeed(""),
-	};
+	const tmux = { detect: () => Effect.void };
 	const controller = new WorkflowController({ getActiveTools: () => ["read"], setActiveTools: () => undefined }, undefined, () => runId, tmux as never);
-	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "paused", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "paused", workItems: [item(), item({ id: "two", title: "Two", order: 2, status: "failed" })], userResolutions: [], finalized: false }));
-	await Effect.runPromise(controller.finalizePlan());
-	const started = await Effect.runPromise(controller.startWorker("one"));
-	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
-	const client = new ProtocolClient({ socketPath: started.workflowSocketPath!, identity, token: await Effect.runPromise(readWorkflowToken(resolved.paths.runDir)), onDelegate: () => undefined, onFeedback: () => undefined, onShutdown: () => undefined, retryDelaysMs: [5] });
-	await Effect.runPromise(client.start()); await eventually(() => client.authoritativeContext !== undefined);
-	await new WorkerReportRuntime(client).submit(report(), client.authoritativeContext!);
-	await eventually(() => controller.activeRun?.plan.workItems[0]?.status === "report-review");
-	const failed = await Effect.runPromise(controller.acceptReport("one", "Accepted first item"));
-	assert.equal(failed.phase, "failed");
-	assert.equal(failed.plan.workItems.every((candidate) => candidate.status === "completed" || candidate.status === "failed"), true);
-	assert.equal(failed.plan.workItems.find((candidate) => candidate.id === "two")?.status, "failed");
-	assert.equal(failed.progression?.stage, "progression-failed");
-	assert.notEqual(controller.activeRun, undefined);
-	await Effect.runPromise(client.shutdown()); await Effect.runPromise(controller.stop());
-	fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
+	try {
+		await Effect.runPromise(controller.startRun({ cwd: project, prompt: "paused", agentDir: agent }));
+		await Effect.runPromise(controller.savePlan({ summary: "paused", auditProfile: profile, workItems: [item(), item({ id: "two", title: "Two", order: 2, status: "failed" })], userResolutions: [], finalized: false }));
+		await assert.rejects(Effect.runPromise(controller.finalizePlan()), /initial planned state/);
+	} finally {
+		if (controller.activeRun) await Effect.runPromise(controller.stop()).catch(() => undefined);
+		fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });
+	}
 });
 
 test("revision feedback returns the same worker to running and preserves repeated attempts", async () => {
@@ -170,7 +161,7 @@ test("revision feedback returns the same worker to running and preserves repeate
 	const feedback: string[] = [];
 	const controller = new WorkflowController({ getActiveTools: () => ["read"], setActiveTools: () => undefined }, undefined, () => runId, tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "revision", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "revision", workItems: [item()], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "revision", auditProfile: profile, workItems: [item()], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("one"));
 	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
@@ -203,7 +194,7 @@ test("revision feedback returns the same worker to running and preserves repeate
 	const firstAttempt = await Effect.runPromise(readReportAttempt(resolved.paths, "one", 1));
 	assert.equal(firstAttempt.report.summary, "Done enough");
 	const finished = await Effect.runPromise(controller.acceptReport("one", "Evidence reviewed"));
-	assert.equal(finished.phase, "completed");
+	assert.equal(finished.phase, "auditing");
 	assert.equal(finished.plan.workItems[0]?.completion?.acceptedAttempt, 1);
 	const acceptedReport = JSON.parse(fs.readFileSync(finished.plan.workItems[0]!.completion!.acceptedReportPath, "utf8")) as { report: WorkerReport };
 	assert.equal(acceptedReport.report.summary, "Done enough");
@@ -222,7 +213,7 @@ test("blocked workers resume through persisted answers and native same-session f
 	const feedback: string[] = [];
 	const controller = new WorkflowController({ getActiveTools: () => ["read"], setActiveTools: () => undefined }, undefined, () => runId, tmux as never);
 	await Effect.runPromise(controller.startRun({ cwd: project, prompt: "block", agentDir: agent }));
-	await Effect.runPromise(controller.savePlan({ summary: "block", workItems: [item()], userResolutions: [], finalized: false }));
+	await Effect.runPromise(controller.savePlan({ summary: "block", auditProfile: profile, workItems: [item()], userResolutions: [], finalized: false }));
 	await Effect.runPromise(controller.finalizePlan());
 	const started = await Effect.runPromise(controller.startWorker("one"));
 	const resolved = await Effect.runPromise(pathsForProject(project, runId, agent));
@@ -240,7 +231,7 @@ test("blocked workers resume through persisted answers and native same-session f
 	await new WorkerReportRuntime(client).submit(report(), client.authoritativeContext!);
 	await eventually(() => controller.activeRun?.plan.workItems[0]?.status === "report-review");
 	const finished = await Effect.runPromise(controller.acceptReport("one", "Accepted after blocker resolution"));
-	assert.equal(finished.phase, "completed");
+	assert.equal(finished.phase, "auditing");
 	assert.equal(finished.plan.userResolutions[0]?.answer, "Use strict behavior");
 	await Effect.runPromise(client.shutdown()); await Effect.runPromise(controller.shutdown());
 	fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(agent, { recursive: true, force: true });

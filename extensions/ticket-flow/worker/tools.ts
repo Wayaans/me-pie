@@ -9,7 +9,7 @@ import { Effect } from "effect";
 import { Type, type Static } from "typebox";
 import type { AuthoritativeWorkerContext, WorkerFeedback, WorkerReport } from "../domain.ts";
 import type { WorkerLifecycle } from "./lifecycle.ts";
-import { renderContextCall, renderReportCall, renderReportResult } from "./renderers.ts";
+import { renderWorkerCall, renderWorkerResult } from "./renderers.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
@@ -20,44 +20,64 @@ const RequirementResultParameters = StrictObject({
 	result: StringEnum(["satisfied", "not-satisfied", "not-applicable"] as const),
 	evidence: Type.String(),
 });
-
 const CheckResultParameters = StrictObject({
 	command: Type.String(),
 	result: StringEnum(["passed", "failed", "not-run"] as const),
 	output: Type.Optional(Type.String()),
 	reason: Type.Optional(Type.String()),
 });
-
-export const WorkflowContextParameters = StrictObject({
-	action: StringEnum(["get", "wait-for-feedback"] as const),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
+const AuditVerdictParameters = StrictObject({
+	requirement: Type.String(),
+	verdict: StringEnum(["pass", "fail", "not-applicable"] as const),
+	evidence: Type.String(),
+	fixes: Type.Optional(Type.Array(Type.String())),
+});
+const AuditFindingParameters = StrictObject({
+	id: Type.String(),
+	severity: StringEnum(["critical", "high", "medium", "low"] as const),
+	finding: Type.String(),
+	evidence: Type.String(),
+	fixLink: Type.Optional(Type.String()),
+	resolved: Type.Optional(Type.Boolean()),
 });
 
-export const WorkflowSubmitReportParameters = StrictObject({
-	status: StringEnum(["progress", "completed", "blocked", "failed"] as const),
-	summary: Type.String(),
+/** The worker process has exactly one workflow tool. */
+export const WORKER_TOOL_NAMES = ["workflow_worker"] as const;
+export const WorkflowWorkerParameters = StrictObject({
+	action: StringEnum(["get", "send", "submit"] as const),
+	message: Type.Optional(Type.String()),
+	questions: Type.Optional(Type.Array(Type.String())),
+	blocking: Type.Optional(Type.Boolean()),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
+	status: Type.Optional(StringEnum(["progress", "completed", "blocked", "failed"] as const)),
+	summary: Type.Optional(Type.String()),
 	requirements: Type.Optional(Type.Array(RequirementResultParameters)),
 	filesChanged: Type.Optional(Type.Array(Type.String())),
 	filesChangedExplanation: Type.Optional(Type.String()),
 	checks: Type.Optional(Type.Array(CheckResultParameters)),
 	caveats: Type.Optional(Type.Array(Type.String())),
 	blockers: Type.Optional(Type.Array(Type.String())),
-	questions: Type.Optional(Type.Array(Type.String())),
 	userInterventionRequired: Type.Optional(Type.Boolean()),
+	commitIds: Type.Optional(Type.Array(Type.String())),
+	auditVerdicts: Type.Optional(Type.Array(AuditVerdictParameters)),
+	auditFindings: Type.Optional(Type.Array(AuditFindingParameters)),
 });
 
-export type WorkflowContextInput = Static<typeof WorkflowContextParameters>;
-export type WorkflowSubmitReportInput = Static<typeof WorkflowSubmitReportParameters>;
+export type WorkflowWorkerInput = Static<typeof WorkflowWorkerParameters>;
+/** Legacy schemas are exported for decoding old session entries; only workflow_worker is registered. */
+export const WorkflowContextParameters = StrictObject({ action: StringEnum(["get", "wait-for-feedback"] as const), timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })) });
+export const WorkflowSubmitReportParameters = StrictObject({ status: StringEnum(["progress", "completed", "blocked", "failed"] as const), summary: Type.String(), requirements: Type.Optional(Type.Array(RequirementResultParameters)), filesChanged: Type.Optional(Type.Array(Type.String())), filesChangedExplanation: Type.Optional(Type.String()), checks: Type.Optional(Type.Array(CheckResultParameters)), caveats: Type.Optional(Type.Array(Type.String())), blockers: Type.Optional(Type.Array(Type.String())), questions: Type.Optional(Type.Array(Type.String())), userInterventionRequired: Type.Optional(Type.Boolean()) });
 
 export interface WorkerToolLifecycle {
 	readonly getContext: WorkerLifecycle["getContext"];
 	readonly waitForFeedback: WorkerLifecycle["waitForFeedback"];
 	readonly submitReport: WorkerLifecycle["submitReport"];
+	readonly sendQuestion?: WorkerLifecycle["sendQuestion"];
 }
 
 function lifecycleOrThrow(getLifecycle: () => WorkerToolLifecycle | undefined): WorkerToolLifecycle {
 	const lifecycle = getLifecycle();
-	if (!lifecycle) throw new Error("Ticket Flow worker lifecycle is not connected to an authenticated orchestrator.");
+	if (!lifecycle) throw new Error("Ticket Flow worker is inactive: no authenticated orchestrator connection.");
 	return lifecycle;
 }
 
@@ -82,50 +102,61 @@ export function boundWorkerToolOutput(text: string): string {
 
 export function registerWorkerTools(pi: ExtensionAPI, getLifecycle: () => WorkerToolLifecycle | undefined): void {
 	pi.registerTool({
-		name: "workflow_context",
-		label: "Workflow Context",
-		description: "Get bounded authoritative context from the authenticated orchestrator connection, or wait for feedback. Output is bounded and waits respect cancellation.",
-		promptSnippet: "Get authoritative delegated-item context or wait for orchestrator feedback",
-		parameters: WorkflowContextParameters,
+		name: "workflow_worker",
+		label: "Workflow Worker",
+		description: "Get authoritative delegated context, send a blocking question, or submit a structured progress/completion report to Main.",
+		promptSnippet: "Get context, ask Main a blocking question, or submit a structured report",
+		parameters: WorkflowWorkerParameters,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal) {
 			const lifecycle = await runToolEffect(Effect.try({ try: () => lifecycleOrThrow(getLifecycle), catch: errorFrom }), signal);
-			if (params.action === "get") {
-				if (params.timeoutMs !== undefined) throw new Error("workflow_context get does not accept timeoutMs.");
-				const context = await runToolEffect(Effect.try({ try: () => lifecycle.getContext(), catch: errorFrom }), signal);
-				const details: { readonly context?: AuthoritativeWorkerContext; readonly feedback?: WorkerFeedback } = { context };
-				return { content: [{ type: "text" as const, text: boundWorkerToolOutput(JSON.stringify(context)) }], details };
+			switch (params.action) {
+				case "get": {
+					if (params.message !== undefined || params.status !== undefined || params.summary !== undefined || params.timeoutMs !== undefined) throw new Error("workflow_worker get accepts no message, report, or timeout fields.");
+					const context = await runToolEffect(Effect.try({ try: () => lifecycle.getContext(), catch: errorFrom }), signal);
+					return { content: [{ type: "text" as const, text: boundWorkerToolOutput(JSON.stringify(context)) }], details: { context } as { readonly context: AuthoritativeWorkerContext } };
+				}
+				case "send": {
+					if (params.status !== undefined || params.summary !== undefined || params.requirements !== undefined || params.timeoutMs !== undefined && params.blocking === false) throw new Error("workflow_worker send accepts a question message, questions, and optional blocking flag.");
+					const message = params.message?.trim();
+					if (!message) throw new Error("workflow_worker send requires a non-empty message.");
+					const questions = params.questions ?? [message];
+					if (params.blocking === false) {
+						await lifecycle.submitReport({ status: "blocked", summary: message, blockers: [message], questions, userInterventionRequired: false }, signal);
+						return { content: [{ type: "text" as const, text: "Question sent to Main; worker remains connected." }], details: { question: message, questions, blocking: false } };
+					}
+					const feedback = lifecycle.sendQuestion
+						? await lifecycle.sendQuestion(message, questions, signal, params.timeoutMs)
+						: await lifecycle.waitForFeedback(signal, params.timeoutMs);
+					const text = `Main feedback received: ${feedback.type === "feedback" ? feedback.message : feedback.type}`;
+					return { content: [{ type: "text" as const, text: boundWorkerToolOutput(text) }], details: { question: message, questions, feedback } };
+				}
+				case "submit": {
+					if (!params.status || !params.summary) throw new Error("workflow_worker submit requires status and summary.");
+					const report: WorkerReport = {
+						status: params.status,
+						summary: params.summary,
+						...(params.requirements === undefined ? {} : { requirements: params.requirements }),
+						...(params.filesChanged === undefined ? {} : { filesChanged: params.filesChanged }),
+						...(params.filesChangedExplanation === undefined ? {} : { filesChangedExplanation: params.filesChangedExplanation }),
+						...(params.checks === undefined ? {} : { checks: params.checks }),
+						...(params.caveats === undefined ? {} : { caveats: params.caveats }),
+						...(params.blockers === undefined ? {} : { blockers: params.blockers }),
+						...(params.questions === undefined ? {} : { questions: params.questions }),
+						...(params.userInterventionRequired === undefined ? {} : { userInterventionRequired: params.userInterventionRequired }),
+						...(params.commitIds === undefined ? {} : { commitIds: params.commitIds }),
+						...(params.auditVerdicts === undefined ? {} : { auditVerdicts: params.auditVerdicts }),
+						...(params.auditFindings === undefined ? {} : { auditFindings: params.auditFindings }),
+					};
+					const validation = await lifecycle.submitReport(report, signal);
+					return {
+						content: [{ type: "text" as const, text: report.status === "completed" ? `Submitted completed report (${validation.matchedRequirements}/${validation.plannedRequirements} requirements).` : `Submitted ${report.status} report.` }],
+						details: { report, validation },
+					};
+				}
 			}
-			const feedback = await runToolEffect(Effect.tryPromise({
-				try: () => lifecycle.waitForFeedback(signal, params.timeoutMs),
-				catch: errorFrom,
-			}), signal);
-			const details: { readonly context?: AuthoritativeWorkerContext; readonly feedback?: WorkerFeedback } = { feedback };
-			return { content: [{ type: "text" as const, text: boundWorkerToolOutput(JSON.stringify(feedback)) }], details };
 		},
-		renderCall: renderContextCall,
-	});
-
-	pi.registerTool({
-		name: "workflow_submit_report",
-		label: "Workflow Report",
-		description: "Submit progress, completion, blocker, or failure through the authenticated native protocol. Completed reports require every planned requirement, files, checks, caveats, and blockers.",
-		promptSnippet: "Submit progress, blockers, failure, or a final structured completion report",
-		parameters: WorkflowSubmitReportParameters,
-		executionMode: "sequential",
-		async execute(_toolCallId, params, signal) {
-			const report = params as WorkerReport;
-			const lifecycle = await runToolEffect(Effect.try({ try: () => lifecycleOrThrow(getLifecycle), catch: errorFrom }), signal);
-			const validation = await runToolEffect(Effect.tryPromise({
-				try: () => lifecycle.submitReport(report, signal),
-				catch: errorFrom,
-			}), signal);
-			const text = report.status === "completed"
-				? `Submitted completed report with ${validation.matchedRequirements}/${validation.plannedRequirements} requirements.`
-				: `Submitted ${report.status} report.`;
-			return { content: [{ type: "text" as const, text }], details: { report, validation } };
-		},
-		renderCall: renderReportCall,
-		renderResult: (result, _options, theme) => renderReportResult(result, theme),
+		renderCall: renderWorkerCall,
+		renderResult: renderWorkerResult,
 	});
 }

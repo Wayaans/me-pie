@@ -10,6 +10,8 @@ export interface WorkerStartupEnvironment {
 	readonly runId: string;
 	readonly workItemId: string;
 	readonly requestedProfile: PiLaunchProfile;
+	/** Launch metadata, when supplied by the owner launcher. */
+	readonly kind?: "implementation" | "audit" | "fix";
 	readonly socketPath: string;
 	readonly token: string;
 }
@@ -47,6 +49,10 @@ export function readWorkerEnvironment(environment: NodeJS.ProcessEnv = process.e
 	const thinking = required(environment, "MEPIE_WORKFLOW_REQUESTED_THINKING");
 	const socketPath = required(environment, "MEPIE_WORKFLOW_SOCKET");
 	const token = required(environment, "MEPIE_WORKFLOW_TOKEN");
+	const kind = environment.MEPIE_WORKFLOW_WORKER_KIND;
+	if (kind !== undefined && kind !== "implementation" && kind !== "audit" && kind !== "fix") {
+		throw new WorkerEnvironmentError({ variable: "MEPIE_WORKFLOW_WORKER_KIND", message: "MEPIE_WORKFLOW_WORKER_KIND must be implementation, audit, or fix." });
+	}
 	if (!/^[^/\s]+\/[^/\s]+$/.test(model)) {
 		throw new WorkerEnvironmentError({ variable: "MEPIE_WORKFLOW_REQUESTED_MODEL", message: "The requested model must be an exact provider/model identifier." });
 	}
@@ -56,7 +62,14 @@ export function readWorkerEnvironment(environment: NodeJS.ProcessEnv = process.e
 	if (!path.isAbsolute(socketPath)) {
 		throw new WorkerEnvironmentError({ variable: "MEPIE_WORKFLOW_SOCKET", message: "The workflow socket path must be absolute." });
 	}
-	return { runId, workItemId, requestedProfile: { model, thinking: thinking as PiLaunchProfile["thinking"] }, socketPath, token };
+	return {
+		runId,
+		workItemId,
+		requestedProfile: { model, thinking: thinking as PiLaunchProfile["thinking"] },
+		...(kind === undefined ? {} : { kind }),
+		socketPath,
+		token,
+	};
 }
 
 export class WorkerLifecycle {
@@ -117,6 +130,30 @@ export class WorkerLifecycle {
 	submitReport(report: WorkerReport, signal?: AbortSignal): Promise<ReportValidationResult> {
 		if (!this.reportRuntime) return Promise.reject(new WorkerLifecycleError({ message: "Worker native protocol has not started." }));
 		return this.reportRuntime.submit(report, this.getContext(), signal);
+	}
+
+	/** Send a blocking worker question without dropping the authenticated socket. */
+	async sendQuestion(message: string, questions: readonly string[] = [message], signal?: AbortSignal, timeoutMs?: number): Promise<WorkerFeedback> {
+		const text = message.trim();
+		if (!text) throw new WorkerLifecycleError({ message: "Worker question must be non-empty." });
+		const normalizedQuestions = questions.map((question) => question.trim()).filter(Boolean);
+		if (normalizedQuestions.length === 0) throw new WorkerLifecycleError({ message: "Worker question list must be non-empty." });
+		const startedAt = Date.now();
+		const timeoutSignal = timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs);
+		const waitSignal = timeoutSignal === undefined
+			? signal
+			: signal === undefined
+				? timeoutSignal
+				: AbortSignal.any([signal, timeoutSignal]);
+		await this.submitReport({
+			status: "blocked",
+			summary: text,
+			blockers: [text],
+			questions: normalizedQuestions,
+			userInterventionRequired: false,
+		}, waitSignal);
+		const remaining = timeoutMs === undefined ? undefined : Math.max(1, timeoutMs - (Date.now() - startedAt));
+		return this.waitForFeedback(waitSignal, remaining);
 	}
 
 	get isStarted(): boolean { return this.started; }

@@ -68,7 +68,7 @@ function item(): WorkItem {
 }
 
 function plan(): WorkflowPlan {
-	return { summary: "Stage 3", workItems: [item()], userResolutions: [], finalized: false };
+	return { summary: "Stage 3", auditProfile: profile, workItems: [item()], userResolutions: [], finalized: false };
 }
 
 test("tmux format parsing and display-name sanitization are deterministic", () => {

@@ -43,6 +43,8 @@ export interface CreateWorkerWindowInput {
 	readonly order: number;
 	readonly cwd: string;
 	readonly profile: PiLaunchProfile;
+	readonly readOnly?: boolean;
+	readonly kind?: "implementation" | "audit" | "fix";
 	readonly socketPath: string;
 	readonly token: string;
 }
@@ -235,11 +237,15 @@ export class TmuxController {
 			const session = yield* this.detect();
 			const piExecutable = yield* this.resolvePi();
 			const runtimeDirectory = workflowRuntimeDirectory(input.runId);
-			const args = buildPiArguments(input.profile, this.packageRoot);
+			const args = buildPiArguments(input.profile, this.packageRoot, input.readOnly === undefined ? {} : { readOnly: input.readOnly });
 			const environment = buildWorkerEnvironment({
 				runId: input.runId,
 				workItemId: input.workItemId,
 				profile: input.profile,
+				// The durable plan currently exposes audit read-only-ness as the
+				// launch flag. Carry the role separately so the worker never has to
+				// infer it from its prompt or native context.
+				kind: input.kind ?? (input.readOnly === true ? "audit" : input.workItemId.startsWith("fix-") ? "fix" : "implementation"),
 				socketPath: input.socketPath,
 				token: input.token,
 			});

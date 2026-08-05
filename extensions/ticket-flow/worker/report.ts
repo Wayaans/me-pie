@@ -102,6 +102,7 @@ export function validateWorkerReport(
 	ensureTextArray(report.questions, "questions", false);
 	ensureTextArray(report.caveats, "caveats", false);
 	ensureTextArray(report.blockers, "blockers", false);
+	if (report.commitIds !== undefined && report.commitIds.some((commit) => !commit.trim() || /[\s\0]/.test(commit))) throw new Error("commitIds must contain exact non-empty commit identifiers.");
 
 	if (report.status === "progress") return { matchedRequirements: 0, plannedRequirements: planned.length };
 	if (report.status === "blocked") {
@@ -303,8 +304,14 @@ export class WorkerReportRuntime {
 	constructor(private readonly client: ProtocolClient) {}
 
 	async submit(report: WorkerReport, context: AuthoritativeWorkerContext, signal?: AbortSignal): Promise<ReportValidationResult> {
-		const validation = validateWorkerReport(report, context.requirements);
-		await this.client.submitWorkerEvent(protocolEventType(report), { report }, signal);
+		// Audit workers speak in audit verdicts. Transport still carries the
+		// common requirement result shape so the controller can use one durable
+		// report schema without weakening implementation validation.
+		const normalized = context.workItemKind === "audit" && report.requirements === undefined && report.auditVerdicts !== undefined
+			? { ...report, requirements: report.auditVerdicts.map((verdict) => ({ requirement: verdict.requirement, result: verdict.verdict === "pass" ? "satisfied" as const : verdict.verdict === "fail" ? "not-satisfied" as const : "not-applicable" as const, evidence: verdict.evidence })) }
+			: report;
+		const validation = validateWorkerReport(normalized, context.requirements);
+		await this.client.submitWorkerEvent(protocolEventType(normalized), { report: normalized }, signal);
 		return validation;
 	}
 }

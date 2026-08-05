@@ -1,37 +1,38 @@
 import { Effect, Exit, Result, Scope, Semaphore } from "effect";
 import type {
-	CompletionRecord,
 	PlanChange,
 	PlanningDetails,
 	PiLaunchProfile,
 	ProgressionCheckpoint,
+	WorkerReport,
 	WorkflowBlocker,
 	WorkflowPlan,
+	UserResolution,
 	WorkflowRun,
 	WorkItem,
 } from "./domain.ts";
 import { createRunId } from "./domain.ts";
-import { appendEvent, makeWorkflowEvent, replayEvents } from "./event-store.ts";
+import { replayEvents } from "./event-store.ts";
 import { acquireProjectLock, recoverProjectLock, type ProjectLock } from "./lock.ts";
 import { pathsForProject, type WorkflowPaths } from "./paths.ts";
 import { normalizePlan, transitionRun, transitionWorkItem, validatePlan } from "./state-machine.ts";
 import type { PersistenceError, ValidationError } from "./errors.ts";
-import { loadRun, saveRun } from "./state-store.ts";
+import { loadRun } from "./state-store.ts";
+import { persistWorkflowTransaction } from "./persistence.ts";
 import { TmuxController } from "./tmux/controller.ts";
 import { readWorkflowToken, removeWorkflowToken, workflowSocketPath, writeWorkflowToken } from "./protocol/runtime.ts";
 import { ProtocolServer, type ProtocolRejection } from "./protocol/server.ts";
 import type { WorkflowProtocolEvent } from "./protocol/messages.ts";
+import { ingestProtocolEvent, acknowledgeProtocolCommand as acknowledgeProtocolCommandIngestion, rejectProtocolWorker as rejectProtocolWorkerIngestion, type ProtocolIngestionDependencies } from "./protocol/ingestion.ts";
 import { makeAuthoritativeWorkerContext, requirementId } from "./worker/context.ts";
-import { persistReportAttempt, persistAcceptedReport, readLatestReportAttempt, readReportAttempt, validateWorkerReport } from "./worker/report.ts";
-import { applyCompletionStrategy, type CompletionApplicationResult } from "./completion.ts";
+import { readLatestReportAttempt, readReportAttempt } from "./worker/report.ts";
+import { acceptReport as acceptReportProgression, continueAfterCompletedProgression, type CompletionAcceptanceDependencies } from "./completion-acceptance.ts";
 import { discoverUnfinishedRuns, reconcileRecovery, type RecoveryDiscovery, type RecoveryReconciliation } from "./recovery.ts";
+import { advanceAuditAfterAcceptance as advanceAuditProgression, auditProfile, scheduleAuditAfterAcceptance, type AuditProgressionDependencies } from "./audit.ts";
+import { gitHead, gitPreflight, gitStateFromPreflight, type GitCommandRunner } from "./git.ts";
+import { questionIdFor, reconcilePlanningQuestions } from "./planning.ts";
 
-export const WORKFLOW_TOOL_NAMES = [
-	"workflow_plan",
-	"workflow_worker",
-	"workflow_review_report",
-	"workflow_control",
-] as const;
+export const WORKFLOW_TOOL_NAMES = ["workflow_plan", "workflow_delegate"] as const;
 
 const READ_ONLY_TOOL_NAMES = new Set([
 	"read", "grep", "find", "ls", "rg", "fd", "find_docs", "github_get", "github_comments",
@@ -39,17 +40,21 @@ const READ_ONLY_TOOL_NAMES = new Set([
 ]);
 const MAX_STATUS_BYTES = 50 * 1024;
 const MAX_STATUS_LINES = 2_000;
+export const DELEGATION_START_TIMEOUT_MS = 30_000;
 
 export interface WorkflowControllerPi {
 	readonly getActiveTools: () => string[];
 	readonly setActiveTools: (names: string[]) => void;
 }
 
+export type WorkflowProgressUpdate = (message: string) => void;
+
 export interface StartRunInput {
 	readonly cwd: string;
 	readonly prompt: string;
 	readonly sessionId?: string;
 	readonly agentDir?: string;
+	readonly auditProfile?: PiLaunchProfile;
 }
 
 export interface RecoverRunInput {
@@ -156,35 +161,75 @@ function waitWithTimeout<T>(wait: (signal: AbortSignal) => Promise<T>, signal: A
 	return wait(controller.signal).finally(() => { if (timer) clearTimeout(timer); signal?.removeEventListener("abort", abort); });
 }
 
-function applyPlanChange(plan: WorkflowPlan, planning: PlanningDetails, change: PlanChange): {
+async function waitForProtocolEvent(
+	server: ProtocolServer,
+	predicate: (event: WorkflowProtocolEvent) => boolean,
+	isPaused: () => string | undefined,
+	signal: AbortSignal,
+): Promise<WorkflowProtocolEvent> {
+	const local = new AbortController();
+	const abort = () => local.abort(signal.reason ?? new DOMException("Aborted", "AbortError"));
+	if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+	const waiting = server.wait(predicate, local.signal);
+	void waiting.catch(() => undefined);
+	try {
+		while (true) {
+			const result = await Promise.race([
+				waiting.then((event) => ({ event } as const)),
+				new Promise<{ readonly event?: undefined }>((resolve) => setTimeout(() => resolve({}), 10)),
+			]);
+			if (result.event) return result.event;
+			const issue = isPaused();
+			if (issue) throw new Error(issue);
+		}
+	} finally {
+		local.abort();
+		signal.removeEventListener("abort", abort);
+	}
+}
+
+function applyPlanChange(plan: WorkflowPlan, planning: PlanningDetails, change: PlanChange, now: string): {
 	readonly plan: WorkflowPlan;
 	readonly unresolvedQuestions: readonly string[];
+	readonly questionLedger: PlanningDetails["questionLedger"];
 } {
+	const reconcile = (requestedQuestions: readonly string[], incomingResolutions: readonly UserResolution[]): Pick<ReturnType<typeof reconcilePlanningQuestions>, "questionLedger" | "unresolvedQuestions" | "userResolutions"> => reconcilePlanningQuestions({
+		existingLedger: planning.questionLedger,
+		existingUnresolved: planning.unresolvedQuestions,
+		existingResolutions: plan.userResolutions,
+		incomingResolutions,
+		requestedQuestions,
+		now,
+	});
 	switch (change.type) {
 		case "set-summary":
-			return { plan: { ...plan, summary: change.summary, finalized: false }, unresolvedQuestions: planning.unresolvedQuestions };
+			return { plan: { ...plan, summary: change.summary, finalized: false }, unresolvedQuestions: planning.unresolvedQuestions, questionLedger: planning.questionLedger };
 		case "upsert-work-item": {
 			const workItems = plan.workItems.some((item) => item.id === change.workItem.id)
 				? plan.workItems.map((item) => item.id === change.workItem.id ? change.workItem : item)
 				: [...plan.workItems, change.workItem];
-			return { plan: { ...plan, workItems, finalized: false }, unresolvedQuestions: planning.unresolvedQuestions };
+			return { plan: { ...plan, workItems, finalized: false }, unresolvedQuestions: planning.unresolvedQuestions, questionLedger: planning.questionLedger };
 		}
 		case "remove-work-item":
 			return {
 				plan: { ...plan, workItems: plan.workItems.filter((item) => item.id !== change.workItemId), finalized: false },
 				unresolvedQuestions: planning.unresolvedQuestions,
+				questionLedger: planning.questionLedger,
 			};
-		case "set-user-resolutions":
-			return { plan: { ...plan, userResolutions: change.userResolutions, finalized: false }, unresolvedQuestions: planning.unresolvedQuestions };
-		case "set-unresolved-questions":
-			return { plan: { ...plan, finalized: false }, unresolvedQuestions: unique(change.questions.map((question) => question.trim())) };
+		case "set-user-resolutions": {
+			const result = reconcile([], change.userResolutions);
+			return { plan: { ...plan, userResolutions: result.userResolutions, finalized: false }, unresolvedQuestions: result.unresolvedQuestions, questionLedger: result.questionLedger };
+		}
+		case "set-unresolved-questions": {
+			const result = reconcile(change.questions, []);
+			return { plan: { ...plan, userResolutions: result.userResolutions, finalized: false }, unresolvedQuestions: result.unresolvedQuestions, questionLedger: result.questionLedger };
+		}
 	}
 }
 
 export class WorkflowController {
 	private active: ActiveRun | undefined;
 	private lastStopped: WorkflowRun | undefined;
-	/** All progression decisions and transport callbacks share this permit. */
 	private readonly coordinator = Semaphore.makeUnsafe(1);
 
 	constructor(
@@ -192,6 +237,7 @@ export class WorkflowController {
 		private readonly now: () => Date = () => new Date(),
 		private readonly newRunId: () => string = createRunId,
 		private readonly tmux = new TmuxController(),
+		private readonly gitRunner?: GitCommandRunner,
 	) {}
 
 	get activeRun(): WorkflowRun | undefined {
@@ -213,7 +259,6 @@ export class WorkflowController {
 		return this.coordinator.withPermits(1)(operation);
 	}
 
-	/** Select the first dependency-ready item in finalized order. */
 	nextReadyWorkItem(): WorkItem | undefined {
 		const run = this.active?.run;
 		if (!run || !run.plan.finalized) return undefined;
@@ -225,7 +270,6 @@ export class WorkflowController {
 		return undefined;
 	}
 
-	/** Backwards-friendly short name used by orchestration callers. */
 	nextReadyItem(): WorkItem | undefined {
 		return this.nextReadyWorkItem();
 	}
@@ -237,13 +281,9 @@ export class WorkflowController {
 	): Effect.Effect<WorkflowRun, Error | PersistenceError | ValidationError> {
 		const active = this.active;
 		if (!active) return Effect.fail(new Error("No active Ticket Flow run."));
-		return Effect.gen(function* () {
-			yield* saveRun(active.paths, next);
-			const event = yield* makeWorkflowEvent(next.id, eventType, data);
-			yield* appendEvent(active.paths.eventsFile, event);
-			active.run = next;
-			return next;
-		});
+		return persistWorkflowTransaction(active.paths, next, eventType, data).pipe(
+			Effect.tap((normalized) => Effect.sync(() => { active.run = normalized; })),
+		);
 	}
 
 	private detach(activeState: ActiveRun): void {
@@ -276,6 +316,10 @@ export class WorkflowController {
 				)).pipe(Effect.mapError((error) => new Error(`Could not acquire the Ticket Flow project lock: ${errorMessage(error)}`)));
 				const previousActiveTools = this.pi.getActiveTools();
 				const restrictedActiveTools = restrictedToolList(previousActiveTools);
+				const git = yield* Effect.tryPromise({
+					try: (signal) => gitPreflight(input.cwd, runId, this.gitRunner, signal),
+					catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+				});
 				const timestamp = this.now().toISOString();
 				const run: WorkflowRun = {
 					id: runId,
@@ -283,11 +327,13 @@ export class WorkflowController {
 					projectPath: resolved.canonicalProjectPath,
 					originalPrompt: input.prompt,
 					...(input.sessionId === undefined ? {} : { orchestratorSessionId: input.sessionId }),
+					...(input.auditProfile === undefined ? {} : { auditProfile: auditProfile(input.auditProfile) }),
 					phase: "analyzing",
 					createdAt: timestamp,
 					updatedAt: timestamp,
 					plan: emptyPlan(),
 					planning: { unresolvedQuestions: [], changes: [], previousActiveTools, restrictedActiveTools },
+					...(git === undefined ? {} : { git: gitStateFromPreflight(git) }),
 				};
 				const activeState = { run, paths: resolved.paths, lock, scope };
 				this.active = activeState;
@@ -302,23 +348,42 @@ export class WorkflowController {
 	savePlan(plan: WorkflowPlan, questions: readonly string[] = []) {
 		return Effect.gen({ self: this }, function* () {
 			const active = yield* this.requirePlanningRun();
-			const normalized = normalizePlan({ ...plan, finalized: false });
-			yield* validatePlan(normalized);
-			const unresolvedQuestions = unique(questions.map((question) => question.trim()));
-			if (unresolvedQuestions.some((question) => !question)) {
-				return yield* Effect.fail(new Error("Unresolved questions must not be empty."));
+			const requestedFinalized = plan.finalized;
+			const timestamp = this.now().toISOString();
+			const requestedAuditProfile = plan.auditProfile;
+			if (requestedFinalized && requestedAuditProfile === undefined) {
+				return yield* Effect.fail(new Error("Cannot finalize: an explicit model and thinking level audit profile must be set in plan.auditProfile; no fallback is permitted."));
 			}
-			const phase = unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing";
+			const reconciled = reconcilePlanningQuestions({
+				existingLedger: active.planning.questionLedger,
+				existingUnresolved: active.planning.unresolvedQuestions,
+				existingResolutions: active.plan.userResolutions,
+				incomingResolutions: plan.userResolutions,
+				requestedQuestions: questions,
+				now: timestamp,
+			});
+			const normalizedDraft = normalizePlan({
+				...plan,
+				userResolutions: reconciled.userResolutions,
+				finalized: false,
+			});
+			yield* validatePlan(normalizedDraft);
+			if (requestedFinalized && reconciled.unresolvedQuestions.length > 0) return yield* Effect.fail(new Error("Cannot save a finalized plan while clarification questions remain; durable question answers are required."));
+			const normalized = requestedFinalized ? normalizePlan({ ...normalizedDraft, finalized: true }) : normalizedDraft;
+			yield* validatePlan(normalized);
+			const phase = requestedFinalized ? yield* transitionRun(active.phase, "ready") : reconciled.unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing";
 			const next: WorkflowRun = {
 				...active,
+				...(requestedAuditProfile === undefined ? {} : { auditProfile: auditProfile(requestedAuditProfile) }),
 				phase,
-				updatedAt: this.now().toISOString(),
+				updatedAt: timestamp,
 				plan: normalized,
-				planning: { ...active.planning, unresolvedQuestions },
+				planning: { ...active.planning, unresolvedQuestions: reconciled.unresolvedQuestions, questionLedger: reconciled.questionLedger },
 			};
-			return yield* this.persist(next, "plan-saved", {
+			return yield* this.persist(next, requestedFinalized ? "plan-finalized" : "plan-saved", {
 				workItemCount: normalized.workItems.length,
-				unresolvedQuestionCount: unresolvedQuestions.length,
+				unresolvedQuestionCount: reconciled.unresolvedQuestions.length,
+				finalized: requestedFinalized,
 			});
 		});
 	}
@@ -329,14 +394,19 @@ export class WorkflowController {
 			if (changes.length === 0) return yield* Effect.fail(new Error("workflow_plan update requires at least one change."));
 			let nextPlan = active.plan;
 			let unresolvedQuestions = active.planning.unresolvedQuestions;
+			let questionLedger = active.planning.questionLedger;
+			const timestamp = this.now().toISOString();
 			for (const change of changes) {
-				const applied = applyPlanChange(nextPlan, { ...active.planning, unresolvedQuestions }, change);
+				const planningState: PlanningDetails = questionLedger === undefined
+					? { ...active.planning, unresolvedQuestions }
+					: { ...active.planning, unresolvedQuestions, questionLedger };
+				const applied = applyPlanChange(nextPlan, planningState, change, timestamp);
 				nextPlan = applied.plan;
 				unresolvedQuestions = applied.unresolvedQuestions;
+				questionLedger = applied.questionLedger;
 			}
 			nextPlan = normalizePlan(nextPlan);
 			yield* validatePlan(nextPlan);
-			const timestamp = this.now().toISOString();
 			const next: WorkflowRun = {
 				...active,
 				phase: unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing",
@@ -345,6 +415,7 @@ export class WorkflowController {
 				planning: {
 					...active.planning,
 					unresolvedQuestions,
+					...(questionLedger === undefined ? {} : { questionLedger }),
 					changes: [...active.planning.changes, ...changes.map((change) => ({ timestamp, change }))],
 				},
 			};
@@ -356,10 +427,89 @@ export class WorkflowController {
 		return this.serialize(this.startWorkerInternal(workItemId));
 	}
 
+	private pauseDelegationStart(workItemId: string, stage: string, cause: unknown) {
+		return Effect.uninterruptible(Effect.gen({ self: this }, function* () {
+			const current = this.active?.run;
+			if (!current || current.activeWorkItemId !== workItemId) return;
+			const phase = current.phase === "paused" ? current.phase : yield* transitionRun(current.phase, "paused");
+			const timestamp = this.now().toISOString();
+			const next: WorkflowRun = {
+				...current,
+				phase,
+				pauseReason: "recovery",
+				recoveryIssue: { kind: `delegation-${stage}`, message: `Worker delegation ${stage} did not complete: ${errorMessage(cause)}. Resume only after inspecting the durable checkpoint.` },
+				progression: { operation: "delegate", stage: `${stage}-paused`, workItemId, updatedAt: timestamp },
+				updatedAt: timestamp,
+			};
+			yield* this.persist(next, `delegation-${stage}-paused`, { workItemId, message: errorMessage(cause) });
+		}));
+	}
+
+	delegateStart(workItemId: string, onUpdate?: WorkflowProgressUpdate, signal?: AbortSignal, timeoutMs = DELEGATION_START_TIMEOUT_MS) {
+		return Effect.gen({ self: this }, function* () {
+			const active = yield* this.requireRun();
+			const item = active.plan.workItems.find((candidate) => candidate.id === workItemId);
+			if (!item) return yield* Effect.fail(new Error(`Unknown work item: ${workItemId}`));
+			if (active.phase === "paused") return yield* Effect.fail(new Error("Ticket Flow is paused; resume before starting a worker."));
+			onUpdate?.("tmux window creation · pending");
+			yield* this.startWorker(workItemId);
+			onUpdate?.("tmux window created · stable ownership recorded");
+			const protocol = this.active?.protocol;
+			if (!protocol) return yield* Effect.fail(new Error("Delegation protocol was not started."));
+			const connected = yield* Effect.result(Effect.tryPromise({
+				try: (waitSignal) => waitWithTimeout((innerSignal) => waitForProtocolEvent(protocol, (event) => event.type === "worker-connected", () => this.active?.run.phase === "paused" ? this.active.run.recoveryIssue?.message ?? "Delegation was paused during connection." : undefined, innerSignal), waitSignal, timeoutMs),
+				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+			}));
+			if (Result.isFailure(connected)) {
+				yield* this.pauseDelegationStart(workItemId, "connection", connected.failure);
+				onUpdate?.("connection/profile verification · paused for recovery");
+				return yield* Effect.fail(connected.failure);
+			}
+			onUpdate?.(`exact profile verified · ${item.launchProfile?.model} · ${item.launchProfile?.thinking}`);
+			const ready = yield* Effect.result(Effect.tryPromise({
+				try: (waitSignal) => waitWithTimeout((innerSignal) => waitForProtocolEvent(protocol, (event) => event.type === "worker-ready", () => this.active?.run.phase === "paused" ? this.active.run.recoveryIssue?.message ?? "Delegation was paused before prompt delivery." : undefined, innerSignal), waitSignal, timeoutMs),
+				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+			}));
+			if (Result.isFailure(ready)) {
+				yield* this.pauseDelegationStart(workItemId, "ready", ready.failure);
+				return yield* Effect.fail(ready.failure);
+			}
+			const delegateResult = yield* Effect.result(Effect.tryPromise({
+				try: (waitSignal) => waitWithTimeout(async (innerSignal) => {
+					while (true) {
+						const candidate = this.active?.run.protocolCommands?.find((command) => command.type === "delegate" && !command.acknowledged);
+						if (candidate) return candidate;
+						await new Promise<void>((resolve, reject) => {
+							const timer = setTimeout(resolve, 10);
+							const abort = () => { clearTimeout(timer); reject(innerSignal.reason ?? new DOMException("Aborted", "AbortError")); };
+							innerSignal.addEventListener("abort", abort, { once: true });
+						});
+					}
+				}, waitSignal, timeoutMs),
+				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+			}));
+			if (Result.isFailure(delegateResult)) {
+				yield* this.pauseDelegationStart(workItemId, "prompt", delegateResult.failure);
+				return yield* Effect.fail(delegateResult.failure);
+			}
+			const delegate = delegateResult.success;
+			const acknowledgement = yield* Effect.result(Effect.tryPromise({
+				try: (waitSignal) => waitWithTimeout((innerSignal) => protocol.waitForAcknowledgement(delegate.requestId, innerSignal), waitSignal, timeoutMs),
+				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+			}));
+			if (Result.isFailure(acknowledgement)) {
+				yield* this.pauseDelegationStart(workItemId, "acknowledgement", acknowledgement.failure);
+				return yield* Effect.fail(acknowledgement.failure);
+			}
+			onUpdate?.("authenticated connection ready · exact planned prompt delivered");
+			return yield* this.requireRun();
+		}).pipe(Effect.onInterrupt(() => this.pauseDelegationStart(workItemId, "cancelled", new Error("delegation start was cancelled")).pipe(Effect.catch(() => Effect.void))));
+	}
+
 	private startWorkerInternal(workItemId: string) {
 		return Effect.gen({ self: this }, function* () {
 			const active = yield* this.requireRun();
-			if (!active.plan.finalized || (active.phase !== "ready" && active.phase !== "executing")) {
+			if (!active.plan.finalized || (active.phase !== "ready" && active.phase !== "executing" && active.phase !== "auditing" && active.phase !== "fixing")) {
 				return yield* Effect.fail(new Error("A worker can start only after the Ticket Flow plan is finalized."));
 			}
 			if (active.tmux !== undefined) {
@@ -377,7 +527,12 @@ export class WorkflowController {
 			if (!item.launchProfile?.model || !item.launchProfile.thinking) {
 				return yield* Effect.fail(new Error(`Work item ${workItemId} has no complete launch profile.`));
 			}
-			let status = item.status;
+			const attemptBaseCommit = active.git === undefined ? undefined : yield* Effect.tryPromise({
+				try: (headSignal) => gitHead(active.projectPath, this.gitRunner, headSignal),
+				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+			});
+			if (active.git !== undefined && attemptBaseCommit === undefined) return yield* Effect.fail(new Error("Git state exists but the active attempt has no reachable HEAD."));
+		let status = item.status;
 			if (status === "planned" || status === "interrupted") status = yield* transitionWorkItem(status, "ready");
 			if (status !== "ready") return yield* Effect.fail(new Error(`Work item ${workItemId} cannot start while ${status}.`));
 			status = yield* transitionWorkItem(status, "spawning");
@@ -385,7 +540,9 @@ export class WorkflowController {
 			const spawningItem = { ...item, status };
 			const spawning: WorkflowRun = {
 				...active,
+				...(active.git === undefined || attemptBaseCommit === undefined ? {} : { git: { ...active.git, attemptBaseCommit } }),
 				phase,
+				progression: { operation: "delegate", stage: "tmux-window-pending", workItemId, updatedAt: this.now().toISOString() },
 				updatedAt: this.now().toISOString(),
 				activeWorkItemId: workItemId,
 				requestedLaunchProfile: { model: item.launchProfile.model, thinking: item.launchProfile.thinking },
@@ -394,7 +551,7 @@ export class WorkflowController {
 			yield* this.persist(spawning, "worker-spawning", { workItemId, requestedLaunchProfile: spawning.requestedLaunchProfile });
 			const activeState = this.active!;
 			const socketPath = workflowSocketPath(active.id);
-			const socketRun: WorkflowRun = { ...spawning, workflowSocketPath: socketPath };
+			const socketRun: WorkflowRun = { ...spawning, workflowSocketPath: socketPath, progression: { operation: "delegate", stage: "authenticated-socket-pending", workItemId, updatedAt: this.now().toISOString() } };
 			yield* this.persist(socketRun, "worker-protocol-starting", { workItemId, socketPath });
 			const failProtocolStart = (cause: unknown) => Effect.gen({ self: this }, function* () {
 				const failedItem = { ...spawningItem, status: yield* transitionWorkItem("spawning", "failed") };
@@ -420,6 +577,10 @@ export class WorkflowController {
 				order: item.order,
 				cwd: active.projectPath,
 				profile: spawning.requestedLaunchProfile!,
+				// The durable kind is authoritative. Never let a model-supplied
+				// readOnly field downgrade an audit worker (or upgrade another kind).
+				readOnly: item.kind === "audit",
+				kind: item.kind === "audit" ? "audit" : item.kind === "fix" ? "fix" : "implementation",
 				socketPath,
 				token: activeState.workerToken,
 			}).pipe(Effect.catch((cause) => Effect.gen({ self: this }, function* () {
@@ -441,6 +602,7 @@ export class WorkflowController {
 			const verifyingItem = { ...spawningItem, status: yield* transitionWorkItem("spawning", "verifying-worker") };
 			const verifying: WorkflowRun = {
 				...socketRun,
+				progression: { operation: "delegate", stage: "profile-verification-pending", workItemId, updatedAt: this.now().toISOString() },
 				updatedAt: this.now().toISOString(),
 				tmux: handle,
 				plan: { ...socketRun.plan, workItems: socketRun.plan.workItems.map((candidate) => candidate.id === workItemId ? verifyingItem : candidate) },
@@ -477,214 +639,41 @@ export class WorkflowController {
 		});
 	}
 
-	private rejectProtocolWorker(rejection: ProtocolRejection) {
-		return this.serialize(this.rejectProtocolWorkerInternal(rejection));
+	private protocolIngestionDependencies(): ProtocolIngestionDependencies {
+		return { now: this.now, persist: (next, eventType, data) => this.persist(next, eventType, data) };
 	}
 
-	private rejectProtocolWorkerInternal(rejection: ProtocolRejection) {
-		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requireRun();
-			const workItemId = active.activeWorkItemId;
-			const item = workItemId === undefined ? undefined : active.plan.workItems.find((candidate) => candidate.id === workItemId);
-			if (!item || item.status !== "verifying-worker") {
-				const event = yield* makeWorkflowEvent(active.id, "worker-profile-rejected", { reason: rejection.reason });
-				yield* appendEvent(this.active!.paths.eventsFile, event);
-				return;
-			}
-			const next: WorkflowRun = {
-				...active,
-				phase: yield* transitionRun(active.phase, "paused"),
-				pauseReason: "recovery",
-				recoveryIssue: { kind: `profile-${rejection.reason}`, message: `Worker profile reconciliation failed: ${rejection.reason}.` },
-				updatedAt: this.now().toISOString(),
-			};
-			yield* this.persist(next, "worker-profile-rejected", {
-				reason: rejection.reason,
-				...(rejection.actual === undefined ? {} : {
-					actual: {
-						provider: rejection.actual.provider,
-						model: rejection.actual.model,
-						thinking: rejection.actual.thinking,
-						runId: rejection.actual.runId,
-						workItemId: rejection.actual.workItemId,
-					},
-				}),
-			});
-		});
+	private protocolState(): { readonly run: WorkflowRun; readonly paths: WorkflowPaths; readonly server: ProtocolServer } | undefined {
+		const active = this.active;
+		return active?.protocol === undefined ? undefined : { run: active.run, paths: active.paths, server: active.protocol };
+	}
+
+	private rejectProtocolWorker(rejection: ProtocolRejection) {
+		return this.serialize(Effect.gen({ self: this }, function* () {
+			const state = this.protocolState();
+			if (!state) return yield* Effect.fail(new Error("No active native worker protocol."));
+			yield* rejectProtocolWorkerIngestion(state, rejection, this.protocolIngestionDependencies());
+		}));
 	}
 
 	private acknowledgeProtocolCommand(requestId: string) {
-		return this.serialize(this.acknowledgeProtocolCommandInternal(requestId));
-	}
-
-	private acknowledgeProtocolCommandInternal(requestId: string) {
-		return Effect.gen({ self: this }, function* () {
+		return this.serialize(Effect.gen({ self: this }, function* () {
 			const active = yield* this.requireRun();
-			const commands = active.protocolCommands ?? [];
-			const command = commands.find((candidate) => candidate.requestId === requestId);
-			if (!command || command.acknowledged) return;
-			const next: WorkflowRun = {
-				...active,
-				updatedAt: this.now().toISOString(),
-				protocolCommands: commands.map((candidate) => candidate.requestId === requestId ? { ...candidate, acknowledged: true } : candidate),
-			};
-			yield* this.persist(next, "worker-command-acknowledged", { requestId, type: command.type, messageId: command.messageId });
-		});
+			yield* acknowledgeProtocolCommandIngestion(active, requestId, this.protocolIngestionDependencies());
+		}));
 	}
 
-	/** Single adapter from validated transport messages to persisted workflow events. */
 	private receiveProtocolEvent(event: WorkflowProtocolEvent) {
-		return this.serialize(this.receiveProtocolEventInternal(event));
+		return this.serialize(Effect.gen({ self: this }, function* () {
+			const state = this.protocolState();
+			if (!state) return yield* Effect.fail(new Error("No active native worker protocol."));
+			yield* ingestProtocolEvent(state, event, this.protocolIngestionDependencies());
+		}));
 	}
-
-	private receiveProtocolEventInternal(event: WorkflowProtocolEvent) {
-		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requireRun();
-			if (event.type === "worker-connected") {
-				if (active.activeWorkItemId !== event.identity.workItemId || !active.requestedLaunchProfile) {
-					return yield* Effect.fail(new Error("Authenticated worker does not match the active work item."));
-				}
-				const item = active.plan.workItems.find((candidate) => candidate.id === event.identity.workItemId);
-				if (active.worker && (
-					(active.worker.sessionId !== undefined && active.worker.sessionId !== event.identity.sessionId)
-					|| (active.worker.sessionFile !== undefined && active.worker.sessionFile !== event.identity.sessionFile)
-				)) {
-					const pausedPhase = active.phase === "paused" ? active.phase : yield* transitionRun(active.phase, "paused");
-					yield* this.persist({ ...active, phase: pausedPhase, pauseReason: "recovery", recoveryIssue: { kind: "worker-session", message: "Reconnecting worker Pi session identity does not match persisted state." }, updatedAt: this.now().toISOString() }, "worker-session-rejected", {
-						workItemId: event.identity.workItemId,
-						expectedSessionId: active.worker.sessionId,
-						actualSessionId: event.identity.sessionId,
-					});
-					return yield* Effect.fail(new Error("Reconnecting worker Pi session identity does not match the persisted worker."));
-				}
-				if (!item || !["verifying-worker", "running", "report-pending", "report-review", "report-revision", "blocked"].includes(item.status)) {
-					return yield* Effect.fail(new Error("Worker connection arrived in an invalid workflow state."));
-				}
-				const server = this.active?.protocol;
-				if (!server) return yield* Effect.fail(new Error("Native protocol server disappeared before delegation."));
-				if (item.status === "running" || item.status === "report-review" || item.status === "report-pending" || item.status === "report-revision" || item.status === "blocked") {
-					const shouldResumeRecovery = active.phase === "paused" && active.pauseReason === "recovery";
-					const reconnectedPhase = item.status === "blocked" || (active.phase === "paused" && !shouldResumeRecovery)
-						? "paused" as const
-						: shouldResumeRecovery ? yield* transitionRun(active.phase, "executing") : active.phase;
-					const pauseReason = reconnectedPhase === "paused" ? active.pauseReason : undefined;
-					const { pauseReason: _pauseReason, recoveryIssue: _recoveryIssue, ...activeWithoutPauseReason } = active;
-					const reconnected = yield* this.persist({
-						...activeWithoutPauseReason,
-						phase: reconnectedPhase,
-						...(pauseReason === undefined ? {} : { pauseReason }),
-						worker: event.identity,
-						updatedAt: this.now().toISOString(),
-					}, "worker-reconnected", { workItemId: item.id, messageId: event.messageId, sessionId: event.identity.sessionId });
-					const pendingDelegate = (reconnected.protocolCommands ?? []).find((command) => command.type === "delegate" && !command.acknowledged);
-					if (pendingDelegate && item.status === "running" && reconnected.phase !== "paused") {
-						const context = makeAuthoritativeWorkerContext(reconnected, item, event.identity);
-						server.send("delegate", { prompt: item.delegationPrompt, context, requestId: pendingDelegate.requestId }, pendingDelegate.messageId);
-					}
-					return;
-				}
-				if (active.phase === "paused" && active.pauseReason === "user") {
-					yield* this.persist({ ...active, worker: event.identity, updatedAt: this.now().toISOString() }, "worker-verified-while-paused", {
-						workItemId: item.id, sessionId: event.identity.sessionId,
-					});
-					return;
-				}
-				const delegate = { type: "delegate" as const, requestId: crypto.randomUUID(), messageId: crypto.randomUUID(), acknowledged: false };
-				const running = { ...item, status: yield* transitionWorkItem(item.status, "running") };
-				const { pauseReason: _pauseReason, ...activeWithoutPauseReason } = active;
-				const next: WorkflowRun = {
-					...activeWithoutPauseReason,
-					phase: active.phase === "paused" ? yield* transitionRun(active.phase, "executing") : active.phase,
-					updatedAt: this.now().toISOString(),
-					worker: event.identity,
-					protocolCommands: [...(active.protocolCommands ?? []), delegate],
-					plan: { ...active.plan, workItems: active.plan.workItems.map((candidate) => candidate.id === item.id ? running : candidate) },
-				};
-				yield* this.persist(next, "worker-profile-verified", {
-					workItemId: item.id, requestedLaunchProfile: active.requestedLaunchProfile,
-					actualLaunchProfile: { provider: event.identity.provider, model: event.identity.model, thinking: event.identity.thinking },
-				});
-				const context = makeAuthoritativeWorkerContext(next, item, event.identity);
-				server.send("delegate", { prompt: item.delegationPrompt, context, requestId: delegate.requestId }, delegate.messageId);
-				return;
-			}
-			const state = this.active;
-			if (!state || active.activeWorkItemId !== event.workItemId) return yield* Effect.fail(new Error("Worker event does not match the active work item."));
-			const item = active.plan.workItems.find((candidate) => candidate.id === event.workItemId);
-			if (!item) return yield* Effect.fail(new Error("Worker event references an unknown work item."));
-			if (event.type === "worker-ready" || event.type === "worker-shutdown") {
-				const workflowEvent = yield* makeWorkflowEvent(active.id, event.type, { workItemId: event.workItemId, messageId: event.messageId });
-				yield* appendEvent(state.paths.eventsFile, workflowEvent);
-				return;
-			}
-			const report = event.payload.report;
-			const requirements = item.requirements.map((requirement, index) => ({ id: requirementId(index), requirement }));
-			const validation = validateWorkerReport(report, requirements);
-			if (event.type === "worker-progress") {
-				const workflowEvent = yield* makeWorkflowEvent(active.id, event.type, { workItemId: event.workItemId, payload: event.payload, messageId: event.messageId });
-				yield* appendEvent(state.paths.eventsFile, workflowEvent);
-				return;
-			}
-			if (!active.worker || !active.requestedLaunchProfile) return yield* Effect.fail(new Error("Final report arrived without authenticated worker launch metadata."));
-			const persisted = yield* persistReportAttempt({
-				paths: state.paths,
-				runId: active.id,
-				workItemId: item.id,
-				submittedAt: this.now().toISOString(),
-				identity: active.worker,
-				requestedLaunchProfile: active.requestedLaunchProfile,
-				report,
-			});
-			let status = item.status;
-			if (event.type === "worker-report") {
-				// A worker may submit a newer attempt before the orchestrator has
-				// reviewed the previous one. Keep the item reviewable and retain both
-				// immutable attempts on disk.
-				if (status === "running" || status === "report-revision") {
-					if (status === "report-revision") status = yield* transitionWorkItem(status, "running");
-					status = yield* transitionWorkItem(status, "report-pending");
-					status = yield* transitionWorkItem(status, "report-review");
-				}
-			} else if (event.type === "worker-blocked") {
-				if (status !== "blocked") status = yield* transitionWorkItem(status, "blocked");
-			} else if (event.type === "worker-failed") {
-				// Keep the owned worker metadata until an explicit close/stop. This
-				// makes the failure report observable and still allows its transport
-				// acknowledgement to be delivered safely.
-				if (status !== "failed") status = yield* transitionWorkItem(status, "failed");
-			}
-			const blockerQuestions = report.questions ?? [];
-			const blockerMessage = report.blockers?.join("; ") ?? report.summary;
-			const blocker: WorkflowBlocker | undefined = event.type === "worker-blocked"
-				? { workItemId: item.id, message: blockerMessage, questions: blockerQuestions, reportedAt: this.now().toISOString() }
-				: undefined;
-			const phase = event.type === "worker-blocked"
-				? yield* transitionRun(active.phase, "paused")
-				: event.type === "worker-failed"
-					? yield* transitionRun(active.phase, "failed")
-					: active.phase;
-			const next: WorkflowRun = {
-				...active,
-				phase,
-				...(event.type === "worker-blocked" ? { pauseReason: "blocker" as const } : {}),
-				updatedAt: this.now().toISOString(),
-				...(blocker === undefined ? {} : { blockers: [...(active.blockers ?? []), blocker] }),
-				plan: { ...active.plan, workItems: active.plan.workItems.map((candidate) => candidate.id === item.id ? { ...candidate, status } : candidate) },
-			};
-			yield* this.persist(next, event.type, {
-				workItemId: event.workItemId,
-				messageId: event.messageId,
-				reportAttempt: persisted.attempt.attempt,
-				reportFile: persisted.path,
-				validation,
-			});
-		});
-	}
-
 	waitWorker(workItemId: string, until: "connected" | "ready" | "progress" | "report" | "blocked" | "idle" | "exit" | "any" = "any", signal?: AbortSignal, timeoutMs?: number) {
 		return Effect.gen({ self: this }, function* () {
 			const active = yield* this.requireRun();
-			if (until === "idle") return yield* Effect.fail(new Error("workflow_worker wait until idle is not available in the native protocol; use a worker event."));
+			if (until === "idle") return yield* Effect.fail(new Error("workflow_delegate wait until idle is not available in the native protocol; use a worker event."));
 			if (active.activeWorkItemId !== workItemId) return yield* Effect.fail(new Error(`Work item ${workItemId} does not own the active worker.`));
 			const server = this.active?.protocol;
 			if (!server) return yield* Effect.fail(new Error("Native worker protocol is not running."));
@@ -695,7 +684,6 @@ export class WorkflowController {
 			return boundStatusOutput(JSON.stringify(event));
 		});
 	}
-
 	sendWorkerFeedback(workItemId: string, message: string, signal?: AbortSignal) {
 		return this.serialize(this.sendWorkerFeedbackInternal(workItemId, message, "message", undefined, undefined, signal));
 	}
@@ -736,10 +724,19 @@ export class WorkflowController {
 				try: () => waitWithTimeout((waitSignal) => server.waitForAcknowledgement(command.requestId, waitSignal), signal, 2_000),
 				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
 			});
+			if (kind === "message") {
+				const current = yield* this.requireRun();
+				const blockedItem = current.plan.workItems.find((candidate) => candidate.id === workItemId);
+				if (blockedItem?.status === "blocked") {
+					const running = yield* transitionWorkItem(blockedItem.status, "running");
+					const phase = current.phase === "paused" ? yield* transitionRun(current.phase, "executing") : current.phase;
+					const { pauseReason: _pauseReason, recoveryIssue: _recoveryIssue, progression: _progression, ...withoutPause } = current;
+					return yield* this.persist({ ...withoutPause, phase, updatedAt: this.now().toISOString(), plan: { ...current.plan, workItems: current.plan.workItems.map((candidate) => candidate.id === workItemId ? { ...candidate, status: running } : candidate), }, blockers: (current.blockers ?? []).map((blocker) => blocker.workItemId === workItemId && blocker.resolvedAt === undefined ? { ...blocker, resolvedAt: this.now().toISOString() } : blocker) }, "worker-feedback-resumed", { workItemId, kind });
+				}
+			}
 			return yield* this.requireRun();
 		});
 	}
-
 	readWorker(workItemId: string, lines = 200) {
 		return Effect.gen({ self: this }, function* () {
 			const active = yield* this.requireRun();
@@ -827,7 +824,6 @@ export class WorkflowController {
 			return { run, closeResult };
 		});
 	}
-
 	inspectReport(workItemId: string, signal?: AbortSignal) {
 		return this.serialize(this.inspectReportInternal(workItemId, signal));
 	}
@@ -849,70 +845,41 @@ export class WorkflowController {
 		});
 	}
 
-	private continueAfterCompletedInternal(workItemId: string) {
+	private auditProgressionDependencies(): AuditProgressionDependencies {
+		return {
+			now: this.now,
+			persist: (next, eventType, data) => this.persist(next, eventType, data),
+			...(this.gitRunner === undefined ? {} : { gitRunner: this.gitRunner }),
+		};
+	}
+
+	private advanceAuditAfterAcceptance(run: WorkflowRun, itemId: string, report: WorkerReport, reportPath: string) {
 		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requireRun();
-			if (active.activeWorkItemId !== undefined && active.activeWorkItemId !== workItemId) return active;
-			if (active.activeWorkItemId === workItemId) {
-				if (!active.tmux) return yield* Effect.fail(new Error(`Completed work item ${workItemId} still has no persisted tmux handle.`));
-				yield* this.closeWorkerInternal(workItemId, false, true);
+			const result = yield* advanceAuditProgression(run, itemId, report, reportPath, this.auditProgressionDependencies());
+			if (result.terminal) {
+				this.lastStopped = result.run;
+				const state = this.active;
+				if (state) yield* this.release(state);
 			}
-			const afterClose = yield* this.requireRun();
-			// A user pause is an explicit request not to start the next worker.
-			const next = afterClose.phase === "paused" ? undefined : this.nextReadyWorkItem();
-			if (next) {
-				const nextCheckpoint: ProgressionCheckpoint = {
-					operation: "accept",
-					stage: "next-delegating",
-					workItemId: next.id,
-					updatedAt: this.now().toISOString(),
-				};
-				yield* this.persist({ ...afterClose, updatedAt: nextCheckpoint.updatedAt, progression: nextCheckpoint }, "next-worker-delegating", { completedWorkItemId: workItemId, nextWorkItemId: next.id });
-				const delegation = yield* Effect.result(this.startWorkerInternal(next.id));
-				if (Result.isFailure(delegation)) {
-					const currentAfterFailure = yield* this.requireRun();
-					const failedRun: WorkflowRun = {
-						...currentAfterFailure,
-						phase: yield* transitionRun(currentAfterFailure.phase, "failed"),
-						updatedAt: this.now().toISOString(),
-					};
-					yield* this.persist(failedRun, "next-worker-failed", { workItemId: next.id, message: errorMessage(delegation.failure) });
-					return yield* Effect.fail(delegation.failure);
-				}
-				return delegation.success;
-			}
-
-			const incomplete = afterClose.plan.workItems.filter((item) => item.status !== "completed");
-			if (incomplete.length > 0) {
-				const failedItems = incomplete.filter((item) => item.status === "failed");
-				const phase = failedItems.length > 0
-					? yield* transitionRun(afterClose.phase, "failed")
-					: yield* transitionRun(afterClose.phase, "paused");
-				const checkpoint: ProgressionCheckpoint = {
-					operation: "accept",
-					stage: failedItems.length > 0 ? "progression-failed" : "progression-paused",
-					workItemId,
-					updatedAt: this.now().toISOString(),
-				};
-				return yield* this.persist({ ...afterClose, phase, updatedAt: checkpoint.updatedAt, progression: checkpoint }, failedItems.length > 0 ? "progression-failed" : "progression-paused", {
-					completedWorkItemId: workItemId,
-					incompleteWorkItemIds: incomplete.map((item) => item.id),
-					failedWorkItemIds: failedItems.map((item) => item.id),
-				});
-			}
-
-			const { progression: _completedProgression, ...withoutProgression } = afterClose;
-			const completedRun: WorkflowRun = {
-				...withoutProgression,
-				phase: yield* transitionRun(afterClose.phase, "completed"),
-				updatedAt: this.now().toISOString(),
-			};
-			const finished = yield* this.persist(completedRun, "run-completed", { completedWorkItemId: workItemId });
-			this.lastStopped = finished;
-			const state = this.active;
-			if (state) yield* this.release(state);
-			return finished;
+			return result.run;
 		});
+	}
+
+	private completionAcceptanceDependencies(): CompletionAcceptanceDependencies {
+		return {
+			now: this.now,
+			getState: () => this.active === undefined ? undefined : { run: this.active.run, paths: this.active.paths },
+			persist: (next, eventType, data) => this.persist(next, eventType, data),
+			closeWorker: (workItemId, force, retainCompleted) => this.closeWorkerInternal(workItemId, force, retainCompleted).pipe(Effect.mapError((cause) => cause instanceof Error ? cause : new Error(String(cause)))),
+			nextReadyWorkItem: () => this.nextReadyWorkItem(),
+			advanceAudit: (run, itemId, report, reportPath) => this.advanceAuditAfterAcceptance(run, itemId, report, reportPath),
+			scheduleAudit: (run, completedWorkItemId) => scheduleAuditAfterAcceptance(run, completedWorkItemId, this.auditProgressionDependencies()),
+			...(this.gitRunner === undefined ? {} : { gitRunner: this.gitRunner }),
+		};
+	}
+
+	private continueAfterCompletedInternal(workItemId: string, deferAuditAdvance = false) {
+		return continueAfterCompletedProgression(workItemId, deferAuditAdvance, this.completionAcceptanceDependencies());
 	}
 
 	acceptReport(workItemId: string, comment: string, signal?: AbortSignal) {
@@ -920,117 +887,8 @@ export class WorkflowController {
 	}
 
 	private acceptReportInternal(workItemId: string, comment: string, signal?: AbortSignal) {
-		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requireRun();
-			const item = active.plan.workItems.find((candidate) => candidate.id === workItemId);
-			if (!item) return yield* Effect.fail(new Error(`Unknown work item: ${workItemId}`));
-			// Repeating acceptance after the checkpoint has completed is safe and
-			// resumes any interrupted close/advance step without applying a second
-			// project mutation.
-			if (item.status === "completed" && item.completion) return yield* this.continueAfterCompletedInternal(workItemId);
-			if (item.status !== "report-review") return yield* Effect.fail(new Error(`Work item ${workItemId} is not in report-review.`));
-			const acceptedComment = nonEmptyText(comment, "Acceptance comment");
-			const capturedAttempt = active.progression?.operation === "accept" && active.progression.workItemId === workItemId
-				? active.progression.reportAttempt
-				: undefined;
-			const attempt = capturedAttempt === undefined
-				? yield* readLatestReportAttempt(this.active!.paths, workItemId, signal)
-				: yield* readReportAttempt(this.active!.paths, workItemId, capturedAttempt, signal);
-			if (!attempt) return yield* Effect.fail(new Error(`No worker report exists for ${workItemId}.`));
-			if (attempt.report.status !== "completed") return yield* Effect.fail(new Error("Only a completed worker report can be accepted."));
-			const requirements = item.requirements.map((requirement, index) => ({ id: requirementId(index), requirement }));
-			yield* Effect.try({
-				try: () => validateWorkerReport(attempt.report, requirements),
-				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
-			});
-			const acceptingAt = this.now().toISOString();
-			const acceptingCheckpoint: ProgressionCheckpoint = { operation: "accept", stage: "accepting", workItemId, updatedAt: acceptingAt, reportAttempt: attempt.attempt, comment: acceptedComment };
-			yield* this.persist({ ...active, updatedAt: acceptingAt, progression: acceptingCheckpoint }, "report-accepting", { workItemId, reportAttempt: attempt.attempt });
-			const completedAt = this.now().toISOString();
-			const acceptedReportPath = yield* persistAcceptedReport(this.active!.paths, attempt, completedAt, signal);
-			const completion: CompletionRecord = {
-				acceptedAttempt: attempt.attempt,
-				acceptedReportPath,
-				comment: acceptedComment,
-				completedAt,
-				strategy: item.completionStrategy ?? { type: "ledger-only" },
-				...(active.worker === undefined ? {} : { worker: active.worker }),
-				...(active.requestedLaunchProfile === undefined ? {} : { requestedLaunchProfile: active.requestedLaunchProfile }),
-			};
-			const acceptedCheckpoint: ProgressionCheckpoint = {
-				operation: "accept",
-				stage: "report-accepted",
-				workItemId,
-				updatedAt: completedAt,
-				reportAttempt: attempt.attempt,
-				comment: acceptedComment,
-				completion,
-			};
-			yield* this.persist({ ...this.active!.run, updatedAt: completedAt, progression: acceptedCheckpoint }, "report-accepted", {
-				workItemId, reportAttempt: attempt.attempt, acceptedReportPath, comment: acceptedComment,
-			});
-
-			const withCompletion: WorkflowRun = {
-				...this.active!.run,
-				updatedAt: this.now().toISOString(),
-				progression: { ...acceptedCheckpoint, stage: "completion-recorded", updatedAt: this.now().toISOString() },
-				plan: {
-					...this.active!.run.plan,
-					workItems: this.active!.run.plan.workItems.map((candidate) => candidate.id === workItemId ? { ...candidate, completion } : candidate),
-				},
-			};
-			yield* this.persist(withCompletion, "completion-recorded", { workItemId, reportAttempt: attempt.attempt });
-			const applying: WorkflowRun = {
-				...this.active!.run,
-				updatedAt: this.now().toISOString(),
-				progression: { ...acceptedCheckpoint, stage: "completion-applying", updatedAt: this.now().toISOString() },
-			};
-			yield* this.persist(applying, "completion-applying", { workItemId, strategy: completion.strategy.type });
-
-			const mutation = yield* Effect.result(applyCompletionStrategy({
-				projectPath: active.projectPath,
-				runId: active.id,
-				workItemId,
-				workItemTitle: item.title,
-				comment: acceptedComment,
-				completedAt,
-				strategy: completion.strategy,
-			}, undefined, signal));
-			if (Result.isFailure(mutation)) {
-				const failed: WorkflowRun = {
-					...this.active!.run,
-					updatedAt: this.now().toISOString(),
-					progression: { ...acceptedCheckpoint, stage: "completion-failed", updatedAt: this.now().toISOString() },
-				};
-				yield* this.persist(failed, "completion-failed", { workItemId, message: errorMessage(mutation.failure) });
-				return yield* Effect.fail(mutation.failure);
-			}
-			const completionResult: CompletionApplicationResult = mutation.success;
-			yield* this.persist({
-				...this.active!.run,
-				updatedAt: this.now().toISOString(),
-				progression: { ...acceptedCheckpoint, stage: "completion-applied", updatedAt: this.now().toISOString() },
-			}, "completion-applied", { workItemId, changed: completionResult.changed, paths: completionResult.paths });
-
-			const current = this.active!.run;
-			const completedStatus = yield* transitionWorkItem(
-				current.plan.workItems.find((candidate) => candidate.id === workItemId)!.status,
-				"completed",
-			);
-			const completedItemRun: WorkflowRun = {
-				...current,
-				updatedAt: this.now().toISOString(),
-				progression: { ...acceptedCheckpoint, stage: "worker-closing", updatedAt: this.now().toISOString() },
-				plan: {
-					...current.plan,
-					workItems: current.plan.workItems.map((candidate) => candidate.id === workItemId ? { ...candidate, status: completedStatus, completion } : candidate),
-				},
-			};
-			yield* this.persist(completedItemRun, "work-item-completed", { workItemId, reportAttempt: attempt.attempt });
-			return yield* this.continueAfterCompletedInternal(workItemId);
-		});
+		return acceptReportProgression(workItemId, comment, signal, this.completionAcceptanceDependencies());
 	}
-
 	reviseReport(workItemId: string, feedback: string, missingRequirements: readonly string[] = [], signal?: AbortSignal) {
 		return this.serialize(this.reviseReportInternal(workItemId, feedback, missingRequirements, signal));
 	}
@@ -1078,7 +936,7 @@ export class WorkflowController {
 			const questions = [...(options.questions ?? latest?.report.questions ?? [])].map((question) => question.trim()).filter(Boolean);
 			const status = item.status === "blocked" ? item.status : yield* transitionWorkItem(item.status, "blocked");
 			const phase = active.phase === "paused" ? active.phase : yield* transitionRun(active.phase, "paused");
-			const blocker: WorkflowBlocker = { workItemId, message, questions, reportedAt: this.now().toISOString() };
+			const blocker: WorkflowBlocker = { workItemId, message, questions, userInterventionRequired: latest?.report.userInterventionRequired ?? questions.length > 0, reportedAt: this.now().toISOString() };
 			const existingBlocker = (active.blockers ?? []).find((candidate) => candidate.workItemId === workItemId && candidate.resolvedAt === undefined && candidate.message === message);
 			const blockers = existingBlocker === undefined ? [...(active.blockers ?? []), blocker] : active.blockers;
 			const checkpoint: ProgressionCheckpoint = { operation: "block", stage: "blocker-recorded", workItemId, updatedAt: blocker.reportedAt };
@@ -1106,16 +964,17 @@ export class WorkflowController {
 			const item = active.plan.workItems.find((candidate) => candidate.id === workItemId);
 			if (!item || item.status !== "blocked" || active.activeWorkItemId !== workItemId) return yield* Effect.fail(new Error(`Work item ${workItemId} is not a resumable blocked worker.`));
 			const resolvedAt = this.now().toISOString();
-			const resolutions = questions.map((question, index) => ({ id: `blocker-${workItemId}-${crypto.randomUUID()}`, question: question.trim(), answer: answers[index]!.trim(), resolvedAt }));
+			const resolutions = questions.map((question, index) => ({ id: questionIdFor(question), question: question.trim(), answer: answers[index]!.trim(), resolvedAt }));
+			const reconciled = reconcilePlanningQuestions({ existingLedger: active.planning.questionLedger, existingUnresolved: active.planning.unresolvedQuestions, existingResolutions: active.plan.userResolutions, incomingResolutions: resolutions, requestedQuestions: [], now: resolvedAt });
 			const answerMessage = resolutions.map((resolution) => `Question: ${resolution.question}\nAnswer: ${resolution.answer}`).join("\n\n");
 			const checkpoint: ProgressionCheckpoint = { operation: "block", stage: "answers-recorded", workItemId, updatedAt: resolvedAt };
-			const resolvedPlan = { ...active.plan, userResolutions: [...active.plan.userResolutions, ...resolutions] };
+			const resolvedPlan = { ...active.plan, userResolutions: reconciled.userResolutions };
 			const resolutionChange: PlanChange = { type: "set-user-resolutions", userResolutions: resolvedPlan.userResolutions };
 			yield* this.persist({
 				...active,
 				updatedAt: resolvedAt,
 				progression: checkpoint,
-				planning: { ...active.planning, changes: [...active.planning.changes, { timestamp: resolvedAt, change: resolutionChange }] },
+				planning: { ...active.planning, unresolvedQuestions: reconciled.unresolvedQuestions, questionLedger: reconciled.questionLedger, changes: [...active.planning.changes, { timestamp: resolvedAt, change: resolutionChange }] },
 				plan: resolvedPlan,
 				blockers: (active.blockers ?? []).map((blocker) => blocker.workItemId === workItemId && blocker.resolvedAt === undefined ? { ...blocker, resolvedAt } : blocker),
 			}, "worker-blocker-answers-recorded", { workItemId, questions: questions.map((question) => question.trim()) });
@@ -1145,6 +1004,9 @@ export class WorkflowController {
 					`Cannot finalize: ${active.planning.unresolvedQuestions.length} unresolved user question(s) remain.`,
 				));
 			}
+			if (!active.plan.auditProfile?.model || !active.plan.auditProfile.thinking) {
+				return yield* Effect.fail(new Error("Cannot finalize: an explicit model and thinking level audit profile must be set in plan.auditProfile; no fallback is permitted."));
+			}
 			const plan = normalizePlan({ ...active.plan, finalized: true });
 			yield* validatePlan(plan);
 			const phase = yield* transitionRun(active.phase, "ready");
@@ -1159,7 +1021,8 @@ export class WorkflowController {
 	private recoveryTargetPhase(run: WorkflowRun): WorkflowRun["phase"] {
 		const activeItem = run.activeWorkItemId === undefined ? undefined : run.plan.workItems.find((item) => item.id === run.activeWorkItemId);
 		if (run.pauseReason === "user" || activeItem?.status === "blocked") return "paused";
-		if (run.activeWorkItemId) return "executing";
+		if (run.activeWorkItemId) return run.audit?.activeRound === undefined ? (run.phase === "fixing" ? "fixing" : "executing") : "auditing";
+		if (run.phase === "auditing" || run.phase === "fixing") return run.phase;
 		if (run.plan.finalized) return "ready";
 		return run.planning.unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing";
 	}
@@ -1213,16 +1076,18 @@ export class WorkflowController {
 				}
 			}
 			const currentItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
+			if (active.progression?.operation === "accept" && active.progression.stage === "audit-round-pending-record") {
+				const pendingAudit = active.plan.workItems.find((item) => item.id === active.progression?.workItemId);
+				if (!pendingAudit?.completion) return yield* Effect.fail(new Error("Audit completion checkpoint has no durable completion record."));
+				const accepted = yield* readReportAttempt(activeState.paths, pendingAudit.id, pendingAudit.completion.acceptedAttempt);
+				return yield* this.advanceAuditAfterAcceptance(active, pendingAudit.id, accepted.report, pendingAudit.completion.acceptedReportPath);
+			}
 			if (active.progression?.operation === "accept" && active.progression.comment && currentItem?.status === "report-review") {
 				return yield* this.acceptReportInternal(currentItem.id, active.progression.comment);
 			}
 			if (currentItem?.status === "completed") return yield* this.continueAfterCompletedInternal(currentItem.id);
 			if (active.progression?.operation === "close" && active.activeWorkItemId && active.tmux) {
 				return (yield* this.closeWorkerInternal(active.activeWorkItemId, false, false)).run;
-			}
-			if (!active.activeWorkItemId) {
-				const next = this.nextReadyWorkItem();
-				if (next && active.phase === "ready") return yield* this.startWorkerInternal(next.id);
 			}
 			return active;
 		});
@@ -1233,7 +1098,10 @@ export class WorkflowController {
 			if (this.active) return yield* Effect.fail(new Error(`Ticket Flow run ${this.active.run.id} is already active.`));
 			const discovery = yield* this.discover(input.cwd, input.agentDir, input.sessionId);
 			const candidates = input.runId === undefined ? discovery.runs : discovery.runs.filter((candidate) => candidate.run.id === input.runId);
-			if (candidates.length === 0) return yield* Effect.fail(new Error("No recoverable Ticket Flow run exists for this project."));
+			if (candidates.length === 0) {
+				const invalid = input.runId === undefined ? undefined : discovery.invalidRunIssues?.find((issue) => issue.runId === input.runId);
+				return yield* Effect.fail(new Error(invalid === undefined ? "No recoverable Ticket Flow run exists for this project." : `Run ${input.runId} cannot be recovered: ${invalid.message}. Inspect or migrate the durable state before retrying.`));
+			}
 			if (candidates.length > 1 && input.runId === undefined) return yield* Effect.fail(new Error("Multiple unfinished runs exist; recovery requires an explicit run ID."));
 			const candidate = candidates[0]!;
 			const scope = yield* Scope.make();
@@ -1276,7 +1144,7 @@ export class WorkflowController {
 	resume() {
 		return this.serialize(Effect.gen({ self: this }, function* () {
 			const active = yield* this.requireRun();
-			if (active.phase !== "paused") return yield* Effect.fail(new Error("workflow_control resume requires an owned paused run."));
+			if (active.phase !== "paused") return yield* Effect.fail(new Error("/ticket-flow resume requires an owned paused run."));
 			const activeItem = active.activeWorkItemId === undefined ? undefined : active.plan.workItems.find((item) => item.id === active.activeWorkItemId);
 			if (activeItem?.status === "blocked") return yield* Effect.fail(new Error("Resolve the active worker blocker before resuming Ticket Flow."));
 			const { pauseReason: _pauseReason, recoveryIssue: _recoveryIssue, ...withoutPauseReason } = active;
@@ -1394,9 +1262,6 @@ export class WorkflowController {
 		return this.serialize(Effect.gen({ self: this }, function* () {
 			const activeState = this.active;
 			if (!activeState) return;
-			// A session reload or orchestrator exit preserves the worker, token,
-			// tmux window, and durable state while releasing local listeners, fibers,
-			// tool restrictions, and the verified project-lock lease.
 			yield* activeState.protocol?.shutdown() ?? Effect.void;
 			delete activeState.protocol;
 			delete activeState.workerToken;

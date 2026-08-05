@@ -35,7 +35,7 @@ function item(overrides: Partial<WorkItem> = {}): WorkItem {
 }
 
 function plan(workItems: readonly WorkItem[] = [item()]): WorkflowPlan {
-	return { summary: "Implement domain", workItems, userResolutions: [], finalized: true };
+	return { summary: "Implement domain", auditProfile: { model: "openai-codex/gpt-5.6-sol", thinking: "medium" }, workItems, userResolutions: [], finalized: true };
 }
 
 function run(projectPath: string, workflowPlan = plan()): WorkflowRun {

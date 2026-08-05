@@ -8,6 +8,19 @@ import type { TmuxController, TmuxWindowInspection } from "./tmux/controller.ts"
 
 const FINISHED_PHASES = new Set<WorkflowRun["phase"]>(["completed", "stopped"]);
 
+function recoveryErrorMessage(error: unknown): string {
+	if (error instanceof Error && error.message) return error.message;
+	if (typeof error === "object" && error !== null) {
+		const value = error as { readonly _tag?: unknown; readonly path?: unknown; readonly expected?: unknown; readonly actual?: unknown; readonly operation?: unknown; readonly message?: unknown; readonly cause?: unknown };
+		if (typeof value.message === "string" && value.message) return value.message;
+		if (value._tag === "UnsupportedVersionError") return `Unsupported schema version ${String(value.actual)} in ${String(value.path)}; expected ${String(value.expected)}. Migrate the run or restore a compatible Ticket Flow version`;
+		if (value._tag === "CorruptDataError") return `Corrupt durable state at ${String(value.path)}: ${String(value.message)}`;
+		if (value._tag === "PersistenceError") return `Durable persistence ${String(value.operation)} failed at ${String(value.path)}: ${String(value.cause)}`;
+		if (typeof value._tag === "string") return value._tag;
+	}
+	return String(error);
+}
+
 export interface RecoverableRun {
 	readonly run: WorkflowRun;
 	readonly paths: WorkflowPaths;
@@ -17,6 +30,8 @@ export interface RecoverableRun {
 export interface RecoveryDiscovery {
 	readonly runs: readonly RecoverableRun[];
 	readonly invalidRunIds: readonly string[];
+	/** Actionable errors are retained instead of silently disappearing runs. */
+	readonly invalidRunIssues?: readonly { readonly runId: string; readonly message: string }[];
 }
 
 export type ReconciliationKind =
@@ -50,11 +65,16 @@ export function discoverUnfinishedRuns(
 		});
 		const runs: RecoverableRun[] = [];
 		const invalidRunIds: string[] = [];
+		const invalidRunIssues: { runId: string; message: string }[] = [];
 		for (const entry of entries) {
 			if (!entry.isDirectory()) continue;
 			const paths = yield* resolveWorkflowPaths(resolved.canonicalProjectPath, entry.name, resolved.paths.agentDir);
 			const loaded = yield* Effect.result(loadRun(paths));
-			if (loaded._tag === "Failure") { invalidRunIds.push(entry.name); continue; }
+			if (loaded._tag === "Failure") {
+				invalidRunIds.push(entry.name);
+				invalidRunIssues.push({ runId: entry.name, message: recoveryErrorMessage(loaded.failure) });
+				continue;
+			}
 			if (FINISHED_PHASES.has(loaded.success.phase)) continue;
 			const lock = yield* inspectProjectLock(paths.rootDir, paths.projectId, {
 				runId: loaded.success.id,
@@ -63,7 +83,7 @@ export function discoverUnfinishedRuns(
 			});
 			runs.push({ run: loaded.success, paths, lock });
 		}
-		return { runs: runs.sort((left, right) => right.run.updatedAt.localeCompare(left.run.updatedAt)), invalidRunIds };
+		return { runs: runs.sort((left, right) => right.run.updatedAt.localeCompare(left.run.updatedAt)), invalidRunIds, invalidRunIssues };
 	});
 }
 

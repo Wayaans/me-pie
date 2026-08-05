@@ -6,6 +6,23 @@ import { containsCredential, deterministicJsonLine, FILE_MODE } from "./state-st
 
 export const MAX_EVENT_BYTES = 32 * 1024;
 
+class AppendAttemptError extends Error {
+	readonly appendMayHaveWritten: boolean;
+	constructor(cause: unknown, appendMayHaveWritten: boolean) {
+		super(cause instanceof Error ? cause.message : String(cause));
+		this.name = "AppendAttemptError";
+		this.appendMayHaveWritten = appendMayHaveWritten;
+		this.cause = cause;
+	}
+}
+
+/** Whether an append failure happened after the file handle was opened. */
+export function eventAppendMayHaveWritten(error: unknown): boolean {
+	if (error instanceof AppendAttemptError) return error.appendMayHaveWritten;
+	if (error && typeof error === "object" && "cause" in error) return eventAppendMayHaveWritten((error as { readonly cause?: unknown }).cause);
+	return false;
+}
+
 export interface AppendFile {
 	readonly writeFile: (content: string) => Promise<void>;
 	readonly sync: () => Promise<void>;
@@ -79,14 +96,14 @@ export function appendEvent(
 		let handle: AppendFile | undefined;
 		yield* Effect.tryPromise({
 			try: async () => {
-				handle = await fs.openAppend(filePath, FILE_MODE);
+					handle = await fs.openAppend(filePath, FILE_MODE);
 				await fs.chmod(filePath, FILE_MODE);
 				await handle.writeFile(line);
 				await handle.sync();
 				await handle.close();
 				handle = undefined;
 			},
-			catch: (cause) => new PersistenceError({ operation: "append event", path: filePath, cause }),
+			catch: (cause) => new PersistenceError({ operation: "append event", path: filePath, cause: new AppendAttemptError(cause, handle !== undefined) }),
 		}).pipe(Effect.ensuring(Effect.promise(() => handle?.close().catch(() => undefined) ?? Promise.resolve())));
 	});
 }

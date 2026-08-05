@@ -134,15 +134,38 @@ function check(value: unknown, name: string): CheckResult {
 export function decodeWorkerReport(payload: unknown): WorkerReport {
 	const input = record(payload, "worker report");
 	exactKeys(input, [
-		"status", "summary", "requirements", "filesChanged", "filesChangedExplanation", "checks",
+		"status", "summary", "commitIds", "auditVerdicts", "auditFindings", "requirements", "filesChanged", "filesChangedExplanation", "checks",
 		"caveats", "blockers", "questions", "userInterventionRequired",
 	], "worker report");
 	if (input.userInterventionRequired !== undefined && typeof input.userInterventionRequired !== "boolean") {
 		throw new ProtocolMessageError("worker report.userInterventionRequired must be a boolean");
 	}
+	const commitIds = input.commitIds === undefined ? undefined : strings(input.commitIds, "worker report.commitIds");
+	const auditVerdicts = input.auditVerdicts === undefined ? undefined : (() => {
+		if (!Array.isArray(input.auditVerdicts)) throw new ProtocolMessageError("worker report.auditVerdicts must be an array");
+		return input.auditVerdicts.map((entry, index) => {
+			const verdict = record(entry, `worker report.auditVerdicts[${index}]`);
+			exactKeys(verdict, ["requirement", "verdict", "evidence", "fixes"], `worker report.auditVerdicts[${index}]`);
+			if (verdict.verdict !== "pass" && verdict.verdict !== "fail" && verdict.verdict !== "not-applicable") throw new ProtocolMessageError("audit verdict is invalid");
+			return { requirement: text(verdict.requirement, "audit verdict.requirement"), verdict: verdict.verdict as "pass" | "fail" | "not-applicable", evidence: text(verdict.evidence, "audit verdict.evidence"), ...(verdict.fixes === undefined ? {} : { fixes: strings(verdict.fixes, "audit verdict.fixes") }) };
+		});
+	})();
+	const auditFindings = input.auditFindings === undefined ? undefined : (() => {
+		if (!Array.isArray(input.auditFindings)) throw new ProtocolMessageError("worker report.auditFindings must be an array");
+		return input.auditFindings.map((entry, index) => {
+			const finding = record(entry, `worker report.auditFindings[${index}]`);
+			exactKeys(finding, ["id", "severity", "finding", "evidence", "fixLink", "resolved"], `worker report.auditFindings[${index}]`);
+			if (!["critical", "high", "medium", "low"].includes(String(finding.severity))) throw new ProtocolMessageError("audit finding severity is invalid");
+			if (finding.resolved !== undefined && typeof finding.resolved !== "boolean") throw new ProtocolMessageError("audit finding resolved must be a boolean");
+			return { id: identifier(finding.id, "audit finding.id"), severity: finding.severity as "critical" | "high" | "medium" | "low", finding: text(finding.finding, "audit finding.finding"), evidence: text(finding.evidence, "audit finding.evidence"), ...(finding.fixLink === undefined ? {} : { fixLink: text(finding.fixLink, "audit finding.fixLink") }), ...(finding.resolved === undefined ? {} : { resolved: finding.resolved }) };
+		});
+	})();
 	return {
 		status: reportStatus(input.status, "worker report.status"),
 		summary: text(input.summary, "worker report.summary"),
+		...(commitIds === undefined ? {} : { commitIds }),
+		...(auditVerdicts === undefined ? {} : { auditVerdicts }),
+		...(auditFindings === undefined ? {} : { auditFindings }),
 		...(input.requirements === undefined ? {} : { requirements: Array.isArray(input.requirements) ? input.requirements.map((entry, index) => requirement(entry, `worker report.requirements[${index}]`)) : (() => { throw new ProtocolMessageError("worker report.requirements must be an array"); })() }),
 		...(input.filesChanged === undefined ? {} : { filesChanged: strings(input.filesChanged, "worker report.filesChanged") }),
 		...(input.filesChangedExplanation === undefined ? {} : { filesChangedExplanation: text(input.filesChangedExplanation, "worker report.filesChangedExplanation") }),
@@ -187,7 +210,7 @@ function launchProfile(value: unknown, name: string, actual: boolean): Authorita
 export function decodeWorkerContext(value: unknown): AuthoritativeWorkerContext {
 	const input = record(value, "worker context");
 	exactKeys(input, [
-		"runId", "workItemId", "workItemTitle", "sourcePaths", "specificationPaths", "requirements",
+		"runId", "workItemKind", "readOnly", "workItemId", "workItemTitle", "sourcePaths", "specificationPaths", "requirements",
 		"userResolutions", "delegationPrompt", "requestedLaunchProfile", "actualLaunchProfile", "expectedReport", "truncated",
 	], "worker context");
 	if (typeof input.truncated !== "boolean") throw new ProtocolMessageError("worker context.truncated must be a boolean");
@@ -198,8 +221,13 @@ export function decodeWorkerContext(value: unknown): AuthoritativeWorkerContext 
 	if (!Number.isSafeInteger(expected.schemaVersion) || (expected.schemaVersion as number) < 1) throw new ProtocolMessageError("worker context.expectedReport.schemaVersion is invalid");
 	const statuses = strings(expected.statuses, "worker context.expectedReport.statuses") as WorkerReport["status"][];
 	if (statuses.some((status) => !["progress", "completed", "blocked", "failed"].includes(status))) throw new ProtocolMessageError("worker context.expectedReport.statuses contains an invalid status");
+	const workItemKind = input.workItemKind === undefined ? undefined : identifier(input.workItemKind, "worker context.workItemKind");
+	if (workItemKind !== undefined && !["implementation", "audit", "fix"].includes(workItemKind)) throw new ProtocolMessageError("worker context.workItemKind is invalid");
+	if (input.readOnly !== undefined && typeof input.readOnly !== "boolean") throw new ProtocolMessageError("worker context.readOnly must be a boolean");
 	return {
 		runId: identifier(input.runId, "worker context.runId"),
+		...(workItemKind === undefined ? {} : { workItemKind: workItemKind as "implementation" | "audit" | "fix" }),
+		...(input.readOnly === undefined ? {} : { readOnly: input.readOnly }),
 		workItemId: identifier(input.workItemId, "worker context.workItemId"),
 		workItemTitle: text(input.workItemTitle, "worker context.workItemTitle"),
 		sourcePaths: strings(input.sourcePaths, "worker context.sourcePaths"),
