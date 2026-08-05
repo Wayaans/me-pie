@@ -225,6 +225,8 @@ test("system-prompt injection is active only while a command-created run exists"
 		const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
 		const handlers = new Map<string, (...args: unknown[]) => unknown>();
 		const sent: string[] = [];
+		const notices: string[] = [];
+		const widgets: unknown[] = [];
 		let active = ["read", "bash", "edit", "ask_me"];
 		const fake = {
 			registerCommand: (name: string, definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => commands.set(name, definition.handler),
@@ -256,11 +258,50 @@ test("system-prompt injection is active only while a command-created run exists"
 			sessionManager: { getSessionId: () => "session-integration" },
 			ui: {
 				setStatus: (_key: string, value: string | undefined) => statuses.push(value),
-				notify: (message: string) => { throw new Error(message); },
+				setWidget: (_key: string, value: unknown) => widgets.push(value),
+				notify: (message: string) => notices.push(message),
 			},
 		} as unknown as ExtensionContext;
 		await commands.get("ticket-flow")?.("tmux  inspect @tickets exactly", ctx);
 		assert.equal(sent.length, 1);
+		assert.equal(typeof widgets.at(-1), "function");
+
+		const otherCommands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
+		const otherHandlers = new Map<string, (...args: unknown[]) => unknown>();
+		const otherWidgets: unknown[] = [];
+		let otherActive = ["read", "bash"];
+		ticketFlow({
+			registerCommand: (name: string, definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => otherCommands.set(name, definition.handler),
+			registerTool: (definition: { name: string }) => { otherActive.push(definition.name); },
+			on: (name: string, handler: (...args: unknown[]) => unknown) => otherHandlers.set(name, handler),
+			getActiveTools: () => [...otherActive],
+			setActiveTools: (names: string[]) => { otherActive = [...names]; },
+			appendEntry: () => undefined,
+			sendUserMessage: () => undefined,
+		} as unknown as ExtensionAPI, { tmux });
+		const otherCtx = {
+			...ctx,
+			sessionManager: { getSessionId: () => "session-other" },
+			ui: {
+				setStatus: () => undefined,
+				setWidget: (_key: string, value: unknown) => otherWidgets.push(value),
+				notify: (message: string) => notices.push(message),
+			},
+		} as unknown as ExtensionContext;
+		await otherHandlers.get("session_start")?.({}, otherCtx);
+		assert.equal(otherWidgets.at(-1), undefined);
+		await otherCommands.get("ticket-flow")?.("status", otherCtx);
+		assert.equal(typeof otherWidgets.at(-1), "function");
+		await otherCommands.get("ticket-flow")?.("status", otherCtx);
+		assert.equal(otherWidgets.at(-1), undefined);
+		await otherHandlers.get("session_shutdown")?.({}, otherCtx);
+
+		await commands.get("ticket-flow")?.("status", ctx);
+		assert.equal(widgets.at(-1), undefined);
+		assert.match(notices.at(-1) ?? "", /hidden in this session/);
+		await commands.get("ticket-flow")?.("status", ctx);
+		assert.equal(typeof widgets.at(-1), "function");
+		assert.match(notices.at(-1) ?? "", /widget shown/);
 		const injected = before?.({ systemPrompt: "base" }, ctx) as { systemPrompt?: string } | undefined;
 		assert.ok(injected?.systemPrompt?.startsWith("base"));
 		assert.ok(injected?.systemPrompt?.includes(ORCHESTRATOR_SYSTEM_PROMPT));

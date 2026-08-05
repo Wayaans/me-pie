@@ -1,3 +1,5 @@
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+
 export type TicketFlowCommand =
 	| { readonly backend: "tmux"; readonly prompt: string }
 	| { readonly action: "status" | "pause" | "resume" | "stop"; };
@@ -5,6 +7,21 @@ export type TicketFlowCommand =
 export interface CommandPrerequisites {
 	readonly mode: string;
 	readonly tmux: string | undefined;
+}
+
+const TICKET_FLOW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
+	{ value: "status", label: "status", description: "Toggle the Ticket Flow widget in this session" },
+	{ value: "pause", label: "pause", description: "Pause the active Ticket Flow run" },
+	{ value: "resume", label: "resume", description: "Resume a paused Ticket Flow run" },
+	{ value: "stop", label: "stop", description: "Stop the active Ticket Flow run" },
+	{ value: "tmux", label: "tmux", description: "Start or recover a Ticket Flow run" },
+];
+
+export function ticketFlowArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+	const commandPrefix = prefix.trimStart();
+	if (/\s/.test(commandPrefix)) return null;
+	const matches = TICKET_FLOW_ARGUMENT_COMPLETIONS.filter((item) => item.value.startsWith(commandPrefix));
+	return matches.length > 0 ? [...matches] : null;
 }
 
 export function parseTicketFlowCommand(args: string): TicketFlowCommand {

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowCommand, RECOVERY_KICKOFF } from "./command.ts";
+import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowCommand, RECOVERY_KICKOFF, ticketFlowArgumentCompletions } from "./command.ts";
 import { WorkflowController } from "./controller.ts";
 import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts";
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
@@ -190,8 +190,12 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	let widgetTui: { readonly requestRender: (force?: boolean) => void } | undefined;
 	let widgetInstalled = false;
 
+	let widgetVisible = false;
+
 	function clearWidget(ctx?: ExtensionContext): void {
+		widgetVisible = false;
 		widgetRun = undefined;
+		widgetContext = undefined;
 		widget?.setRun(undefined);
 		widget = undefined;
 		widgetTui = undefined;
@@ -212,6 +216,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		widgetContext = ctx;
 		widgetRun = run;
 		if (!ctx.hasUI || run === undefined) { clearWidget(ctx); return; }
+		widgetVisible = true;
 		updateStatus(ctx, run);
 		if (ctx.mode !== "tui") {
 			if (typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, renderWorkflowWidget(run, 100));
@@ -250,6 +255,9 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		}
 	}
 
+	function refreshWidget(ctx: ExtensionContext, run: WorkflowRun | undefined): void {
+		if (widgetVisible) showWidget(ctx, run);
+	}
 
 	async function attachDiscoveredRun(ctx: ExtensionContext, action: "pause" | "resume" | "stop"): Promise<WorkflowRun | undefined> {
 		if (controller.activeRun) return controller.activeRun;
@@ -268,7 +276,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 			...(ctx.sessionManager.getSessionId() === undefined ? {} : { sessionId: ctx.sessionManager.getSessionId() }),
 			...(allowAmbiguousTakeover ? { allowAmbiguousTakeover: true } : {}),
 		}), { signal: ctx.signal });
-		showWidget(ctx, recovered);
+		refreshWidget(ctx, recovered);
 		return recovered;
 	}
 
@@ -277,35 +285,44 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 			const discovery = await discoverOrchestratorRecovery(controller, ctx);
 			if (controller.activeRun) {
 				pi.setActiveTools(toolsForWorkflowRole(pi.getActiveTools(), "orchestrator"));
-				showWidget(ctx, controller.activeRun);
-			}
-			else if (discovery.runs[0]) {
-				pi.setActiveTools(withoutWorkflowTools(pi.getActiveTools()));
-				showWidget(ctx, discovery.runs[0].run);
 			} else {
 				// Registered workflow tools remain inactive until a run owns them.
 				pi.setActiveTools(withoutWorkflowTools(pi.getActiveTools()));
-				clearWidget(ctx);
 			}
+			const sessionId = ctx.sessionManager.getSessionId();
+			const currentSessionRun = sessionId === undefined
+				? undefined
+				: discovery.runs.find((candidate) => candidate.run.orchestratorSessionId === sessionId)?.run;
+			// Widget visibility is session-local. The owner session restores its
+			// widget; other sessions require /ticket-flow status to opt in.
+			if (sessionId !== undefined && controller.activeRun?.orchestratorSessionId === sessionId) showWidget(ctx, controller.activeRun);
+			else if (currentSessionRun) showWidget(ctx, currentSessionRun);
+			else clearWidget(ctx);
 		} catch (error) { notifyError(ctx, error); }
 	});
 
 	pi.registerCommand("ticket-flow", {
 		description: "Start or control the explicit Ticket Flow workflow",
+		getArgumentCompletions: ticketFlowArgumentCompletions,
 		handler: async (args, ctx) => {
 			try {
 				const command = parseTicketFlowCommand(args);
 				if ("action" in command) {
 					switch (command.action) {
 						case "status": {
+							if (widgetVisible) {
+								clearWidget(ctx);
+								if (ctx.hasUI) ctx.ui.notify("Ticket Flow widget hidden in this session.", "info");
+								return;
+							}
 							if (controller.activeRun) {
 								showWidget(ctx, controller.activeRun);
-								if (ctx.hasUI) ctx.ui.notify(`Ticket Flow ${controller.activeRun.phase} · ${controller.activeRun.plan.workItems.length} item(s)`, "info");
+								if (ctx.hasUI) ctx.ui.notify(`Ticket Flow ${controller.activeRun.phase} · ${controller.activeRun.plan.workItems.length} item(s) · widget shown`, "info");
 							} else {
 								const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, ctx.sessionManager.getSessionId()), { signal: ctx.signal });
 								const found = discovery.runs[0]?.run;
 								if (found) showWidget(ctx, found);
-								if (ctx.hasUI) ctx.ui.notify(found ? `Recoverable Ticket Flow ${found.phase} · ${found.id}` : "No active Ticket Flow run.", found ? "info" : "warning");
+								if (ctx.hasUI) ctx.ui.notify(found ? `Recoverable Ticket Flow ${found.phase} · ${found.id} · widget shown` : "No active Ticket Flow run.", found ? "info" : "warning");
 							}
 							return;
 						}
@@ -313,13 +330,13 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 							const attached = await attachDiscoveredRun(ctx, "pause");
 							if (!attached) throw new Error("No active Ticket Flow run.");
 							const run = attached.phase === "paused" ? attached : await Effect.runPromise(controller.pause(), { signal: ctx.signal });
-							showWidget(ctx, run); if (ctx.hasUI) ctx.ui.notify("Ticket Flow paused.", "info"); return;
+							refreshWidget(ctx, run); if (ctx.hasUI) ctx.ui.notify("Ticket Flow paused.", "info"); return;
 						}
 						case "resume": {
 							const attached = await attachDiscoveredRun(ctx, "resume");
 							if (!attached) throw new Error("No recoverable Ticket Flow run exists for this project.");
 							const run = attached.phase === "paused" ? await Effect.runPromise(controller.resume(), { signal: ctx.signal }) : attached;
-							const resolved = await resolveRecoveryIssue(controller, run, ctx); showWidget(ctx, resolved); return;
+							const resolved = await resolveRecoveryIssue(controller, run, ctx); refreshWidget(ctx, resolved); return;
 						}
 						case "stop": {
 							const attached = await attachDiscoveredRun(ctx, "stop");
@@ -338,7 +355,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 					const choice = await ctx.ui.select("Ticket Flow run already exists", ["Recover existing run", "Cancel"]);
 					if (choice !== "Recover existing run") return;
 					const recovered = await recoverWithConfirmation(controller, ctx);
-					showWidget(ctx, recovered);
+					refreshWidget(ctx, recovered);
 					if (recovered.phase !== "stopped") pi.sendUserMessage(RECOVERY_KICKOFF);
 					return;
 				}
@@ -367,14 +384,14 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 
 	pi.on("tool_execution_start", (_event, ctx) => {
 		const run = controller.activeRun ?? widgetRun;
-		if (run) showWidget(ctx, run);
+		if (run) refreshWidget(ctx, run);
 	});
 
 	pi.on("tool_execution_end", (event, ctx) => {
 		const resultRun = (event.result as { readonly details?: { readonly run?: WorkflowRun } } | undefined)?.details?.run;
 		if (resultRun?.phase === "completed" || resultRun?.phase === "stopped") { clearWidget(ctx); return; }
 		const run = controller.activeRun ?? resultRun ?? (widgetRun?.phase === "completed" || widgetRun?.phase === "stopped" ? undefined : widgetRun);
-		if (run) showWidget(ctx, run); else clearWidget(ctx);
+		if (run) refreshWidget(ctx, run); else if (widgetVisible) clearWidget(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

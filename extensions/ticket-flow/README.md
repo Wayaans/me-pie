@@ -20,7 +20,7 @@ Run inside Pi TUI and an active tmux client:
 /ticket-flow stop
 ```
 
-`tmux <prompt>` is the only start syntax. User controls do not require a new worker. `status`, `pause`, `resume`, and `stop` discover and safely attach a detached durable run when needed. Stop confirms before closing an owned active worker. Recovery never creates a duplicate worker.
+`tmux <prompt>` is the only start syntax. User controls do not require a new worker. `status` toggles the task-list widget in the current Pi session; the session that starts a run shows it automatically, while other sessions keep it hidden until their first `status` invocation. `pause`, `resume`, and `stop` discover and safely attach a detached durable run when needed without changing widget visibility. Stop confirms before closing an owned active worker. Recovery never creates a duplicate worker. Command arguments autocomplete in the Pi editor.
 
 ## Main tools
 
@@ -45,7 +45,7 @@ A blocking question first appears as a blocked worker event (`workflow_delegate 
 
 ## Widget
 
-While a run is active or recoverable, a bordered task-list widget remains above the editor. It shows compact item statuses, an animated current-step marker, current model/thinking, tmux stable display/window/pane IDs, clarification blockers, and audit/fix rounds. Recovery restores it; stopped/completed/no-run states clear it.
+A bordered task-list widget can remain above the editor while a run is active or recoverable. It shows compact item statuses, an animated current-step marker, current model/thinking, tmux stable display/window/pane IDs, clarification blockers, and audit/fix rounds. Widget visibility is session-local: a newly started run is shown in its starting session, recoverable runs stay hidden in other sessions, and `/ticket-flow status` toggles show/hide for the current session. Stopped, completed, and no-run states clear it.
 
 ## Durable state and ownership
 
