@@ -264,6 +264,11 @@ test("system-prompt injection is active only while a command-created run exists"
 		} as unknown as ExtensionContext;
 		await commands.get("ticket-flow")?.("tmux  inspect @tickets exactly", ctx);
 		assert.equal(sent.length, 1);
+		await handlers.get("agent_settled")?.({}, ctx);
+		assert.equal(sent.length, 2, "an actionable workflow schedules a continuation turn instead of stopping");
+		assert.match(sent.at(-1) ?? "", /continue.*Ticket Flow/i);
+		await handlers.get("agent_settled")?.({}, ctx);
+		assert.equal(sent.length, 2, "the same durable state is not continued in a loop");
 		assert.equal(typeof widgets.at(-1), "function");
 		const widgetFactory = widgets.at(-1) as (tui: { requestRender: () => void }, theme: unknown) => { dispose: () => void };
 		widgetFactory({ requestRender: () => undefined }, {}).dispose();
@@ -312,7 +317,7 @@ test("system-prompt injection is active only while a command-created run exists"
 		const injected = before?.({ systemPrompt: "base" }, ctx) as { systemPrompt?: string } | undefined;
 		assert.ok(injected?.systemPrompt?.startsWith("base"));
 		assert.ok(injected?.systemPrompt?.includes(ORCHESTRATOR_SYSTEM_PROMPT));
-		assert.match(statuses.at(-1) ?? "", /analyzing/);
+		assert.match(statuses.at(-1) ?? "", /planning/);
 		await handlers.get("session_shutdown")?.({}, ctx);
 		assert.equal(before?.({ systemPrompt: "base" }, ctx), undefined);
 	} finally {

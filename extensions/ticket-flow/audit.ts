@@ -244,7 +244,7 @@ function ensureAuditWorktree(run: WorkflowRun, reason: string, dependencies: Aud
 			...run,
 			phase: paused,
 			pauseReason: "recovery",
-			recoveryIssue: { kind: "audit-worktree", message: `Audit cannot begin until the dedicated workflow branch has a clean worktree: ${check.failure.message}` },
+			recoveryIssue: { kind: "audit-worktree", message: `Audit cannot begin until the persisted workflow branch has a clean worktree: ${check.failure.message}` },
 			updatedAt: timestamp,
 		}, "audit-worktree-paused", { reason, message: check.failure.message });
 	});

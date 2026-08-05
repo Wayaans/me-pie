@@ -29,9 +29,9 @@ Only these tools are active while an owned run exists:
 - `workflow_plan` — `get`, `save`, or typed `update`. Save a complete normalized plan and set `finalized: true` only after all clarification questions, exact profiles, dependencies, and completion mutations are resolved. Put an explicit `auditProfile` in the plan; there is no audit-model fallback.
 - `workflow_delegate` — `start`, `wait`, `send`, `accept`, `revise`, or `close`. Progression is explicit: accepting a ticket never starts the next worker.
 
-Default tool rows are compact. Full run/plan state is in tool `details` and the owner-only `plan.json` snapshot.
+Default tool rows use the same compact tool-plus-command form as `workflow-worker` (for example, `workflow-plan · save` and `workflow-delegate · start`). Full run/plan state is in tool `details` and the owner-only `plan.json` snapshot.
 
-`workflow_delegate start` is one recoverable transaction. It persists checkpoints while it creates the owned tmux window, launches Pi, verifies the exact provider/model/thinking profile, authenticates the native connection, and delivers the exact planned prompt. Visible substep updates are emitted while the transaction runs. A failed or cancelled substep pauses safely for recovery.
+`workflow_delegate start` is one recoverable transaction. It persists checkpoints while it creates the owned tmux window, launches Pi, verifies the exact provider/model/thinking profile, authenticates the native connection, and delivers the exact planned prompt. Visible substep updates are emitted while the transaction runs. A failed or cancelled substep pauses safely for recovery. Main keeps scheduling bounded continuation turns while durable state changes and the run remains actionable, so finalizing a plan cannot silently end the workflow; it stops only for completion, failure, pause, or a genuine user decision.
 
 ## Worker tool
 
@@ -45,7 +45,7 @@ A blocking question first appears as a blocked worker event (`workflow_delegate 
 
 ## Widget
 
-A bordered task-list widget can remain above the editor while a run is active or recoverable. It shows compact item statuses, an animated current-step marker, current model/thinking, tmux stable display/window/pane IDs, clarification blockers, and audit/fix rounds. Widget visibility is session-local: a newly started run is shown in its starting session, recoverable runs stay hidden in other sessions, and `/ticket-flow status` toggles show/hide for the current session. Stopped, completed, and no-run states clear it.
+A bordered task-list widget can remain above the editor while a run is active or recoverable. Its title reports each live step—planning, ticket analysis, plan updates/finalization, delegation, worker verification, report review, audit, audit fixes, and finalization. It also shows compact item statuses, an animated current-step marker, current model/thinking, tmux stable display/window/pane IDs, clarification blockers, and audit/fix rounds. Widget visibility is session-local: a newly started run is shown in its starting session, recoverable runs stay hidden in other sessions, and `/ticket-flow status` toggles show/hide for the current session. Stopped, completed, and no-run states clear it.
 
 ## Durable state and ownership
 
@@ -65,7 +65,7 @@ A project lock, authenticated native protocol, stable tmux ownership tags, immut
 
 ## Git policy
 
-For a Git checkout, Ticket Flow requires a clean preflight, records the baseline, and creates a dedicated `mepie/ticket-flow/<run-id>` branch. Implementation/fix reports identify their commits; accepted commit IDs are persisted. Plan-driven completion mutations are staged only by their exact declared paths and committed with a deterministic `mepie(ticket-flow): record completion …` subject; unrelated staged or changed paths abort the transaction. Ledger-only completion creates no commit. Audits use only the persisted accepted commit set and never claim to audit uncommitted changes. Fix workers may modify the checkout and must report their implementation commits; only audit workers are read-only.
+For a Git checkout, Ticket Flow requires a clean preflight and records the baseline. It creates and switches to `mepie/ticket-flow/<run-id>` only when the starting branch is exactly `main`; from every other branch it preserves and uses the current branch without creating or switching branches. Implementation/fix reports identify their commits; accepted commit IDs are persisted. Plan-driven completion mutations are staged only by their exact declared paths and committed with a deterministic `mepie(ticket-flow): record completion …` subject; unrelated staged or changed paths abort the transaction. Ledger-only completion creates no commit. Audits use only the persisted accepted commit set and never claim to audit uncommitted changes. Fix workers may modify the checkout and must report their implementation commits; only audit workers are read-only.
 
 ## Completion mutations
 

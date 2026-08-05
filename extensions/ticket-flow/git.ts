@@ -107,14 +107,20 @@ export async function gitPreflight(cwd: string, runId: string, runner: GitComman
 	if (changedFiles.length > 0) throw new Error(`Ticket Flow requires a clean worktree before starting; changed paths: ${changedFiles.join(", ")}`);
 	const baselineCommit = nonEmpty(await command(runner, ["rev-parse", "HEAD"], cwd, signal), "baseline commit");
 	const baselineBranch = nonEmpty(await command(runner, ["branch", "--show-current"], cwd, signal), "baseline branch");
-	const workflowBranch = `mepie/ticket-flow/${runId.replace(/[^A-Za-z0-9_.-]/g, "-")}`;
-	const existing = await runner.run(["show-ref", "--verify", "--quiet", `refs/heads/${workflowBranch}`], cwd, signal);
-	if (existing.code === 0) {
-		const existingHead = await command(runner, ["rev-parse", workflowBranch], cwd, signal);
-		if (existingHead !== baselineCommit) throw new Error(`Dedicated workflow branch ${workflowBranch} already contains commits; refusing to reuse it for a new run.`);
-		await command(runner, ["switch", workflowBranch], cwd, signal);
-	} else {
-		await command(runner, ["switch", "-c", workflowBranch], cwd, signal);
+	// Main is the only branch Ticket Flow may leave. An invocation from any
+	// feature/staging branch must preserve that branch and use it in place.
+	const workflowBranch = baselineBranch === "main"
+		? `mepie/ticket-flow/${runId.replace(/[^A-Za-z0-9_.-]/g, "-")}`
+		: baselineBranch;
+	if (baselineBranch === "main") {
+		const existing = await runner.run(["show-ref", "--verify", "--quiet", `refs/heads/${workflowBranch}`], cwd, signal);
+		if (existing.code === 0) {
+			const existingHead = await command(runner, ["rev-parse", workflowBranch], cwd, signal);
+			if (existingHead !== baselineCommit) throw new Error(`Workflow branch ${workflowBranch} already contains commits; refusing to reuse it for a new run.`);
+			await command(runner, ["switch", workflowBranch], cwd, signal);
+		} else {
+			await command(runner, ["switch", "-c", workflowBranch], cwd, signal);
+		}
 	}
 	return { repository: cwd, baselineCommit, baselineBranch, workflowBranch, clean: true, changedFiles: [] };
 }
@@ -335,7 +341,7 @@ export async function validateAttemptCommitIds(
 	if (!(await isGitRepository(cwd))) throw new Error("Git commit tracking requires a repository.");
 	if (new Set(commitIds).size !== commitIds.length) throw new Error("Reported commit IDs must be unique within the active attempt.");
 	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Acceptance requires the dedicated workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
+	if (branch !== state.workflowBranch) throw new Error(`Acceptance requires the persisted workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
 	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
 	const baseline = await canonicalCommitId(cwd, state.baselineCommit, runner, signal);
 	const attemptBase = state.attemptBaseCommit === undefined ? baseline : await canonicalCommitId(cwd, state.attemptBaseCommit, runner, signal);
@@ -373,7 +379,7 @@ export async function validateAcceptedCommitIds(
 	const changed = await statusFiles(cwd, runner, signal);
 	if (changed.length > 0) throw new Error(`Worktree must be clean at acceptance; changed paths: ${changed.join(", ")}`);
 	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Acceptance requires the dedicated workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
+	if (branch !== state.workflowBranch) throw new Error(`Acceptance requires the persisted workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
 	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
 	const baseline = await canonicalCommitId(cwd, state.baselineCommit, runner, signal);
 	const attemptBase = state.attemptBaseCommit === undefined ? baseline : await canonicalCommitId(cwd, state.attemptBaseCommit, runner, signal);
@@ -404,7 +410,7 @@ export async function validateAcceptedCommitHistory(
 	const changed = await statusFiles(cwd, runner, signal);
 	if (changed.length > 0) throw new Error(`Worktree must be clean while validating completion history; changed paths: ${changed.join(", ")}`);
 	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Completion history requires the dedicated workflow branch ${state.workflowBranch}.`);
+	if (branch !== state.workflowBranch) throw new Error(`Completion history requires the persisted workflow branch ${state.workflowBranch}.`);
 	const canonical = await canonicalCommitIds(cwd, commitIds, runner, signal);
 	const persisted = new Set((await canonicalCommitIds(cwd, state.acceptedCommitIds, runner, signal)).map((commit) => commit.toLowerCase()));
 	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
@@ -422,7 +428,7 @@ export async function assertGitReadyForAudit(cwd: string, state: GitRunState, ru
 	const changed = await statusFiles(cwd, runner, signal);
 	if (changed.length > 0) throw new Error(`Worktree must be clean before audit; changed paths: ${changed.join(", ")}`);
 	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Audit requires the dedicated workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
+	if (branch !== state.workflowBranch) throw new Error(`Audit requires the persisted workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
 	const canonicalAccepted = await canonicalCommitIds(cwd, state.acceptedCommitIds, runner, signal);
 	if (new Set(canonicalAccepted).size !== canonicalAccepted.length) throw new Error("Accepted Git commits must be unique before audit.");
 	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);

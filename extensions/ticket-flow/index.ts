@@ -4,6 +4,7 @@ import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowComman
 import { WorkflowController } from "./controller.ts";
 import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts";
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
+import { shouldAutoContinueWorkflow, WORKFLOW_CONTINUATION_KICKOFF, workflowContinuationKey } from "./orchestrator/continuation.ts";
 import { discoverOrchestratorRecovery, recoverWithConfirmation, confirmActiveWorkerStop, resolveRecoveryIssue, selectRecoverableRun } from "./orchestrator/lifecycle.ts";
 import { detectWorkflowRole, isTicketFlowInvocation } from "./role.ts";
 import type { WorkflowRun } from "./domain.ts";
@@ -11,7 +12,7 @@ import { prepareWorkerLifecycle, type WorkerLifecycle } from "./worker/lifecycle
 import { registerWorkerTools } from "./worker/tools.ts";
 import { TmuxController } from "./tmux/controller.ts";
 import { filterWorkflowToolContext, isWorkflowToolAllowed, isWorkflowToolName, toolsForWorkflowRole, withoutWorkflowTools } from "./tool-names.ts";
-import { WORKFLOW_WIDGET_KEY, WorkflowTaskListWidget, renderWorkflowWidget } from "./widget.ts";
+import { WORKFLOW_WIDGET_KEY, WorkflowTaskListWidget, renderWorkflowWidget, workflowActivityForTool, workflowActivityFromProgress, workflowPhaseActivity } from "./widget.ts";
 
 export const WORKER_SYSTEM_PROMPT = `## Ticket Flow worker role
 
@@ -27,17 +28,13 @@ export function appendWorkerSystemPrompt(systemPrompt: string): string {
 	return `${systemPrompt}\n\n${WORKER_SYSTEM_PROMPT}`;
 }
 
-export function workflowFooterStatus(run: WorkflowRun): string {
-	if (run.phase === "ready") return `ticket-flow · ready · ${run.plan.workItems.length} items`;
-	if (run.phase === "awaiting-user") return "ticket-flow · awaiting user";
-	if (run.phase === "auditing") return "ticket-flow · audit pending";
-	if (run.phase === "fixing") return "ticket-flow · audit fix pending";
-	return `ticket-flow · ${run.phase}`;
+export function workflowFooterStatus(run: WorkflowRun, activity = workflowPhaseActivity(run)): string {
+	return `ticket-flow · ${activity.toLowerCase()}${run.phase === "ready" ? ` · ${run.plan.workItems.length} items` : ""}`;
 }
 
-function updateStatus(ctx: ExtensionContext, run: WorkflowRun | undefined): void {
+function updateStatus(ctx: ExtensionContext, run: WorkflowRun | undefined, activity?: string): void {
 	if (!ctx.hasUI) return;
-	ctx.ui.setStatus("ticket-flow", run === undefined ? undefined : workflowFooterStatus(run));
+	ctx.ui.setStatus("ticket-flow", run === undefined ? undefined : workflowFooterStatus(run, activity));
 }
 
 function notifyError(ctx: ExtensionContext, error: unknown): void {
@@ -121,6 +118,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	const controller = new WorkflowController(pi, undefined, undefined, options.tmux);
 	registerOrchestratorTools(pi, controller);
 	let widgetRun: WorkflowRun | undefined;
+	let widgetActivity: string | undefined;
 	let widgetContext: ExtensionContext | undefined;
 	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 	let widget: WorkflowTaskListWidget | undefined;
@@ -129,12 +127,15 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	let widgetVisible = false;
 	let widgetReloading = false;
 	let widgetLastReloadAt = 0;
+	let lastContinuationKey: string | undefined;
 
 	function disposeWidgetState(): void {
 		const context = widgetContext;
 		widgetVisible = false;
 		widgetRun = undefined;
+		widgetActivity = undefined;
 		widgetContext = undefined;
+		widget?.setActivity(undefined);
 		widget?.setRun(undefined);
 		widget = undefined;
 		widgetTui = undefined;
@@ -162,13 +163,14 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		widgetRun = run;
 		if (!ctx.hasUI || run === undefined) { clearWidget(ctx); return; }
 		widgetVisible = true;
-		updateStatus(ctx, run);
+		updateStatus(ctx, run, widgetActivity);
 		if (ctx.mode !== "tui") {
-			if (typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, renderWorkflowWidget(run, 100));
+			if (typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, renderWorkflowWidget(run, 100, { activity: widgetActivity }));
 			return;
 		}
 		widget ??= new WorkflowTaskListWidget(run);
 		widget.setRun(run);
+		widget.setActivity(widgetActivity);
 		if (typeof ctx.ui.setWidget !== "function") return;
 		// Install one live component. Its render closure reads the mutable widget,
 		// not the run snapshot that happened to exist at installation time.
@@ -193,7 +195,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 				widgetRun = current;
 				widget?.setRun(current);
 				widget?.advance();
-				updateStatus(widgetContext, current);
+				updateStatus(widgetContext, current, widgetActivity);
 				widgetTui?.requestRender();
 				if (!controller.activeRun && !widgetReloading && Date.now() - widgetLastReloadAt >= 1_000) {
 					widgetReloading = true;
@@ -206,7 +208,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 							if (refreshed && widgetVisible) {
 								widgetRun = refreshed;
 								widget?.setRun(refreshed);
-								updateStatus(context, refreshed);
+								updateStatus(context, refreshed, widgetActivity);
 								widgetTui?.requestRender();
 							}
 						})
@@ -220,6 +222,16 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 
 	function refreshWidget(ctx: ExtensionContext, run: WorkflowRun | undefined): void {
 		if (widgetVisible) showWidget(ctx, run);
+	}
+
+	function setWidgetActivity(ctx: ExtensionContext, run: WorkflowRun, activity: string | undefined): void {
+		widgetActivity = activity;
+		widget?.setActivity(activity);
+		updateStatus(ctx, run, activity);
+		widgetTui?.requestRender();
+		if (widgetVisible && ctx.mode !== "tui" && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, renderWorkflowWidget(run, 100, { activity }));
+		}
 	}
 
 	async function attachDiscoveredRun(ctx: ExtensionContext, action: "pause" | "resume" | "stop"): Promise<WorkflowRun | undefined> {
@@ -346,16 +358,39 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		}
 	});
 
-	pi.on("tool_execution_start", (_event, ctx) => {
+	pi.on("tool_execution_start", (event, ctx) => {
 		const run = controller.activeRun ?? widgetRun;
-		if (run) refreshWidget(ctx, run);
+		if (!run) return;
+		setWidgetActivity(ctx, run, workflowActivityForTool(event.toolName, event.args, run));
+		refreshWidget(ctx, run);
+	});
+
+	pi.on("tool_execution_update", (event, ctx) => {
+		const run = controller.activeRun ?? widgetRun;
+		if (!run) return;
+		const partial = event.partialResult as { readonly content?: readonly { readonly type?: string; readonly text?: string }[] } | undefined;
+		const message = partial?.content?.find((part) => part.type === "text")?.text;
+		if (message) setWidgetActivity(ctx, run, workflowActivityFromProgress(message, run));
 	});
 
 	pi.on("tool_execution_end", (event, ctx) => {
 		const resultRun = (event.result as { readonly details?: { readonly run?: WorkflowRun } } | undefined)?.details?.run;
 		if (resultRun?.phase === "completed" || resultRun?.phase === "stopped") { clearWidget(ctx); return; }
 		const run = controller.activeRun ?? resultRun ?? (widgetRun?.phase === "completed" || widgetRun?.phase === "stopped" ? undefined : widgetRun);
-		if (run) refreshWidget(ctx, run); else if (widgetVisible) clearWidget(ctx);
+		if (run) {
+			setWidgetActivity(ctx, run, undefined);
+			refreshWidget(ctx, run);
+		} else if (widgetVisible) clearWidget(ctx);
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		const run = controller.activeRun;
+		if (!run || !shouldAutoContinueWorkflow(run)) return;
+		const key = workflowContinuationKey(run);
+		if (key === lastContinuationKey) return;
+		lastContinuationKey = key;
+		setWidgetActivity(ctx, run, workflowPhaseActivity(run));
+		pi.sendUserMessage(WORKFLOW_CONTINUATION_KICKOFF);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

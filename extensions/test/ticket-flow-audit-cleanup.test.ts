@@ -99,6 +99,35 @@ test("completion markers bind raw IDs and cannot be forged by acceptance prose",
 	} finally { fs.rmSync(project, { recursive: true, force: true }); }
 });
 
+test("git preflight creates a workflow branch only from main", async () => {
+	const mainProject = temporary("ticket-flow-main-branch-");
+	const featureProject = temporary("ticket-flow-feature-branch-");
+	try {
+		for (const project of [mainProject, featureProject]) {
+			gitInit(project);
+			fs.writeFileSync(path.join(project, "base.txt"), "base\n");
+			commit(project, "base", "base.txt");
+		}
+		execFileSync("git", ["branch", "-M", "main"], { cwd: mainProject });
+		const fromMain = await gitPreflight(mainProject, "from-main");
+		assert.equal(fromMain?.baselineBranch, "main");
+		assert.equal(fromMain?.workflowBranch, "mepie/ticket-flow/from-main");
+		assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: mainProject, encoding: "utf8" }).trim(), "mepie/ticket-flow/from-main");
+
+		execFileSync("git", ["switch", "-c", "staging"], { cwd: featureProject });
+		const branchesBefore = execFileSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: featureProject, encoding: "utf8" }).trim().split("\n").sort();
+		const fromFeature = await gitPreflight(featureProject, "from-feature");
+		const branchesAfter = execFileSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: featureProject, encoding: "utf8" }).trim().split("\n").sort();
+		assert.equal(fromFeature?.baselineBranch, "staging");
+		assert.equal(fromFeature?.workflowBranch, "staging");
+		assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: featureProject, encoding: "utf8" }).trim(), "staging");
+		assert.deepEqual(branchesAfter, branchesBefore);
+	} finally {
+		fs.rmSync(mainProject, { recursive: true, force: true });
+		fs.rmSync(featureProject, { recursive: true, force: true });
+	}
+});
+
 test("accepted worker commits must include the exact workflow branch tip", async () => {
 	const project = temporary("ticket-flow-exact-tip-");
 	try {

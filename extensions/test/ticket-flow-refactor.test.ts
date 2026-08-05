@@ -7,12 +7,14 @@ import { Check } from "typebox/value";
 import { Effect } from "effect";
 import type { WorkItem } from "../ticket-flow/domain.ts";
 import { AUDIT_PROMPT_TEMPLATE, assertExactAuditPrompt, buildAuditPrompt, reduceAuditRound } from "../ticket-flow/audit.ts";
-import { parseTicketFlowCommand, ticketFlowArgumentCompletions } from "../ticket-flow/command.ts";
+import { ORCHESTRATOR_KICKOFF, parseTicketFlowCommand, ticketFlowArgumentCompletions } from "../ticket-flow/command.ts";
 import { applyCompletionStrategy } from "../ticket-flow/completion.ts";
 import { WorkflowDelegateParameters, WorkflowPlanParameters, registerOrchestratorTools } from "../ticket-flow/orchestrator/tools.ts";
+import { delegateToolLabel, planToolLabel } from "../ticket-flow/orchestrator/renderers.ts";
+import { shouldAutoContinueWorkflow, workflowContinuationKey } from "../ticket-flow/orchestrator/continuation.ts";
 import { WorkflowWorkerParameters } from "../ticket-flow/worker/tools.ts";
 import { WORKER_TOOL_NAMES, filterWorkflowToolContext, toolsForWorkflowRole, withoutWorkflowTools } from "../ticket-flow/tool-names.ts";
-import { renderWorkflowWidget } from "../ticket-flow/widget.ts";
+import { renderWorkflowWidget, workflowActivityForTool, workflowPhaseActivity } from "../ticket-flow/widget.ts";
 
 function project(): string { return fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-refactor-")); }
 const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const };
@@ -39,6 +41,24 @@ test("public command and tool surfaces are explicit and strict", () => {
 	const names: string[] = [];
 	registerOrchestratorTools({ registerTool: (definition: { readonly name: string }) => names.push(definition.name) } as never, { activeRun: run } as never);
 	assert.deepEqual(names, ["workflow_plan", "workflow_delegate"]);
+});
+
+test("orchestrator tools use the worker tool-plus-command interface", () => {
+	assert.equal(planToolLabel("save"), "workflow-plan · save");
+	assert.equal(planToolLabel("update"), "workflow-plan · update");
+	assert.equal(delegateToolLabel("start"), "workflow-delegate · start");
+	assert.equal(delegateToolLabel("accept"), "workflow-delegate · accept");
+});
+
+test("a finalized plan remains actionable and explicitly continues into delegation", () => {
+	const { activeWorkItemId: _active, requestedLaunchProfile: _profile, tmux: _tmux, ...idleRun } = run;
+	const ready = { ...idleRun, phase: "ready" as const, planning: { unresolvedQuestions: [], changes: [] } };
+	assert.equal(shouldAutoContinueWorkflow(ready), true);
+	assert.match(ORCHESTRATOR_KICKOFF, /continue.*delegat/i);
+	assert.notEqual(workflowContinuationKey(ready), workflowContinuationKey({ ...ready, updatedAt: "2026-01-02" }));
+	assert.equal(shouldAutoContinueWorkflow({ ...ready, phase: "awaiting-user", planning: { unresolvedQuestions: ["Which API?"], changes: [] } }), false);
+	assert.equal(shouldAutoContinueWorkflow({ ...ready, phase: "paused" }), false);
+	assert.equal(shouldAutoContinueWorkflow({ ...ready, phase: "completed" }), false);
 });
 
 test("retired workflow surfaces are removed from tools and resumed context", () => {
@@ -85,6 +105,20 @@ test("approved audit prompt is immutable and exact", () => {
 	assert.equal(prompt.startsWith("Audit the implementation"), true);
 	assert.equal(prompt.endsWith("file-level evidence and fixes."), true);
 	assert.throws(() => assertExactAuditPrompt(`${prompt}!`, input));
+});
+
+test("widget reports planning, plan updates, audit, audit fixes, and finalization steps", () => {
+	const { activeWorkItemId: _active, requestedLaunchProfile: _profile, tmux: _tmux, ...idleRun } = run;
+	const planning = { ...idleRun, phase: "analyzing" as const, planning: { unresolvedQuestions: [], changes: [] }, plan: { ...run.plan, finalized: false } };
+	assert.equal(workflowPhaseActivity(planning), "Planning");
+	assert.equal(workflowActivityForTool("workflow_plan", { action: "update" }, planning), "Updating plan");
+	assert.equal(workflowActivityForTool("workflow_plan", { action: "save", plan: { finalized: true } }, planning), "Finalizing plan");
+	const auditing = { ...idleRun, phase: "auditing" as const, planning: { unresolvedQuestions: [], changes: [] } };
+	assert.equal(workflowPhaseActivity(auditing), "Auditing");
+	assert.equal(workflowPhaseActivity({ ...auditing, phase: "fixing" }), "Fixing audit");
+	assert.equal(workflowActivityForTool("workflow_delegate", { action: "accept" }, auditing), "Finalizing audit");
+	assert.match(renderWorkflowWidget(planning, 80).join("\n"), /Planning/);
+	assert.match(renderWorkflowWidget(planning, 80, { activity: "Finalizing plan" }).join("\n"), /Finalizing plan/);
 });
 
 test("widget is bordered, compact, animated, and width-safe", () => {

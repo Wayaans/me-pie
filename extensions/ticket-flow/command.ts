@@ -47,6 +47,6 @@ export function assertCommandPrerequisites(input: CommandPrerequisites): void {
 	if (!input.tmux?.trim()) throw new Error("Ticket Flow requires an active tmux environment (TMUX is not set).");
 }
 
-export const ORCHESTRATOR_KICKOFF = "Begin Ticket Flow analysis. Interpret the original workflow prompt, read all referenced ticket and specification material, resolve known user questions, save a normalized plan, and finalize it only when every invariant is satisfied.";
+export const ORCHESTRATOR_KICKOFF = "Begin and continue the full Ticket Flow workflow. Interpret the original workflow prompt, read all referenced ticket and specification material, resolve known user questions, save and finalize a normalized plan only when every invariant is satisfied, then immediately continue into explicit ticket delegation, report review, audit, audit fixes, and final audit until completion or a genuine user decision is required. Do not stop after creating the plan.";
 
 export const RECOVERY_KICKOFF = "Ticket Flow recovery is attached. Call workflow_plan get, preserve any explicit user pause, and continue only from the reported durable checkpoint using workflow_delegate.";
