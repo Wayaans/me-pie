@@ -3,13 +3,13 @@ import path from "node:path";
 import { Effect, Result } from "effect";
 import type { CompletionRecord, CompletionStrategy, ProgressionCheckpoint, WorkerReport, WorkflowRun, WorkItem } from "./domain.ts";
 import { applyCompletionStrategy, type CompletionApplicationResult } from "./completion.ts";
-import { canonicalCommitIds, commitCompletionMutation, gitHead, mergeAcceptedCommitIds, validateAcceptedCommitHistory, validateAcceptedCommitIds, validateAttemptCommitIds, assertGitReadyForAudit, type CompletionCommitResult, type GitCommandRunner } from "./git.ts";
+import { canonicalCommitIds, commitCompletionMutation, completionCommitMessage, gitHead, mergeAcceptedCommitIds, validateAcceptedCommitHistory, validateAcceptedCommitIds, validateAttemptCommitIds, assertGitReadyForAudit, type CompletionCommitResult, type GitCommandRunner } from "./git.ts";
 import { deterministicJson } from "./state-store.ts";
 import { persistAcceptedReport, readLatestReportAttempt, readReportAttempt, safeReportItemId, validateWorkerReport, type WorkerReportAttempt as StoredWorkerReportAttempt } from "./worker/report.ts";
 import type { WorkflowPaths } from "./paths.ts";
 import type { PersistenceError, ValidationError } from "./errors.ts";
 import { transitionRun, transitionWorkItem } from "./state-machine.ts";
-import { validateAuditReport } from "./audit.ts";
+import { assertAuditWorkItemPrompt, validateAuditReport } from "./audit.ts";
 
 export interface AcceptedCompletionInput {
 	readonly projectPath: string;
@@ -246,12 +246,13 @@ export function acceptReport(
 			const completionRecovery = active.progression?.operation === "accept" && active.progression.workItemId === workItemId && ["completion-applying", "completion-applied", "completion-failed", "completion-committed", "worker-closing"].includes(active.progression.stage);
 			acceptedCommitIdsForItem = yield* Effect.tryPromise({
 				try: (commitSignal) => completionRecovery
-					? validateAttemptCommitIds(active.projectPath, active.git!, acceptedCommitIdsForItem, dependencies.gitRunner, commitSignal)
+					? validateAttemptCommitIds(active.projectPath, active.git!, acceptedCommitIdsForItem, dependencies.gitRunner, commitSignal, completionCommitMessage(active.id, workItemId))
 					: validateAcceptedCommitIds(active.projectPath, active.git!, acceptedCommitIdsForItem, dependencies.gitRunner, commitSignal),
 				catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
 			});
 		}
 		if (item.kind === "audit") {
+			yield* Effect.try({ try: () => assertAuditWorkItemPrompt(active, item), catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)) });
 			if (active.git !== undefined) {
 				acceptedCommitIdsForItem = yield* Effect.tryPromise({ try: (commitSignal) => canonicalCommitIds(active.projectPath, acceptedCommitIdsForItem, dependencies.gitRunner, commitSignal), catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)) });
 				const accepted = [...(active.git.acceptedCommitIds ?? [])].map((commit) => commit.toLowerCase()).sort();

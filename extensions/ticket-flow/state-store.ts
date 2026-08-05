@@ -223,18 +223,19 @@ function readUnknownJson(
 }
 
 function eventIdInJournal(content: string, eventId: string): "present" | "absent" | "malformed" {
+	let present = false;
 	for (const line of content.split("\n")) {
 		if (!line.trim()) continue;
 		try {
 			const value = JSON.parse(line) as { readonly id?: unknown };
-			if (value.id === eventId) return "present";
+			if (value.id === eventId) present = true;
 		} catch {
-			// A malformed journal must be surfaced, never silently repaired by a
-			// pending snapshot or a second append.
+			// Scan the complete journal: corruption after the matching event is
+			// still corruption and must never be hidden by an early return.
 			return "malformed";
 		}
 	}
-	return "absent";
+	return present ? "present" : "absent";
 }
 
 /**

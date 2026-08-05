@@ -33,7 +33,7 @@ function runChoiceLabel(candidate: RecoverableRun): string {
 export async function selectRecoverableRun(
 	discovery: RecoveryDiscovery,
 	ctx: ExtensionContext,
-	action: "pause" | "resume" | "stop" | "recover",
+	action: "status" | "pause" | "resume" | "stop" | "recover",
 ): Promise<RecoverableRun | undefined> {
 	if (discovery.runs.length === 0) return undefined;
 	if (discovery.runs.length === 1) return discovery.runs[0];

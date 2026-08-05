@@ -6,7 +6,6 @@ import type { PlanChange, WorkflowPlan, WorkflowRun } from "../domain.ts";
 import { formatFinalSummary } from "../audit.ts";
 import { THINKING_LEVELS, WORK_ITEM_STATUSES } from "../domain.ts";
 import type { WorkflowController } from "../controller.ts";
-import { ORCHESTRATOR_TOOL_NAMES } from "../tool-names.ts";
 import { renderDelegateCall, renderDelegateResult, renderPlanCall, renderPlanResult } from "./renderers.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) => Type.Object(properties, { additionalProperties: false });
@@ -67,7 +66,6 @@ export const WorkflowDelegateParameters = StrictObject({
 export type WorkflowPlanInput = Static<typeof WorkflowPlanParameters>;
 export type WorkflowDelegateInput = Static<typeof WorkflowDelegateParameters>;
 
-export { ORCHESTRATOR_TOOL_NAMES } from "../tool-names.ts";
 
 function result(text: string, run?: WorkflowRun, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text }], details: run === undefined ? details : { ...details, run } };

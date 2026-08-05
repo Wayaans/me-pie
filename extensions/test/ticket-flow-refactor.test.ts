@@ -10,8 +10,8 @@ import { AUDIT_PROMPT_TEMPLATE, assertExactAuditPrompt, buildAuditPrompt, reduce
 import { parseTicketFlowCommand, ticketFlowArgumentCompletions } from "../ticket-flow/command.ts";
 import { applyCompletionStrategy } from "../ticket-flow/completion.ts";
 import { WorkflowDelegateParameters, WorkflowPlanParameters, registerOrchestratorTools } from "../ticket-flow/orchestrator/tools.ts";
-import { WORKER_TOOL_NAMES, WorkflowWorkerParameters } from "../ticket-flow/worker/tools.ts";
-import { filterWorkflowToolContext, toolsForWorkflowRole, withoutWorkflowTools } from "../ticket-flow/tool-names.ts";
+import { WorkflowWorkerParameters } from "../ticket-flow/worker/tools.ts";
+import { WORKER_TOOL_NAMES, filterWorkflowToolContext, toolsForWorkflowRole, withoutWorkflowTools } from "../ticket-flow/tool-names.ts";
 import { renderWorkflowWidget } from "../ticket-flow/widget.ts";
 
 function project(): string { return fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-refactor-")); }

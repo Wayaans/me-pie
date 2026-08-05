@@ -83,6 +83,22 @@ export class ProtocolClient {
 	get isVerified(): boolean { return this.verified; }
 	get isStopped(): boolean { return this.stopped; }
 	get authoritativeContext(): AuthoritativeWorkerContext | undefined { return this.context; }
+	waitForVerification(signal?: AbortSignal): Promise<AuthoritativeWorkerContext> {
+		if (this.context && this.verified) return Promise.resolve(this.context);
+		return new Promise((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const cleanup = () => { if (timer) clearTimeout(timer); signal?.removeEventListener("abort", abort); };
+			const abort = () => { cleanup(); reject(signal?.reason ?? new DOMException("Aborted", "AbortError")); };
+			const check = () => {
+				if (this.context && this.verified) { cleanup(); resolve(this.context); return; }
+				if (this.stopped) { cleanup(); reject(new ProtocolClientError("Worker protocol stopped before authenticated delegation.")); return; }
+				timer = setTimeout(check, 10);
+			};
+			if (signal?.aborted) { abort(); return; }
+			signal?.addEventListener("abort", abort, { once: true });
+			check();
+		});
+	}
 	start(): Effect.Effect<void> {
 		return Effect.gen({ self: this }, function* () {
 			if (this.stopped || this.incoming) return;

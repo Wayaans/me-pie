@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, rm, rmdir, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -82,7 +82,7 @@ export function buildPiArguments(profile: PiLaunchProfile, packageRoot: string, 
 	return [
 		"--model", profile.model,
 		"--thinking", profile.thinking,
-		...(options.readOnly ? ["--tools", "read,grep,find,ls"] : []),
+		...(options.readOnly ? ["--tools", "read,grep,find,ls,rg,fd,workflow_worker"] : []),
 		"--extension", packageRoot,
 	];
 }
@@ -97,7 +97,9 @@ export function buildLauncherScript(
 		"#!/bin/sh",
 		"set -eu",
 		'launcher=$0',
+		'runtime_dir=${launcher%/*}',
 		'rm -f -- "$launcher"',
+		'rmdir -- "$runtime_dir" 2>/dev/null || true',
 		...exports,
 		`exec ${[piExecutable, ...args].map(quotePosixArgument).join(" ")}`,
 		"",
@@ -110,10 +112,16 @@ export async function writeOwnerOnlyLauncher(directory: string, script: string, 
 	signal?.throwIfAborted();
 	await chmod(directory, 0o700);
 	const launcherPath = path.join(directory, `worker-${crypto.randomUUID()}.sh`);
-	await writeFile(launcherPath, script, { encoding: "utf8", mode: 0o700, flag: "wx", signal });
-	signal?.throwIfAborted();
-	await chmod(launcherPath, 0o700);
-	return launcherPath;
+	try {
+		await writeFile(launcherPath, script, { encoding: "utf8", mode: 0o700, flag: "wx", signal });
+		signal?.throwIfAborted();
+		await chmod(launcherPath, 0o700);
+		return launcherPath;
+	} catch (cause) {
+		await rm(launcherPath, { force: true }).catch(() => undefined);
+		await rmdir(directory).catch(() => undefined);
+		throw cause;
+	}
 }
 
 export async function resolveExecutable(name: string, searchPath = process.env.PATH, signal?: AbortSignal): Promise<string | undefined> {

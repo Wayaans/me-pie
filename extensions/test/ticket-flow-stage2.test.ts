@@ -118,7 +118,7 @@ test("plan finalization rejects missing launch profiles and unresolved questions
 	await runEffect(controller.savePlan(plan([item({ launchProfile: { model: "openai-codex/gpt-5.6-sol" } })])));
 	await assert.rejects(runEffect(controller.finalizePlan()), /explicit model and thinking level/);
 	await runEffect(controller.savePlan(plan(), ["Which API behavior?"]));
-	await assert.rejects(runEffect(controller.finalizePlan()), /unresolved user question/);
+	await assert.rejects(runEffect(controller.finalizePlan()), /clarification questions/);
 	await runEffect(controller.updatePlan([{ type: "set-user-resolutions", userResolutions: [{ id: "answer-api", question: "Which API behavior?", answer: "Use the strict API.", resolvedAt: "2026-01-01T00:00:00.000Z" }] }]));
 	const ready = await runEffect(controller.finalizePlan());
 	assert.equal(ready.phase, "ready");
@@ -264,6 +264,13 @@ test("system-prompt injection is active only while a command-created run exists"
 		} as unknown as ExtensionContext;
 		await commands.get("ticket-flow")?.("tmux  inspect @tickets exactly", ctx);
 		assert.equal(sent.length, 1);
+		assert.equal(typeof widgets.at(-1), "function");
+		const widgetFactory = widgets.at(-1) as (tui: { requestRender: () => void }, theme: unknown) => { dispose: () => void };
+		widgetFactory({ requestRender: () => undefined }, {}).dispose();
+		assert.equal(statuses.at(-1), undefined);
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		assert.equal(statuses.at(-1), undefined, "disposed widget timer stays stopped");
+		await commands.get("ticket-flow")?.("status", ctx);
 		assert.equal(typeof widgets.at(-1), "function");
 
 		const otherCommands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();

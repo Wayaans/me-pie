@@ -24,11 +24,11 @@ import { readWorkflowToken, removeWorkflowToken, workflowSocketPath, writeWorkfl
 import { ProtocolServer, type ProtocolRejection } from "./protocol/server.ts";
 import type { WorkflowProtocolEvent } from "./protocol/messages.ts";
 import { ingestProtocolEvent, acknowledgeProtocolCommand as acknowledgeProtocolCommandIngestion, rejectProtocolWorker as rejectProtocolWorkerIngestion, type ProtocolIngestionDependencies } from "./protocol/ingestion.ts";
-import { makeAuthoritativeWorkerContext, requirementId } from "./worker/context.ts";
+import { makeAuthoritativeWorkerContext } from "./worker/context.ts";
 import { readLatestReportAttempt, readReportAttempt } from "./worker/report.ts";
 import { acceptReport as acceptReportProgression, continueAfterCompletedProgression, type CompletionAcceptanceDependencies } from "./completion-acceptance.ts";
 import { discoverUnfinishedRuns, reconcileRecovery, type RecoveryDiscovery, type RecoveryReconciliation } from "./recovery.ts";
-import { advanceAuditAfterAcceptance as advanceAuditProgression, auditProfile, scheduleAuditAfterAcceptance, type AuditProgressionDependencies } from "./audit.ts";
+import { advanceAuditAfterAcceptance as advanceAuditProgression, assertAuditWorkItemPrompt, scheduleAuditAfterAcceptance, type AuditProgressionDependencies } from "./audit.ts";
 import { gitHead, gitPreflight, gitStateFromPreflight, type GitCommandRunner } from "./git.ts";
 import { questionIdFor, reconcilePlanningQuestions } from "./planning.ts";
 import { toolsForWorkflowRole, withoutWorkflowTools } from "./tool-names.ts";
@@ -53,7 +53,6 @@ export interface StartRunInput {
 	readonly prompt: string;
 	readonly sessionId?: string;
 	readonly agentDir?: string;
-	readonly auditProfile?: PiLaunchProfile;
 }
 
 export interface RecoverRunInput {
@@ -264,9 +263,6 @@ export class WorkflowController {
 		return undefined;
 	}
 
-	nextReadyItem(): WorkItem | undefined {
-		return this.nextReadyWorkItem();
-	}
 
 	private persist(
 		next: WorkflowRun,
@@ -321,7 +317,6 @@ export class WorkflowController {
 					projectPath: resolved.canonicalProjectPath,
 					originalPrompt: input.prompt,
 					...(input.sessionId === undefined ? {} : { orchestratorSessionId: input.sessionId }),
-					...(input.auditProfile === undefined ? {} : { auditProfile: auditProfile(input.auditProfile) }),
 					phase: "analyzing",
 					createdAt: timestamp,
 					updatedAt: timestamp,
@@ -368,7 +363,6 @@ export class WorkflowController {
 			const phase = requestedFinalized ? yield* transitionRun(active.phase, "ready") : reconciled.unresolvedQuestions.length > 0 ? "awaiting-user" : "analyzing";
 			const next: WorkflowRun = {
 				...active,
-				...(requestedAuditProfile === undefined ? {} : { auditProfile: auditProfile(requestedAuditProfile) }),
 				phase,
 				updatedAt: timestamp,
 				plan: normalized,
@@ -518,6 +512,7 @@ export class WorkflowController {
 				return yield* Effect.fail(new Error(`Work item ${workItemId} is not the next dependency-ready item; delegate ${next.id} first.`));
 			}
 			if (!dependenciesCompleted(active, item)) return yield* Effect.fail(new Error(`Work item ${workItemId} has incomplete dependencies.`));
+			if (item.kind === "audit") yield* Effect.try({ try: () => assertAuditWorkItemPrompt(active, item), catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)) });
 			if (!item.launchProfile?.model || !item.launchProfile.thinking) {
 				return yield* Effect.fail(new Error(`Work item ${workItemId} has no complete launch profile.`));
 			}
@@ -602,7 +597,15 @@ export class WorkflowController {
 				plan: { ...socketRun.plan, workItems: socketRun.plan.workItems.map((candidate) => candidate.id === workItemId ? verifyingItem : candidate) },
 			};
 			return yield* this.persist(verifying, "worker-window-created", { workItemId, handle }).pipe(
-				Effect.onError(() => this.tmux.closeWindow(handle, true).pipe(Effect.catch(() => Effect.void))),
+				Effect.onError(() => Effect.gen({ self: this }, function* () {
+					yield* this.tmux.closeWindow(handle, true).pipe(Effect.catch(() => Effect.void));
+					if (this.active) {
+						delete this.active.workerToken;
+						yield* removeWorkflowToken(this.active.paths.runDir);
+						yield* this.active.protocol?.shutdown() ?? Effect.void;
+						delete this.active.protocol;
+					}
+				})),
 			);
 		});
 	}
@@ -731,16 +734,6 @@ export class WorkflowController {
 			return yield* this.requireRun();
 		});
 	}
-	readWorker(workItemId: string, lines = 200) {
-		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requireRun();
-			if (active.activeWorkItemId !== workItemId || active.tmux?.workItemId !== workItemId) {
-				return yield* Effect.fail(new Error(`Work item ${workItemId} does not own the active tmux window.`));
-			}
-			return boundStatusOutput(yield* this.tmux.capturePane(active.tmux, lines));
-		});
-	}
-
 	closeWorker(workItemId: string, force = false) {
 		return this.serialize(this.closeWorkerInternal(workItemId, force, false));
 	}
@@ -818,27 +811,6 @@ export class WorkflowController {
 			return { run, closeResult };
 		});
 	}
-	inspectReport(workItemId: string, signal?: AbortSignal) {
-		return this.serialize(this.inspectReportInternal(workItemId, signal));
-	}
-
-	private inspectReportInternal(workItemId: string, signal?: AbortSignal) {
-		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requireRun();
-			const item = active.plan.workItems.find((candidate) => candidate.id === workItemId);
-			if (!item) return yield* Effect.fail(new Error(`Unknown work item: ${workItemId}`));
-			const attempt = yield* readLatestReportAttempt(this.active!.paths, workItemId, signal);
-			if (!attempt) return yield* Effect.fail(new Error(`No worker report exists for ${workItemId}.`));
-			const requirements = item.requirements.map((requirement, index) => ({ id: requirementId(index), requirement }));
-			return boundStatusOutput(JSON.stringify({
-				workItemId,
-				workItemTitle: item.title,
-				requirements,
-				latestAttempt: attempt,
-			}, null, 2));
-		});
-	}
-
 	private auditProgressionDependencies(): AuditProgressionDependencies {
 		return {
 			now: this.now,
@@ -986,30 +958,11 @@ export class WorkflowController {
 		});
 	}
 
+	/** Test/helper shorthand; production finalizes through workflow_plan save. */
 	finalizePlan() {
-		return this.serialize(this.finalizePlanInternal());
-	}
-
-	private finalizePlanInternal() {
-		return Effect.gen({ self: this }, function* () {
-			const active = yield* this.requirePlanningRun();
-			if (active.planning.unresolvedQuestions.length > 0) {
-				return yield* Effect.fail(new Error(
-					`Cannot finalize: ${active.planning.unresolvedQuestions.length} unresolved user question(s) remain.`,
-				));
-			}
-			if (!active.plan.auditProfile?.model || !active.plan.auditProfile.thinking) {
-				return yield* Effect.fail(new Error("Cannot finalize: an explicit model and thinking level audit profile must be set in plan.auditProfile; no fallback is permitted."));
-			}
-			const plan = normalizePlan({ ...active.plan, finalized: true });
-			yield* validatePlan(plan);
-			const phase = yield* transitionRun(active.phase, "ready");
-			return yield* this.persist(
-				{ ...active, phase, plan, updatedAt: this.now().toISOString() },
-				"plan-finalized",
-				{ workItemCount: plan.workItems.length },
-			);
-		});
+		const active = this.activeRun;
+		if (!active) return Effect.fail(new Error("No active Ticket Flow run."));
+		return this.savePlan({ ...active.plan, finalized: true }, active.planning.unresolvedQuestions);
 	}
 
 	private recoveryTargetPhase(run: WorkflowRun): WorkflowRun["phase"] {

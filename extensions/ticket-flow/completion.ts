@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, realpath, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -193,22 +194,31 @@ function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
 }
 
 function safeMarkerPart(value: string): string {
-	const readable = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
-	return readable || "item";
+	const readable = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "item";
+	const identity = createHash("sha256").update(value).digest("hex").slice(0, 16);
+	return `${readable}-${identity}`;
 }
 
 export function completionMarker(runId: string, workItemId: string): string {
 	return `<!-- mepie-ticket-flow:completed:${safeMarkerPart(runId)}:${safeMarkerPart(workItemId)} -->`;
 }
 
+function escapeCompletionMarkdown(value: string): string {
+	return value.replaceAll("<!--", "&lt;!--").replaceAll("-->", "--&gt;");
+}
+
+function hasCompletionMarker(content: string, marker: string): boolean {
+	return content.split(/\r?\n/).some((line) => line === marker);
+}
+
 function markdownBlock(input: CompletionApplicationInput): string {
 	const marker = completionMarker(input.runId, input.workItemId);
-	const comment = input.comment.split(/\r?\n/).map((line) => `> ${line}`).join("\n");
+	const comment = escapeCompletionMarkdown(input.comment).split(/\r?\n/).map((line) => `> ${line}`).join("\n");
 	return [
 		marker,
 		"",
 		"## Ticket Flow completion",
-		`- Work item: ${input.workItemTitle}`,
+		`- Work item: ${escapeCompletionMarkdown(input.workItemTitle)}`,
 		`- Completed at: ${input.completedAt}`,
 		"- Orchestrator comment:",
 		comment,
@@ -266,7 +276,7 @@ async function appendMarkdown(
 		const afterRead = await mutationFileIdentity(filePath, fs, operationSignal);
 		if (!sameFileIdentity(before, afterRead)) throw new CompletionError(`Completion target changed while it was being read: ${filePath}`);
 		throwIfAborted(signal, operationSignal);
-		if (original.includes(marker)) return { strategy: "append-markdown", changed: false, paths: [filePath] };
+		if (hasCompletionMarker(original, marker)) return { strategy: "append-markdown", changed: false, paths: [filePath] };
 		const separator = original.length === 0 ? "" : original.endsWith("\n") ? "\n" : "\n\n";
 		const beforeWrite = await mutationFileIdentity(filePath, fs, operationSignal);
 		if (!sameFileIdentity(before, beforeWrite)) throw new CompletionError(`Completion target changed before it was written: ${filePath}`);

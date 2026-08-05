@@ -319,8 +319,6 @@ export interface WorkflowRun {
 	readonly originalPrompt: string;
 	/** Pi session that most recently acquired or recovered orchestration ownership. */
 	readonly orchestratorSessionId?: string;
-	/** Explicit read-only audit profile. It is never inferred from implementation workers. */
-	readonly auditProfile?: PiLaunchProfile;
 	readonly phase: RunPhase;
 	readonly pauseReason?: "user" | "blocker" | "recovery";
 	readonly recoveryIssue?: RecoveryIssue;

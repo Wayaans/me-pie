@@ -41,7 +41,7 @@ A worker process exposes exactly one workflow tool:
 - `workflow_worker send` — send a question to Main; blocking sends keep the authenticated socket open until Main replies (use `workflow_delegate send` for the reply), with cancellation and a bounded timeout;
 - `workflow_worker submit` — send progress, blocker, failure, implementation, or audit reports.
 
-A blocking question first appears as a blocked worker event (`workflow_delegate wait --until blocked`); Main replies with `workflow_delegate send` without restarting the worker. Audit workers receive read/search tools plus a small inspection-only bash allow-list: package runners (`bun`, `npm`, `cargo`, etc.), shell composition, redirects, execution predicates, output flags, and write-capable Git commands are rejected both at activation and execution time. Implementation and fix workers retain normal Pi implementation tools.
+A blocking question first appears as a blocked worker event (`workflow_delegate wait --until blocked`); Main replies with `workflow_delegate send` without restarting the worker. Audit workers receive only structured read, search, and listing tools; raw shell execution is unavailable because shell expansion, PATH helpers, and command flags cannot provide a reliable read-only guarantee. Implementation and fix workers retain normal Pi implementation tools.
 
 ## Widget
 

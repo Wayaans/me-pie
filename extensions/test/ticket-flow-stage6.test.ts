@@ -11,7 +11,7 @@ import { ProtocolClient } from "../ticket-flow/protocol/client.ts";
 import { readWorkflowToken } from "../ticket-flow/protocol/runtime.ts";
 import { pathsForProject } from "../ticket-flow/paths.ts";
 import { loadRun, saveRun } from "../ticket-flow/state-store.ts";
-import { readReportAttempt, WorkerReportRuntime } from "../ticket-flow/worker/report.ts";
+import { readLatestReportAttempt, readReportAttempt, WorkerReportRuntime } from "../ticket-flow/worker/report.ts";
 
 const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const };
 function item(overrides: Partial<WorkItem> = {}): WorkItem {
@@ -187,9 +187,10 @@ test("revision feedback returns the same worker to running and preserves repeate
 	assert.equal(controller.activeRun?.progression?.reportAttempt, 1);
 	await new WorkerReportRuntime(client).submit({ ...report(), summary: "Done with evidence" }, client.authoritativeContext!);
 	await eventually(() => controller.activeRun?.plan.workItems[0]?.status === "report-review");
-	const inspection = JSON.parse(await Effect.runPromise(controller.inspectReport("one"))) as { latestAttempt: { attempt: number; report: WorkerReport } };
-	assert.equal(inspection.latestAttempt.attempt, 2);
-	assert.equal(inspection.latestAttempt.report.summary, "Done with evidence");
+	const latestAttempt = await Effect.runPromise(readLatestReportAttempt(resolved.paths, "one"));
+	assert.ok(latestAttempt);
+	assert.equal(latestAttempt.attempt, 2);
+	assert.equal(latestAttempt.report.summary, "Done with evidence");
 	assert.equal(controller.activeRun?.progression?.reportAttempt, 1);
 	const firstAttempt = await Effect.runPromise(readReportAttempt(resolved.paths, "one", 1));
 	assert.equal(firstAttempt.report.summary, "Done enough");

@@ -98,13 +98,18 @@ export class WorkerLifecycle {
 					onDelegate: (prompt) => pi.sendUserMessage(prompt, context.isIdle() ? undefined : { deliverAs: "followUp" }),
 					onFeedback: (message) => pi.sendUserMessage(message, context.isIdle() ? undefined : { deliverAs: "followUp" }),
 					onShutdown: () => context.shutdown(),
-				}).pipe(Effect.tap((client) => Effect.sync(() => {
-					this.contextRuntime = new WorkerContextRuntime(client);
-					this.reportRuntime = new WorkerReportRuntime(client);
-				})))
-				: Effect.void),
+				}).pipe(
+					Effect.flatMap((client) => Effect.tryPromise({
+						try: (signal) => client.waitForVerification(signal),
+						catch: (cause) => new WorkerLifecycleError({ message: cause instanceof Error ? cause.message : String(cause) }),
+					}).pipe(Effect.as(client))),
+					Effect.tap((client) => Effect.sync(() => {
+						this.contextRuntime = new WorkerContextRuntime(client);
+						this.reportRuntime = new WorkerReportRuntime(client);
+					})),
+				)
+				: Effect.sync(() => { this.started = true; })),
 			Effect.as(this),
-			Effect.tap(() => Effect.sync(() => { this.started = true; })),
 		);
 	}
 
@@ -156,7 +161,7 @@ export class WorkerLifecycle {
 		return this.waitForFeedback(waitSignal, remaining);
 	}
 
-	get isStarted(): boolean { return this.started; }
+	get isStarted(): boolean { return this.contextRuntime?.isActive ?? this.started; }
 	get isReleased(): boolean { return this.released; }
 }
 

@@ -6,9 +6,8 @@ import {
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import { Type, type Static } from "typebox";
-import type { AuthoritativeWorkerContext, WorkerFeedback, WorkerReport } from "../domain.ts";
-import { WORKER_TOOL_NAMES } from "../tool-names.ts";
+import { Type } from "typebox";
+import type { AuthoritativeWorkerContext, WorkerReport } from "../domain.ts";
 import type { WorkerLifecycle } from "./lifecycle.ts";
 import { renderWorkerCall, renderWorkerResult } from "./renderers.ts";
 
@@ -42,8 +41,6 @@ const AuditFindingParameters = StrictObject({
 	resolved: Type.Optional(Type.Boolean()),
 });
 
-/** The worker process has exactly one workflow tool. */
-export { WORKER_TOOL_NAMES } from "../tool-names.ts";
 export const WorkflowWorkerParameters = StrictObject({
 	action: StringEnum(["get", "send", "submit"] as const),
 	message: Type.Optional(Type.String()),
@@ -63,11 +60,8 @@ export const WorkflowWorkerParameters = StrictObject({
 	auditFindings: Type.Optional(Type.Array(AuditFindingParameters)),
 });
 
-export type WorkflowWorkerInput = Static<typeof WorkflowWorkerParameters>;
-
 export interface WorkerToolLifecycle {
 	readonly getContext: WorkerLifecycle["getContext"];
-	readonly waitForFeedback: WorkerLifecycle["waitForFeedback"];
 	readonly submitReport: WorkerLifecycle["submitReport"];
 	readonly sendQuestion: WorkerLifecycle["sendQuestion"];
 }

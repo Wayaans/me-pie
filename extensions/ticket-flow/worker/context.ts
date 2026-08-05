@@ -100,6 +100,8 @@ export function makeAuthoritativeWorkerContext(run: WorkflowRun, item: WorkItem,
 export class WorkerContextRuntime {
 	constructor(private readonly client: ProtocolClient) {}
 
+	get isActive(): boolean { return this.client.isVerified && !this.client.isStopped && this.client.authoritativeContext !== undefined; }
+
 	get(): AuthoritativeWorkerContext {
 		const context = this.client.authoritativeContext;
 		if (!context) throw new Error("Authoritative worker context is unavailable until authenticated delegation arrives.");

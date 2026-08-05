@@ -81,6 +81,11 @@ interface OwnershipRecord {
 	readonly workItemId: string;
 }
 
+async function removeLauncherRuntime(launcherPath: string): Promise<void> {
+	await rm(launcherPath, { force: true }).catch(() => undefined);
+	await rm(path.dirname(launcherPath), { recursive: true, force: true }).catch(() => undefined);
+}
+
 function effectTry<A>(operation: (signal: AbortSignal) => Promise<A>, mapError: (cause: unknown) => Error) {
 	return Effect.tryPromise({ try: operation, catch: mapError });
 }
@@ -259,10 +264,10 @@ export class TmuxController {
 				"new-window", "-d", "-P", "-F", WINDOW_FORMAT,
 				"-c", input.cwd, "-n", displayName, quotePosixArgument(launcherPath),
 			], "create worker window").pipe(
-				Effect.onError(() => effectTry(() => rm(launcherPath, { force: true }), () => new Error("launcher cleanup failed")).pipe(Effect.catch(() => Effect.void))),
+				Effect.onError(() => effectTry(() => removeLauncherRuntime(launcherPath), () => new Error("launcher cleanup failed")).pipe(Effect.catch(() => Effect.void))),
 			);
 			if (created.code !== 0) {
-				yield* effectTry(() => rm(launcherPath, { force: true }), () => new Error("launcher cleanup failed")).pipe(Effect.catch(() => Effect.void));
+				yield* effectTry(() => removeLauncherRuntime(launcherPath), () => new Error("launcher cleanup failed")).pipe(Effect.catch(() => Effect.void));
 				if (/can't find session|no server running/i.test(created.stderr)) {
 					return yield* Effect.fail(new VanishedTmuxSessionError({ sessionId: session.sessionId, message: created.stderr.trim() }));
 				}
@@ -271,7 +276,7 @@ export class TmuxController {
 			const parsed = parseCreatedWindow(created.stdout);
 			if (!parsed || parsed.serverSocketPath !== session.serverSocketPath || parsed.sessionId !== session.sessionId) {
 				yield* this.cleanupUnpersistedWindow(session, launcherPath);
-				yield* effectTry(() => rm(launcherPath, { force: true }), () => new Error("launcher cleanup failed")).pipe(Effect.catch(() => Effect.void));
+				yield* effectTry(() => removeLauncherRuntime(launcherPath), () => new Error("launcher cleanup failed")).pipe(Effect.catch(() => Effect.void));
 				return yield* Effect.fail(new UnexpectedTmuxOutputError({ operation: "create worker window", output: created.stdout }));
 			}
 			const handle: TmuxWindowHandle = {

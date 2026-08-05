@@ -46,82 +46,16 @@ function notifyError(ctx: ExtensionContext, error: unknown): void {
 	ctx.ui.notify(message, "error");
 }
 
-const AUDIT_TOOL_NAMES = new Set(["read", "grep", "find", "ls", "rg", "fd", "bash", "workflow_worker"]);
-
-/**
- * Audit bash is an inspection-only language, not a reduced implementation
- * shell.  In particular, package runners are intentionally not allowed:
- * even `bun test` can execute a project-controlled script.  Keep this
- * allow-list boring and reject anything that requires reasoning about shell
- * expansion or a command's future flags.
- */
-const AUDIT_INSPECTION_COMMANDS = new Set(["pwd", "ls", "find", "rg", "fd", "cat", "head", "tail", "file", "stat", "wc", "sort", "uniq", "diff", "git"]);
-const AUDIT_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "rev-parse", "ls-files", "ls-tree"]);
-const AUDIT_FORBIDDEN_TOKEN = /^(?:--?(?:output|exec|exec-path|delete|remove|write|add|force|prune|clean|apply|index-pack|upload-pack|receive-pack)(?:=.*)?|-exec(?:dir)?(?:=.*)?|-ok(?:dir)?(?:=.*)?|-f(?:print|printf|ls)(?:=.*)?|--pre(?:=.*)?|--external-diff(?:=.*)?|--textconv(?:=.*)?|--ext-diff(?:=.*)?|--no-index(?:=.*)?|--pathspec-from-file(?:=.*)?|--pathspec-file-nul(?:=.*)?)$/i;
-
-function auditShellWords(value: string): readonly string[] | undefined {
-	if (!value || /[;&|<>`$\\\n\r(){}]/.test(value)) return undefined;
-	const words: string[] = [];
-	let current = "";
-	let quote: "'" | '"' | undefined;
-	for (let index = 0; index < value.length; index += 1) {
-		const character = value[index]!;
-		if (quote !== undefined) {
-			if (character === quote) quote = undefined;
-			else current += character;
-			continue;
-		}
-		if (character === "'" || character === '"') {
-			quote = character;
-			continue;
-		}
-		if (/\s/.test(character)) {
-			if (current) { words.push(current); current = ""; }
-			continue;
-		}
-		current += character;
-	}
-	if (quote !== undefined) return undefined;
-	if (current) words.push(current);
-	return words.length > 0 ? words : undefined;
-}
-
-export function isAuditBashCommandAllowed(command: string): boolean {
-	const words = auditShellWords(command.trim());
-	if (!words) return false;
-	const executable = words[0]!;
-	if (!AUDIT_INSPECTION_COMMANDS.has(executable) || executable.includes("/")) return false;
-	const args = words.slice(1);
-	if (args.some((argument) => AUDIT_FORBIDDEN_TOKEN.test(argument) || /^(?:[;&|<>`$]|--output(?:=|$)|-o)/i.test(argument))) return false;
-	if (executable === "git") {
-		// Only harmless top-level switches may precede the subcommand.  Reject
-		// -C/--git-dir/--work-tree and -c because they change the inspection
-		// context or can write Git configuration through aliases.
-		let subcommandIndex = 0;
-		while (subcommandIndex < args.length && ["--no-pager", "--no-optional-locks"].includes(args[subcommandIndex]!)) subcommandIndex += 1;
-		const subcommand = args[subcommandIndex];
-		if (!subcommand || !AUDIT_GIT_SUBCOMMANDS.has(subcommand) || args.slice(0, subcommandIndex).some((arg) => arg.startsWith("-"))) return false;
-		if (args.slice(subcommandIndex + 1).some((arg) => /^(?:commit|checkout|switch|reset|restore|clean|add|rm|mv|push|fetch|pull|merge|rebase|config|--output(?:=|$)|-C$|--git-dir(?:=|$)|--work-tree(?:=|$)|-c$|-d$|-D$|-m$|-M$|-f$)/i.test(arg))) return false;
-		return true;
-	}
-	if (executable === "find") {
-		// find's -exec/-delete/-fprint family is rejected above; no other
-		// find expression can mutate the checkout.
-		return !args.some((arg) => /^(?:-exec|--exec|-delete|-ok|--delete|-fprint|-fprintf|-fls)$/i.test(arg));
-	}
-	// These programs are all direct inspection utilities.  Do not accept
-	// command names which are resolved through PATH aliases or project scripts.
-	return true;
-}
+// Audit workers receive only structured inspection tools. Raw shell strings
+// cannot be made read-only: command flags, PATH helpers, and shell expansion
+// can all turn an apparent inspection command into code execution or a write.
+const AUDIT_TOOL_NAMES = new Set(["read", "grep", "find", "ls", "rg", "fd", "workflow_worker"]);
 
 export function auditToolCallBlocked(event: { readonly toolName: string; readonly input?: unknown }): string | undefined {
 	if (["edit", "write", "delete", "remove", "move", "copy", "git", "git_commit", "shell", "terminal", "exec", "execute"].includes(event.toolName)) {
 		return "Audit workers are read-only and cannot mutate files or Git history.";
 	}
-	if (event.toolName === "bash") {
-		const command = (event.input as { readonly command?: unknown } | undefined)?.command;
-		if (typeof command !== "string" || !isAuditBashCommandAllowed(command)) return "Audit bash is restricted to read-only inspection and validation commands.";
-	}
+	if (event.toolName === "bash") return "Audit workers cannot execute raw shell commands; use structured read, search, and listing tools.";
 	return undefined;
 }
 
@@ -155,14 +89,17 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 				}
 				await Effect.runPromise(lifecycle.start(pi, ctx), { signal: ctx.signal });
 			} catch (error) {
+				// A worker that never reaches authenticated delegation must not retain
+				// implementation or workflow tools from its launch configuration.
+				pi.setActiveTools([]);
 				if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
 		});
 		pi.on("before_agent_start", (event) => ({ systemPrompt: appendWorkerSystemPrompt(event.systemPrompt) }));
 		pi.on("context", (event) => ({ messages: filterWorkflowToolContext(event.messages, "worker") }));
 		pi.on("tool_call", (event) => {
+			if (!lifecycle?.isStarted) return { block: true, reason: "Ticket Flow worker tools are inactive until authenticated delegation is ready." };
 			if (isWorkflowToolName(event.toolName) && !isWorkflowToolAllowed(event.toolName, "worker")) return { block: true, reason: "This workflow tool was retired and is unavailable in Ticket Flow workers." };
-			if (event.toolName === "workflow_worker" && !lifecycle?.isStarted) return { block: true, reason: "Ticket Flow worker is inactive until its authenticated connection is ready." };
 			if (lifecycle?.environment.kind === "audit") {
 				const reason = auditToolCallBlocked(event);
 				if (reason) return { block: true, reason };
@@ -189,10 +126,12 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	let widget: WorkflowTaskListWidget | undefined;
 	let widgetTui: { readonly requestRender: (force?: boolean) => void } | undefined;
 	let widgetInstalled = false;
-
 	let widgetVisible = false;
+	let widgetReloading = false;
+	let widgetLastReloadAt = 0;
 
-	function clearWidget(ctx?: ExtensionContext): void {
+	function disposeWidgetState(): void {
+		const context = widgetContext;
 		widgetVisible = false;
 		widgetRun = undefined;
 		widgetContext = undefined;
@@ -200,8 +139,14 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		widget = undefined;
 		widgetTui = undefined;
 		widgetInstalled = false;
+		widgetReloading = false;
 		if (widgetTimer) clearInterval(widgetTimer);
 		widgetTimer = undefined;
+		if (context?.hasUI) context.ui.setStatus("ticket-flow", undefined);
+	}
+
+	function clearWidget(ctx?: ExtensionContext): void {
+		disposeWidgetState();
 		if (ctx?.hasUI) {
 			if (typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, undefined);
 			ctx.ui.setStatus("ticket-flow", undefined);
@@ -234,7 +179,7 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 				return {
 					render: (width: number) => widget?.render(width, { theme }) ?? [],
 					invalidate: () => widget?.invalidate(),
-					dispose: () => { widgetTui = undefined; widgetInstalled = false; },
+					dispose: disposeWidgetState,
 				};
 			});
 		}
@@ -250,6 +195,24 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 				widget?.advance();
 				updateStatus(widgetContext, current);
 				widgetTui?.requestRender();
+				if (!controller.activeRun && !widgetReloading && Date.now() - widgetLastReloadAt >= 1_000) {
+					widgetReloading = true;
+					widgetLastReloadAt = Date.now();
+					const selectedRunId = current.id;
+					const context = widgetContext;
+					void Effect.runPromise(controller.discover(context.cwd, undefined, context.sessionManager.getSessionId()))
+						.then((discovery) => {
+							const refreshed = discovery.runs.find((candidate) => candidate.run.id === selectedRunId)?.run;
+							if (refreshed && widgetVisible) {
+								widgetRun = refreshed;
+								widget?.setRun(refreshed);
+								updateStatus(context, refreshed);
+								widgetTui?.requestRender();
+							}
+						})
+						.catch(() => undefined)
+						.finally(() => { widgetReloading = false; });
+				}
 			}, 160);
 			widgetTimer.unref?.();
 		}
@@ -320,9 +283,10 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 								if (ctx.hasUI) ctx.ui.notify(`Ticket Flow ${controller.activeRun.phase} · ${controller.activeRun.plan.workItems.length} item(s) · widget shown`, "info");
 							} else {
 								const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, ctx.sessionManager.getSessionId()), { signal: ctx.signal });
-								const found = discovery.runs[0]?.run;
+								const selected = await selectRecoverableRun(discovery, ctx, "status");
+								const found = selected?.run;
 								if (found) showWidget(ctx, found);
-								if (ctx.hasUI) ctx.ui.notify(found ? `Recoverable Ticket Flow ${found.phase} · ${found.id} · widget shown` : "No active Ticket Flow run.", found ? "info" : "warning");
+								if (ctx.hasUI) ctx.ui.notify(found ? `Recoverable Ticket Flow ${found.phase} · ${found.id} · widget shown` : discovery.runs.length === 0 ? "No active Ticket Flow run." : "Ticket Flow status selection was cancelled.", found ? "info" : "warning");
 							}
 							return;
 						}

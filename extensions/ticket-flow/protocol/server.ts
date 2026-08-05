@@ -3,6 +3,7 @@ import net, { type Socket } from "node:net";
 import path from "node:path";
 import { Effect, Fiber, Queue } from "effect";
 import type { PiLaunchProfile, WorkerIdentity } from "../domain.ts";
+import { PersistenceError } from "../errors.ts";
 import { encodeJsonLine, JsonLineFramer } from "./framing.ts";
 import { decodeWorkerConnected, makeMessage, toWorkflowEvent, type ProtocolEnvelope, type WorkflowProtocolEvent } from "./messages.ts";
 
@@ -28,6 +29,7 @@ const MAX_SEEN_INCOMING = 8_192;
 const MAX_FAILED_INCOMING = 1_024;
 const MAX_WAITERS = 256;
 const MAX_PENDING_COMMANDS = 256;
+const MAX_COMPLETED_COMMANDS = 4_096;
 
 /** Callback failures are transient delivery failures, not identity rejections. */
 class ProtocolPersistenceFailure extends Error {
@@ -48,7 +50,10 @@ function commandPayload(payload: Record<string, unknown>): payload is Record<str
 function requiresWorkerAcknowledgement(type: ProtocolEnvelope["type"]): boolean {
 	return type === "worker-progress" || type === "worker-report" || type === "worker-blocked" || type === "worker-failed";
 }
-function retriesAfterPersistenceFailure(event: WorkflowProtocolEvent): boolean {
+function isPersistenceFailure(cause: unknown): boolean {
+	return cause instanceof PersistenceError || (typeof cause === "object" && cause !== null && (cause as { readonly _tag?: unknown })._tag === "PersistenceError");
+}
+function reliableWorkerEvent(event: WorkflowProtocolEvent): boolean {
 	return event.type === "worker-progress" || event.type === "worker-report" || event.type === "worker-blocked" || event.type === "worker-failed";
 }
 
@@ -70,6 +75,7 @@ export class ProtocolServer {
 	/** Protects callback execution if receive paths ever overlap. */
 	private readonly processingIncoming = new Map<string, ProcessingMessage>();
 	private readonly pendingCommands = new Map<string, PendingCommand>();
+	private readonly completedCommands = new Map<string, PendingCommand>();
 	private handshakePendingSocket: Socket | undefined;
 	constructor(readonly options: ProtocolServerOptions) {}
 	get isVerified(): boolean { return this.verified; }
@@ -211,10 +217,10 @@ export class ProtocolServer {
 		try { await this.options.onEvent?.(event); }
 		catch (cause) {
 			const message = cause instanceof Error ? cause.message : String(cause);
-			// Report delivery failures are retriable. Handshake/ready failures
-			// retain the existing explicit rejection behavior for invalid workflow
-			// state or worker identity (for example a different Pi session).
-			if (retriesAfterPersistenceFailure(event)) throw new ProtocolPersistenceFailure(message);
+			// Durable write failures are transport-retriable for every event,
+			// including authentication and ready checkpoints. Validation and
+			// transition failures remain terminal workflow rejections.
+			if (isPersistenceFailure(cause) || reliableWorkerEvent(event)) throw new ProtocolPersistenceFailure(message);
 			throw new ProtocolServerError(message);
 		}
 		this.emit(event);
@@ -372,10 +378,10 @@ export class ProtocolServer {
 		if (type !== "delegate" && type !== "feedback" && type !== "shutdown") { this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, messageId)); return undefined; }
 		if (!commandPayload(payload) || typeof payload.requestId !== "string") throw new ProtocolServerError(`${type} requires a request ID`);
 		const requestId = payload.requestId;
-		const existing = this.pendingCommands.get(requestId);
+		const existing = this.pendingCommands.get(requestId) ?? this.completedCommands.get(requestId);
 		if (existing) {
 			if (existing.type !== type || JSON.stringify(existing.payload) !== JSON.stringify(payload)) throw new ProtocolServerError("Conflicting duplicate command request ID");
-			if (this.handshakePendingSocket === undefined) this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, existing.receipt.messageId));
+			if (!existing.acknowledged && this.handshakePendingSocket === undefined) this.write(makeMessage(this.options.runId, this.options.workItemId, type, payload, existing.receipt.messageId));
 			return existing.receipt;
 		}
 		if (this.pendingCommands.size >= MAX_PENDING_COMMANDS) throw new ProtocolServerError("Protocol command queue is full");
@@ -392,6 +398,7 @@ export class ProtocolServer {
 		}
 	}
 	private async acceptAcknowledgement(requestId: string): Promise<void> {
+		if (this.completedCommands.has(requestId)) return;
 		const command = this.pendingCommands.get(requestId);
 		if (!command) throw new ProtocolServerError("Acknowledgement does not match a pending command");
 		if (command.acknowledged) return;
@@ -408,8 +415,16 @@ export class ProtocolServer {
 			command.acknowledged = false;
 			throw new ProtocolPersistenceFailure(cause instanceof Error ? cause.message : String(cause));
 		}
+		this.pendingCommands.delete(requestId);
+		if (this.completedCommands.size >= MAX_COMPLETED_COMMANDS) {
+			const oldest = this.completedCommands.keys().next().value as string | undefined;
+			if (oldest !== undefined) this.completedCommands.delete(oldest);
+		}
+		this.completedCommands.set(requestId, command);
 	}
 	waitForAcknowledgement(requestId: string, signal?: AbortSignal): Promise<CommandReceipt> {
+		const completed = this.completedCommands.get(requestId);
+		if (completed) return Promise.resolve(completed.receipt);
 		const command = this.pendingCommands.get(requestId); if (!command) return Promise.reject(new ProtocolServerError("Unknown command request ID"));
 		if (command.acknowledged) return Promise.resolve(command.receipt);
 		return new Promise((resolve, reject) => {
@@ -434,6 +449,7 @@ export class ProtocolServer {
 				command.waiters.clear();
 			}
 			this.pendingCommands.clear();
+			this.completedCommands.clear();
 			this.processingIncoming.clear();
 			this.seenIncoming.clear();
 			this.failedIncoming.clear();

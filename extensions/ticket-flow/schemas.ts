@@ -228,7 +228,6 @@ export const WorkflowRunSchema = Schema.Struct({
 	projectPath: Schema.String,
 	originalPrompt: Schema.String,
 	orchestratorSessionId: Schema.optionalKey(Schema.String),
-	auditProfile: Schema.optionalKey(Schema.Struct({ model: Schema.String, thinking: ThinkingLevelSchema })),
 	phase: RunPhaseSchema,
 	pauseReason: Schema.optionalKey(Schema.Literals(["user", "blocker", "recovery"])),
 	recoveryIssue: Schema.optionalKey(Schema.Struct({ kind: Schema.String, message: Schema.String })),

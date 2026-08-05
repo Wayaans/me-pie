@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
-import { access, realpath } from "node:fs/promises";
+import { access, lstat, readFile, realpath } from "node:fs/promises";
 import { promisify } from "node:util";
 import { Effect } from "effect";
 import type { GitRunState } from "./domain.ts";
@@ -183,6 +184,23 @@ function assertOnlyExpectedChanges(entries: readonly GitStatusEntry[], expected:
 	}
 }
 
+async function completionPathSnapshot(cwd: string, paths: readonly string[]): Promise<string> {
+	const snapshot: Array<{ readonly path: string; readonly kind: "missing" | "file"; readonly mode?: number; readonly hash?: string }> = [];
+	for (const relative of paths) {
+		const absolute = path.join(cwd, relative);
+		try {
+			const metadata = await lstat(absolute);
+			if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`Completion path changed to an unsafe file type while staging: ${relative}`);
+			const content = await readFile(absolute);
+			snapshot.push({ path: relative, kind: "file", mode: metadata.mode, hash: createHash("sha256").update(content).digest("hex") });
+		} catch (cause) {
+			if ((cause as NodeJS.ErrnoException).code === "ENOENT") snapshot.push({ path: relative, kind: "missing" });
+			else throw cause;
+		}
+	}
+	return JSON.stringify(snapshot);
+}
+
 async function commitChangedPaths(cwd: string, runner: GitCommandRunner, signal?: AbortSignal): Promise<readonly string[]> {
 	const result = await runner.run(["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", "-z", "HEAD"], cwd, signal);
 	if (result.code !== 0) throw new Error(`git diff-tree failed: ${result.stderr.trim() || "unknown error"}`);
@@ -226,10 +244,8 @@ export async function commitCompletionMutation(input: CompletionCommitInput): Pr
 	const expectedParents = input.expectedParentCommitIds === undefined ? [] : await canonicalCommitIds(input.projectPath, input.expectedParentCommitIds, runner, input.signal);
 	const assertExpectedParent = async (head: string): Promise<void> => {
 		if (expectedParents.length === 0) return;
-		const parent = await command(runner, ["rev-parse", "--verify", `${head}^`], input.projectPath, input.signal);
-		for (const expected of expectedParents) {
-			if (!(await isAncestor(runner, expected, parent, input.projectPath, input.signal))) throw new Error("Completion commit is not immediately after the accepted worker history.");
-		}
+		const parent = await canonicalCommitId(input.projectPath, await command(runner, ["rev-parse", "--verify", `${head}^`], input.projectPath, input.signal), runner, input.signal);
+		if (!expectedParents.includes(parent)) throw new Error("Completion commit is not immediately after the exact reported worker branch tip.");
 	};
 	const initial = await gitStatusEntries(input.projectPath, runner, input.signal);
 	if (initial.length > 0) {
@@ -249,8 +265,16 @@ export async function commitCompletionMutation(input: CompletionCommitInput): Pr
 		return { commitId, paths: [...expected], alreadyCommitted: true };
 	}
 	if (initial.length === 0) return { paths: [...expected], alreadyCommitted: false };
-	const add = await runner.run(["add", "--", ...expected], input.projectPath, input.signal);
+	const expectedPaths = [...expected].sort();
+	if (expectedParents.length > 0) {
+		const parentHead = await canonicalCommitId(input.projectPath, await command(runner, ["rev-parse", "HEAD"], input.projectPath, input.signal), runner, input.signal);
+		if (!expectedParents.includes(parentHead)) throw new Error("Completion mutation is not based on the exact reported worker branch tip.");
+	}
+	const mutationSnapshot = await completionPathSnapshot(input.projectPath, expectedPaths);
+	const add = await runner.run(["add", "--", ...expectedPaths], input.projectPath, input.signal);
 	if (add.code !== 0) throw new Error(`git add completion paths failed: ${add.stderr.trim() || "unknown error"}`);
+	const stagedSnapshot = await completionPathSnapshot(input.projectPath, expectedPaths);
+	if (stagedSnapshot !== mutationSnapshot) throw new Error("Completion mutation content changed while staging; refusing to commit raced content.");
 	const staged = await gitStatusEntries(input.projectPath, runner, input.signal);
 	assertOnlyExpectedChanges(staged, expected, true);
 	const commit = await runner.run(["commit", "--no-verify", "--no-gpg-sign", "-m", message], input.projectPath, input.signal);
@@ -306,6 +330,7 @@ export async function validateAttemptCommitIds(
 	commitIds: readonly string[],
 	runner: GitCommandRunner = nodeGitRunner,
 	signal?: AbortSignal,
+	expectedCompletionSubject?: string,
 ): Promise<readonly string[]> {
 	if (!(await isGitRepository(cwd))) throw new Error("Git commit tracking requires a repository.");
 	if (new Set(commitIds).size !== commitIds.length) throw new Error("Reported commit IDs must be unique within the active attempt.");
@@ -320,6 +345,13 @@ export async function validateAttemptCommitIds(
 		if (!(await isAncestor(runner, baseline, commit, cwd, signal))) throw new Error(`Commit ${commit} is not a descendant of the run baseline.`);
 		if (!(await isAncestor(runner, attemptBase, commit, cwd, signal))) throw new Error(`Commit ${commit} was not introduced after the active implementation/fix attempt began.`);
 		if (!(await isAncestor(runner, commit, head, cwd, signal))) throw new Error(`Commit ${commit} is not reachable from the workflow branch current HEAD.`);
+	}
+	if (!canonical.includes(head)) {
+		if (!expectedCompletionSubject) throw new Error("Reported commits do not include the workflow branch current HEAD.");
+		const subject = await command(runner, ["log", "-1", "--format=%s", "HEAD"], cwd, signal);
+		if (subject !== expectedCompletionSubject) throw new Error("Workflow branch HEAD is neither a reported worker commit nor the expected completion commit.");
+		const parent = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "--verify", "HEAD^"], cwd, signal), runner, signal);
+		if (!canonical.includes(parent)) throw new Error("Expected completion commit is not immediately after the exact reported worker branch tip.");
 	}
 	return canonical;
 }
@@ -355,6 +387,7 @@ export async function validateAcceptedCommitIds(
 		if (!(await isAncestor(runner, attemptBase, commit, cwd, signal))) throw new Error(`Commit ${commit} was not introduced after the active implementation/fix attempt began.`);
 		if (!(await isAncestor(runner, commit, head, cwd, signal))) throw new Error(`Commit ${commit} is not reachable from the workflow branch current HEAD.`);
 	}
+	if (!canonical.includes(head)) throw new Error("Reported commits must include the workflow branch current HEAD as the exact accepted tip.");
 	return canonical;
 }
 
@@ -411,10 +444,6 @@ export function mergeAcceptedCommitIds(state: GitRunState, commitIds: readonly s
 	};
 }
 
-export function acceptedCommitRange(state: GitRunState | undefined): string {
-	if (!state || state.acceptedCommitIds.length === 0) return "(no accepted commits)";
-	return state.acceptedCommitIds.join(" ");
-}
 
 export function runGitPreflight(cwd: string, runId: string, runner?: GitCommandRunner, signal?: AbortSignal): Effect.Effect<GitPreflight | undefined, Error> {
 	return Effect.tryPromise({ try: () => gitPreflight(cwd, runId, runner, signal), catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)) });

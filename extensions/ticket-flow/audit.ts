@@ -11,7 +11,7 @@ import type {
 	WorkflowRun,
 	WorkItem,
 } from "./domain.ts";
-import { acceptedCommitRange, assertGitReadyForAudit, type GitCommandRunner } from "./git.ts";
+import { assertGitReadyForAudit, type GitCommandRunner } from "./git.ts";
 import type { PersistenceError, ValidationError } from "./errors.ts";
 import { transitionRun, validatePlan } from "./state-machine.ts";
 
@@ -25,25 +25,21 @@ export interface AuditPromptInput {
 	readonly specPath: string;
 }
 
-function substitute(template: string, marker: string, value: string): string {
-	return template.split(marker).join(value);
-}
-
 export function buildAuditPrompt(input: AuditPromptInput, template: string = AUDIT_PROMPT_TEMPLATE): string {
-	const values: readonly [string, string][] = [
+	const values = new Map<string, string>([
 		["{name feature}", input.featureName],
 		["{git id for all the commit when implementing}", input.acceptedCommitIds.join(" ")],
 		["{path to ticket}", input.ticketPath],
 		["{path to spec}", input.specPath],
-	];
-	return values.reduce((result, [marker, value]) => substitute(result, marker, value), template);
+	]);
+	return template.replace(/\{(?:name feature|git id for all the commit when implementing|path to ticket|path to spec)\}/g, (marker) => values.get(marker)!);
 }
 
 export function assertExactAuditPrompt(prompt: string, input: AuditPromptInput, template: string = AUDIT_PROMPT_TEMPLATE): void {
 	if (prompt !== buildAuditPrompt(input, template)) throw new Error("Audit prompt is not exactly the immutable Ticket Flow audit template substitution.");
 }
 
-export function auditProfile(profile: PiLaunchProfile | undefined): PiLaunchProfile {
+function auditProfile(profile: PiLaunchProfile | undefined): PiLaunchProfile {
 	if (!profile?.model || !profile.thinking) throw new Error("Audit requires an explicit model and thinking level; no fallback is permitted.");
 	return { model: profile.model, thinking: profile.thinking };
 }
@@ -83,17 +79,38 @@ export function validateAuditReport(report: WorkerReport, requirements: readonly
 	if (verdicts.some((verdict) => verdict.verdict === "fail") && auditReportFindings(report).length === 0) {
 		throw new Error("A failing audit verdict must include at least one finding.");
 	}
+	const findingIds = new Set<string>();
 	for (const finding of auditReportFindings(report)) {
 		if (!finding.id.trim() || !finding.finding.trim() || !finding.evidence.trim()) throw new Error("Audit findings require stable IDs, findings, and evidence.");
+		if (findingIds.has(finding.id)) throw new Error(`Duplicate audit finding ID: ${finding.id}`);
+		findingIds.add(finding.id);
 	}
 }
 
 export function auditEvidenceHash(findings: readonly AuditFinding[]): string {
-	return createHash("sha256").update(JSON.stringify(findings.map(({ id, evidence, finding }) => ({ id, evidence, finding })))).digest("hex");
+	const evidence = findings
+		.map(({ id, evidence, finding }) => ({ id, evidence, finding }))
+		.sort((left, right) => left.id.localeCompare(right.id) || left.finding.localeCompare(right.finding) || left.evidence.localeCompare(right.evidence));
+	return createHash("sha256").update(JSON.stringify(evidence)).digest("hex");
 }
 
-export function acceptedCommitsForAudit(state: AuditRunState, git: Parameters<typeof acceptedCommitRange>[0]): string {
-	return acceptedCommitRange(git);
+export function assertAuditWorkItemPrompt(run: WorkflowRun, item: WorkItem): void {
+	if (item.kind !== "audit" || !run.audit) throw new Error("Exact audit prompt validation requires an active generated audit item.");
+	if (run.audit.template !== AUDIT_PROMPT_TEMPLATE) throw new Error("Audit state does not contain the immutable Ticket Flow audit template.");
+	const roundNumber = Number(item.id.replace("audit-round-", ""));
+	const round = run.audit.rounds.find((candidate) => candidate.round === roundNumber);
+	if (!round || round.workerItemId !== item.id || round.status !== "pending") throw new Error("Audit item is not bound to one durable pending audit round.");
+	if (item.delegationPrompt !== round.prompt) throw new Error("Audit item prompt does not match its durable audit round.");
+	const currentAccepted = run.git?.acceptedCommitIds ?? [];
+	if (currentAccepted.length !== round.acceptedCommitIds.length || currentAccepted.some((commit, index) => commit !== round.acceptedCommitIds[index])) {
+		throw new Error("Audit round commit set does not match the current persisted accepted commit set.");
+	}
+	assertExactAuditPrompt(item.delegationPrompt, {
+		featureName: run.audit.featureName,
+		acceptedCommitIds: round.acceptedCommitIds,
+		ticketPath: run.audit.ticketPath,
+		specPath: run.audit.specPath,
+	}, run.audit.template);
 }
 
 function boundSummary(text: string, maxBytes: number): string {
@@ -184,7 +201,7 @@ export function reduceAuditRound(
 	const findings = [...auditReportFindings(report)];
 	const verdicts = [...auditReportVerdicts(report)];
 	const evidenceHash = auditEvidenceHash(findings);
-	const previous = run.audit.rounds.at(-1);
+	const previous = run.audit.rounds.filter((candidate) => candidate.round < roundNumber).at(-1);
 	const sameEvidence = previous?.status === "findings" && evidenceHash === auditEvidenceHash(previous.findings ?? []);
 	const occurrences = sameEvidence ? (run.audit.noProgress?.occurrences ?? 1) + 1 : 1;
 	const fixWorkItemId = findings.length > 0 ? `fix-round-${roundNumber}` : undefined;
@@ -277,7 +294,8 @@ function scheduleFreshAudit(run: WorkflowRun, dependencies: AuditProgressionDepe
 		if (run.plan.workItems.some((item) => item.id === `audit-round-${round}`)) return run;
 		const auditReady = yield* ensureAuditWorktree(run, "fresh-audit", dependencies);
 		if (auditReady.phase === "paused") return auditReady;
-		const prompt = buildAuditPrompt({ featureName: run.audit.featureName, acceptedCommitIds: run.git?.acceptedCommitIds ?? [], ticketPath: run.audit.ticketPath, specPath: run.audit.specPath });
+		const acceptedCommitIds = run.git?.acceptedCommitIds ?? [];
+		const prompt = buildAuditPrompt({ featureName: run.audit.featureName, acceptedCommitIds, ticketPath: run.audit.ticketPath, specPath: run.audit.specPath });
 		const item: WorkItem = {
 			...generatedAuditItem(run, round, run.audit.featureName, prompt, "A fresh read-only audit follows every accepted fix."),
 			sourcePaths,
@@ -286,7 +304,9 @@ function scheduleFreshAudit(run: WorkflowRun, dependencies: AuditProgressionDepe
 		};
 		const plan: WorkflowPlan = { ...run.plan, workItems: [...run.plan.workItems, item] };
 		yield* validatePlan(plan, { allowGeneratedItems: true });
-		const next: WorkflowRun = { ...run, phase: yield* transitionRun(run.phase, "auditing"), audit: { ...run.audit, activeRound: round }, plan, updatedAt: dependencies.now().toISOString() };
+		const createdAt = dependencies.now().toISOString();
+		const pendingRound: AuditRound = { round, workerItemId: item.id, prompt, acceptedCommitIds, status: "pending", createdAt };
+		const next: WorkflowRun = { ...run, phase: yield* transitionRun(run.phase, "auditing"), audit: { ...run.audit, activeRound: round, rounds: [...run.audit.rounds, pendingRound] }, plan, updatedAt: createdAt };
 		return yield* dependencies.persist(next, "audit-round-created", { workItemId: item.id, round, prompt });
 	});
 }
@@ -323,12 +343,15 @@ export function scheduleAuditAfterAcceptance(
 		const featureName = run.plan.summary.trim() || run.originalPrompt.trim();
 		const auditReady = yield* ensureAuditWorktree(run, "initial-audit", dependencies);
 		if (auditReady.phase === "paused") return auditReady;
-		const prompt = buildAuditPrompt({ featureName, acceptedCommitIds: run.git?.acceptedCommitIds ?? [], ticketPath, specPath });
-		const audit = createAuditState({ featureName, acceptedCommitIds: run.git?.acceptedCommitIds ?? [], ticketPath, specPath, profile: explicitAuditProfile });
+		const acceptedCommitIds = run.git?.acceptedCommitIds ?? [];
+		const prompt = buildAuditPrompt({ featureName, acceptedCommitIds, ticketPath, specPath });
+		const audit = createAuditState({ featureName, acceptedCommitIds, ticketPath, specPath, profile: explicitAuditProfile });
 		const item = generatedAuditItem(run, 1, featureName, prompt, "A fresh read-only zero-trust audit follows implementation acceptance.");
 		const plan: WorkflowPlan = { ...run.plan, workItems: [...run.plan.workItems, item] };
 		yield* validatePlan(plan, { allowGeneratedItems: true });
-		const next: WorkflowRun = { ...run, phase: yield* transitionRun(run.phase, "auditing"), audit: { ...audit, activeRound: 1 }, updatedAt: dependencies.now().toISOString(), plan };
+		const createdAt = dependencies.now().toISOString();
+		const pendingRound: AuditRound = { round: 1, workerItemId: item.id, prompt, acceptedCommitIds, status: "pending", createdAt };
+		const next: WorkflowRun = { ...run, phase: yield* transitionRun(run.phase, "auditing"), audit: { ...audit, activeRound: 1, rounds: [pendingRound] }, updatedAt: createdAt, plan };
 		return yield* dependencies.persist(next, "audit-created", { workItemId: item.id, prompt, template: AUDIT_PROMPT_TEMPLATE });
 	});
 }
