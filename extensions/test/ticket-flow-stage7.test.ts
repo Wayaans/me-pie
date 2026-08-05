@@ -13,7 +13,7 @@ import { saveRun } from "../ticket-flow/state-store.ts";
 import { ProtocolClient } from "../ticket-flow/protocol/client.ts";
 import { readWorkflowToken, workflowTokenPath } from "../ticket-flow/protocol/runtime.ts";
 import { reconcileRecovery } from "../ticket-flow/recovery.ts";
-import { resolveRecoveryIssue } from "../ticket-flow/orchestrator/lifecycle.ts";
+import { resolveRecoveryIssue, selectRecoverableRun } from "../ticket-flow/orchestrator/lifecycle.ts";
 import { WorkerReportRuntime } from "../ticket-flow/worker/report.ts";
 
 const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const };
@@ -25,6 +25,21 @@ async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) { if (Date.now() > deadline) throw new Error("Timed out waiting for condition"); await new Promise((resolve) => setTimeout(resolve, 10)); }
 }
+
+test("multiple unfinished runs require an explicit interactive selection", async () => {
+	const candidates = [
+		{ run: { id: "older", phase: "paused", updatedAt: "2026-01-01", activeWorkItemId: undefined }, paths: {}, lock: {} },
+		{ run: { id: "newer", phase: "paused", updatedAt: "2026-01-02", activeWorkItemId: "one" }, paths: {}, lock: {} },
+	];
+	let title = "";
+	const selected = await selectRecoverableRun({ runs: candidates, invalidRunIds: [] } as never, {
+		hasUI: true,
+		ui: { select: async (value: string, choices: readonly string[]) => { title = value; return choices[1]; } },
+	} as never, "stop");
+	assert.equal(selected?.run.id, "newer");
+	assert.equal(title, "Select Ticket Flow run to stop");
+	await assert.rejects(selectRecoverableRun({ runs: candidates, invalidRunIds: [] } as never, { hasUI: false } as never, "stop"), /interactive run selection/);
+});
 
 class FakeTmux {
 	created = 0;

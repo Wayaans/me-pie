@@ -4,7 +4,7 @@ import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowComman
 import { WorkflowController } from "./controller.ts";
 import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts";
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
-import { discoverOrchestratorRecovery, recoverWithConfirmation, confirmActiveWorkerStop, resolveRecoveryIssue } from "./orchestrator/lifecycle.ts";
+import { discoverOrchestratorRecovery, recoverWithConfirmation, confirmActiveWorkerStop, resolveRecoveryIssue, selectRecoverableRun } from "./orchestrator/lifecycle.ts";
 import { detectWorkflowRole, isTicketFlowInvocation } from "./role.ts";
 import type { WorkflowRun } from "./domain.ts";
 import { prepareWorkerLifecycle, type WorkerLifecycle } from "./worker/lifecycle.ts";
@@ -251,12 +251,11 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 	}
 
 
-	async function attachDiscoveredRun(ctx: ExtensionContext): Promise<WorkflowRun | undefined> {
+	async function attachDiscoveredRun(ctx: ExtensionContext, action: "pause" | "resume" | "stop"): Promise<WorkflowRun | undefined> {
 		if (controller.activeRun) return controller.activeRun;
 		const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, ctx.sessionManager.getSessionId()), { signal: ctx.signal });
-		if (discovery.runs.length === 0) return undefined;
-		if (discovery.runs.length > 1) throw new Error("Multiple unfinished Ticket Flow runs exist; resume requires an explicit run selection.");
-		const candidate = discovery.runs[0]!;
+		const candidate = await selectRecoverableRun(discovery, ctx, action);
+		if (!candidate) return undefined;
 		let allowAmbiguousTakeover = false;
 		if (candidate.lock.state === "ambiguous") {
 			if (!ctx.hasUI) throw new Error("Ambiguous Ticket Flow lock ownership requires interactive approval.");
@@ -311,19 +310,19 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 							return;
 						}
 						case "pause": {
-							const attached = await attachDiscoveredRun(ctx);
+							const attached = await attachDiscoveredRun(ctx, "pause");
 							if (!attached) throw new Error("No active Ticket Flow run.");
 							const run = attached.phase === "paused" ? attached : await Effect.runPromise(controller.pause(), { signal: ctx.signal });
 							showWidget(ctx, run); if (ctx.hasUI) ctx.ui.notify("Ticket Flow paused.", "info"); return;
 						}
 						case "resume": {
-							const attached = await attachDiscoveredRun(ctx);
+							const attached = await attachDiscoveredRun(ctx, "resume");
 							if (!attached) throw new Error("No recoverable Ticket Flow run exists for this project.");
 							const run = attached.phase === "paused" ? await Effect.runPromise(controller.resume(), { signal: ctx.signal }) : attached;
 							const resolved = await resolveRecoveryIssue(controller, run, ctx); showWidget(ctx, resolved); return;
 						}
 						case "stop": {
-							const attached = await attachDiscoveredRun(ctx);
+							const attached = await attachDiscoveredRun(ctx, "stop");
 							if (!attached) throw new Error("No active Ticket Flow run.");
 							if (!await confirmActiveWorkerStop(controller, ctx)) return;
 							const run = await Effect.runPromise(controller.stop(), { signal: ctx.signal }); clearWidget(ctx); if (ctx.hasUI) ctx.ui.notify(`Ticket Flow stopped (${run.id}).`, "info"); return;

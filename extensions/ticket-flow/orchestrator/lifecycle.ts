@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import type { WorkflowController } from "../controller.ts";
-import type { RecoveryDiscovery } from "../recovery.ts";
+import type { RecoverableRun, RecoveryDiscovery } from "../recovery.ts";
 
 export async function discoverOrchestratorRecovery(
 	controller: WorkflowController,
@@ -23,6 +23,25 @@ export async function discoverOrchestratorRecovery(
 		ctx.ui.notify("Ticket Flow ignored invalid persisted run state.", "warning");
 	}
 	return discovery;
+}
+
+function runChoiceLabel(candidate: RecoverableRun): string {
+	const active = candidate.run.activeWorkItemId === undefined ? "no active worker" : candidate.run.activeWorkItemId;
+	return `${candidate.run.id} · ${candidate.run.phase} · ${active} · ${candidate.run.updatedAt}`;
+}
+
+export async function selectRecoverableRun(
+	discovery: RecoveryDiscovery,
+	ctx: ExtensionContext,
+	action: "pause" | "resume" | "stop" | "recover",
+): Promise<RecoverableRun | undefined> {
+	if (discovery.runs.length === 0) return undefined;
+	if (discovery.runs.length === 1) return discovery.runs[0];
+	if (!ctx.hasUI) throw new Error(`Multiple unfinished Ticket Flow runs exist; ${action} requires interactive run selection.`);
+	const choices = discovery.runs.map(runChoiceLabel);
+	const selected = await ctx.ui.select(`Select Ticket Flow run to ${action}`, choices);
+	if (selected === undefined) return undefined;
+	return discovery.runs[choices.indexOf(selected)];
 }
 
 export async function confirmActiveWorkerStop(controller: WorkflowController, ctx: ExtensionContext): Promise<boolean> {
@@ -52,9 +71,8 @@ export async function resolveRecoveryIssue(controller: WorkflowController, run: 
 export async function recoverWithConfirmation(controller: WorkflowController, ctx: ExtensionContext) {
 	const sessionId = ctx.sessionManager.getSessionId();
 	const discovery = await Effect.runPromise(controller.discover(ctx.cwd, undefined, sessionId), { signal: ctx.signal });
-	if (discovery.runs.length === 0) throw new Error("No recoverable Ticket Flow run exists for this project.");
-	if (discovery.runs.length > 1) throw new Error("Multiple unfinished Ticket Flow runs exist; resolve the conflict with /ticket-flow.");
-	const candidate = discovery.runs[0]!;
+	const candidate = await selectRecoverableRun(discovery, ctx, "recover");
+	if (!candidate) throw new Error(discovery.runs.length === 0 ? "No recoverable Ticket Flow run exists for this project." : "Ticket Flow recovery was cancelled.");
 	let allowAmbiguousTakeover = false;
 	if (candidate.lock.state === "ambiguous") {
 		if (!ctx.hasUI) throw new Error("Ambiguous Ticket Flow lock ownership requires interactive approval.");
