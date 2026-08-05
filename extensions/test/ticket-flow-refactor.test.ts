@@ -11,6 +11,7 @@ import { parseTicketFlowCommand } from "../ticket-flow/command.ts";
 import { applyCompletionStrategy } from "../ticket-flow/completion.ts";
 import { WorkflowDelegateParameters, WorkflowPlanParameters, registerOrchestratorTools } from "../ticket-flow/orchestrator/tools.ts";
 import { WORKER_TOOL_NAMES, WorkflowWorkerParameters } from "../ticket-flow/worker/tools.ts";
+import { filterWorkflowToolContext, toolsForWorkflowRole, withoutWorkflowTools } from "../ticket-flow/tool-names.ts";
 import { renderWorkflowWidget } from "../ticket-flow/widget.ts";
 
 function project(): string { return fs.mkdtempSync(path.join(os.tmpdir(), "ticket-flow-refactor-")); }
@@ -29,10 +30,25 @@ test("public command and tool surfaces are explicit and strict", () => {
 	assert.equal(Check(WorkflowPlanParameters, { action: "finalize" }), false);
 	for (const action of ["start", "wait", "send", "accept", "revise", "close"]) assert.equal(Check(WorkflowDelegateParameters, { action }), true);
 	for (const action of ["get", "send", "submit"]) assert.equal(Check(WorkflowWorkerParameters, { action }), true);
+	assert.equal(Check(WorkflowWorkerParameters, { action: "send", message: "progress", blocking: false }), false);
 	assert.deepEqual(WORKER_TOOL_NAMES, ["workflow_worker"]);
 	const names: string[] = [];
 	registerOrchestratorTools({ registerTool: (definition: { readonly name: string }) => names.push(definition.name) } as never, { activeRun: run } as never);
 	assert.deepEqual(names, ["workflow_plan", "workflow_delegate"]);
+});
+
+test("retired workflow surfaces are removed from tools and resumed context", () => {
+	assert.deepEqual(withoutWorkflowTools(["read", "workflow_obsolete", "bash"]), ["read", "bash"]);
+	assert.deepEqual(toolsForWorkflowRole(["read", "workflow_obsolete"], "orchestrator"), ["read", "workflow_plan", "workflow_delegate"]);
+	const messages = [
+		{ role: "assistant", content: [{ type: "text", text: "keep" }, { type: "toolCall", name: "workflow_obsolete" }] },
+		{ role: "toolResult", toolName: "workflow_obsolete", content: [] },
+		{ role: "toolResult", toolName: "workflow_plan", content: [] },
+	];
+	assert.deepEqual(filterWorkflowToolContext(messages, "orchestrator"), [
+		{ role: "assistant", content: [{ type: "text", text: "keep" }] },
+		{ role: "toolResult", toolName: "workflow_plan", content: [] },
+	]);
 });
 
 test("audit round reducer links findings and ignores at-least-once duplicates", () => {

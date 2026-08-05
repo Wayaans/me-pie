@@ -25,8 +25,8 @@ import {
 	validateWorkerReport,
 	WorkerReportRuntime,
 } from "../ticket-flow/worker/report.ts";
-import { WorkflowContextParameters, WorkflowSubmitReportParameters, boundWorkerToolOutput, registerWorkerTools } from "../ticket-flow/worker/tools.ts";
-import { workflowContextLabel, workflowReportLabel } from "../ticket-flow/worker/renderers.ts";
+import { WorkflowWorkerParameters, boundWorkerToolOutput, registerWorkerTools } from "../ticket-flow/worker/tools.ts";
+import { workflowReportLabel, workflowWorkerLabel } from "../ticket-flow/worker/renderers.ts";
 
 const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const };
 const identity: WorkerIdentity = { runId: "run-stage5", workItemId: "worker-tools", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high", sessionId: "session-5" };
@@ -100,13 +100,14 @@ async function eventually(predicate: () => boolean, timeoutMs = 1_000): Promise<
 	}
 }
 
-test("worker tool schemas are strict and render compact labels", () => {
-	assert.equal(Check(WorkflowContextParameters, { action: "get" }), true);
-	assert.equal(Check(WorkflowContextParameters, { action: "wait-for-feedback", timeoutMs: 10 }), true);
-	assert.equal(Check(WorkflowContextParameters, { action: "get", extra: true }), false);
-	assert.equal(Check(WorkflowSubmitReportParameters, completedReport()), true);
-	assert.equal(Check(WorkflowSubmitReportParameters, { status: "unknown", summary: "no" }), false);
-	assert.equal(workflowContextLabel("get"), "workflow-worker · get");
+test("worker tool schema is strict and renders compact labels", () => {
+	assert.equal(Check(WorkflowWorkerParameters, { action: "get" }), true);
+	assert.equal(Check(WorkflowWorkerParameters, { action: "get", extra: true }), false);
+	assert.equal(Check(WorkflowWorkerParameters, { action: "send", message: "Which API?", timeoutMs: 10 }), true);
+	assert.equal(Check(WorkflowWorkerParameters, { action: "send", message: "FYI", blocking: false }), false, "worker questions are always blocking; progress uses submit");
+	assert.equal(Check(WorkflowWorkerParameters, { action: "submit", ...completedReport() }), true);
+	assert.equal(Check(WorkflowWorkerParameters, { action: "submit", status: "unknown", summary: "no" }), false);
+	assert.equal(workflowWorkerLabel("get"), "workflow-worker · get");
 	assert.equal(workflowReportLabel("progress"), "workflow-worker · submit · progress");
 	assert.equal(workflowReportLabel("completed", 2, 2), "workflow-worker · submit · completed · 2/2 requirements");
 });
@@ -331,6 +332,7 @@ test("transport failures are thrown by workflow_worker submit", async () => {
 	registerWorkerTools({ registerTool: (definition: CapturedTool) => tools.set(definition.name, definition) } as unknown as ExtensionAPI, () => ({
 		getContext: () => context(),
 		waitForFeedback: () => Promise.resolve({ type: "accepted" }),
+		sendQuestion: () => Promise.resolve({ type: "accepted" }),
 		submitReport: async () => { calls.push("submit"); throw new Error("native transport unavailable"); },
 	}));
 	await assert.rejects(tools.get("workflow_worker")!.execute("id", { action: "submit", status: "progress", summary: "working" }), /native transport unavailable/);

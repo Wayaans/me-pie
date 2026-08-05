@@ -8,6 +8,7 @@ import {
 import { Effect } from "effect";
 import { Type, type Static } from "typebox";
 import type { AuthoritativeWorkerContext, WorkerFeedback, WorkerReport } from "../domain.ts";
+import { WORKER_TOOL_NAMES } from "../tool-names.ts";
 import type { WorkerLifecycle } from "./lifecycle.ts";
 import { renderWorkerCall, renderWorkerResult } from "./renderers.ts";
 
@@ -42,12 +43,11 @@ const AuditFindingParameters = StrictObject({
 });
 
 /** The worker process has exactly one workflow tool. */
-export const WORKER_TOOL_NAMES = ["workflow_worker"] as const;
+export { WORKER_TOOL_NAMES } from "../tool-names.ts";
 export const WorkflowWorkerParameters = StrictObject({
 	action: StringEnum(["get", "send", "submit"] as const),
 	message: Type.Optional(Type.String()),
 	questions: Type.Optional(Type.Array(Type.String())),
-	blocking: Type.Optional(Type.Boolean()),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
 	status: Type.Optional(StringEnum(["progress", "completed", "blocked", "failed"] as const)),
 	summary: Type.Optional(Type.String()),
@@ -64,15 +64,12 @@ export const WorkflowWorkerParameters = StrictObject({
 });
 
 export type WorkflowWorkerInput = Static<typeof WorkflowWorkerParameters>;
-/** Legacy schemas are exported for decoding old session entries; only workflow_worker is registered. */
-export const WorkflowContextParameters = StrictObject({ action: StringEnum(["get", "wait-for-feedback"] as const), timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })) });
-export const WorkflowSubmitReportParameters = StrictObject({ status: StringEnum(["progress", "completed", "blocked", "failed"] as const), summary: Type.String(), requirements: Type.Optional(Type.Array(RequirementResultParameters)), filesChanged: Type.Optional(Type.Array(Type.String())), filesChangedExplanation: Type.Optional(Type.String()), checks: Type.Optional(Type.Array(CheckResultParameters)), caveats: Type.Optional(Type.Array(Type.String())), blockers: Type.Optional(Type.Array(Type.String())), questions: Type.Optional(Type.Array(Type.String())), userInterventionRequired: Type.Optional(Type.Boolean()) });
 
 export interface WorkerToolLifecycle {
 	readonly getContext: WorkerLifecycle["getContext"];
 	readonly waitForFeedback: WorkerLifecycle["waitForFeedback"];
 	readonly submitReport: WorkerLifecycle["submitReport"];
-	readonly sendQuestion?: WorkerLifecycle["sendQuestion"];
+	readonly sendQuestion: WorkerLifecycle["sendQuestion"];
 }
 
 function lifecycleOrThrow(getLifecycle: () => WorkerToolLifecycle | undefined): WorkerToolLifecycle {
@@ -117,17 +114,13 @@ export function registerWorkerTools(pi: ExtensionAPI, getLifecycle: () => Worker
 					return { content: [{ type: "text" as const, text: boundWorkerToolOutput(JSON.stringify(context)) }], details: { context } as { readonly context: AuthoritativeWorkerContext } };
 				}
 				case "send": {
-					if (params.status !== undefined || params.summary !== undefined || params.requirements !== undefined || params.timeoutMs !== undefined && params.blocking === false) throw new Error("workflow_worker send accepts a question message, questions, and optional blocking flag.");
+					if (params.status !== undefined || params.summary !== undefined || params.requirements !== undefined || params.filesChanged !== undefined || params.filesChangedExplanation !== undefined || params.checks !== undefined || params.caveats !== undefined || params.blockers !== undefined || params.userInterventionRequired !== undefined || params.commitIds !== undefined || params.auditVerdicts !== undefined || params.auditFindings !== undefined) {
+						throw new Error("workflow_worker send accepts only a question message, optional questions, and timeoutMs.");
+					}
 					const message = params.message?.trim();
 					if (!message) throw new Error("workflow_worker send requires a non-empty message.");
 					const questions = params.questions ?? [message];
-					if (params.blocking === false) {
-						await lifecycle.submitReport({ status: "blocked", summary: message, blockers: [message], questions, userInterventionRequired: false }, signal);
-						return { content: [{ type: "text" as const, text: "Question sent to Main; worker remains connected." }], details: { question: message, questions, blocking: false } };
-					}
-					const feedback = lifecycle.sendQuestion
-						? await lifecycle.sendQuestion(message, questions, signal, params.timeoutMs)
-						: await lifecycle.waitForFeedback(signal, params.timeoutMs);
+					const feedback = await lifecycle.sendQuestion(message, questions, signal, params.timeoutMs);
 					const text = `Main feedback received: ${feedback.type === "feedback" ? feedback.message : feedback.type}`;
 					return { content: [{ type: "text" as const, text: boundWorkerToolOutput(text) }], details: { question: message, questions, feedback } };
 				}

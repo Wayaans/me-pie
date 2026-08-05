@@ -31,8 +31,7 @@ import { discoverUnfinishedRuns, reconcileRecovery, type RecoveryDiscovery, type
 import { advanceAuditAfterAcceptance as advanceAuditProgression, auditProfile, scheduleAuditAfterAcceptance, type AuditProgressionDependencies } from "./audit.ts";
 import { gitHead, gitPreflight, gitStateFromPreflight, type GitCommandRunner } from "./git.ts";
 import { questionIdFor, reconcilePlanningQuestions } from "./planning.ts";
-
-export const WORKFLOW_TOOL_NAMES = ["workflow_plan", "workflow_delegate"] as const;
+import { toolsForWorkflowRole, withoutWorkflowTools } from "./tool-names.ts";
 
 const READ_ONLY_TOOL_NAMES = new Set([
 	"read", "grep", "find", "ls", "rg", "fd", "find_docs", "github_get", "github_comments",
@@ -79,10 +78,6 @@ interface ActiveRun {
 	protocol?: ProtocolServer;
 }
 
-function unique(values: readonly string[]): string[] {
-	return [...new Set(values)];
-}
-
 function sameToolSet(left: readonly string[], right: readonly string[]): boolean {
 	return left.length === right.length && left.every((name) => right.includes(name));
 }
@@ -101,10 +96,7 @@ function nonEmptyText(value: string | undefined, field: string): string {
 }
 
 export function restrictedToolList(previous: readonly string[]): string[] {
-	return unique([
-		...previous.filter((name) => READ_ONLY_TOOL_NAMES.has(name)),
-		...WORKFLOW_TOOL_NAMES,
-	]);
+	return toolsForWorkflowRole(previous.filter((name) => READ_ONLY_TOOL_NAMES.has(name)), "orchestrator");
 }
 
 export function restoreToolsConservatively(
@@ -112,9 +104,11 @@ export function restoreToolsConservatively(
 	previous: readonly string[],
 	restricted: readonly string[],
 ): boolean {
+	const safePrevious = withoutWorkflowTools(previous);
+	const expectedRestricted = toolsForWorkflowRole(restricted, "orchestrator");
 	const current = pi.getActiveTools();
-	if (!sameToolSet(current, restricted)) return false;
-	pi.setActiveTools([...previous]);
+	if (!sameToolSet(current, expectedRestricted)) return false;
+	pi.setActiveTools(safePrevious);
 	return true;
 }
 
@@ -314,7 +308,7 @@ export class WorkflowController {
 					runId,
 					input.sessionId === undefined ? {} : { sessionId: input.sessionId },
 				)).pipe(Effect.mapError((error) => new Error(`Could not acquire the Ticket Flow project lock: ${errorMessage(error)}`)));
-				const previousActiveTools = this.pi.getActiveTools();
+				const previousActiveTools = withoutWorkflowTools(this.pi.getActiveTools());
 				const restrictedActiveTools = restrictedToolList(previousActiveTools);
 				const git = yield* Effect.tryPromise({
 					try: (signal) => gitPreflight(input.cwd, runId, this.gitRunner, signal),
@@ -1112,7 +1106,7 @@ export class WorkflowController {
 					...(input.allowAmbiguousTakeover === undefined ? {} : { allowAmbiguousTakeover: input.allowAmbiguousTakeover }),
 				}));
 				const loaded = yield* loadRun(candidate.paths);
-				const previousActiveTools = this.pi.getActiveTools();
+				const previousActiveTools = withoutWorkflowTools(this.pi.getActiveTools());
 				const restrictedActiveTools = restrictedToolList(previousActiveTools);
 				const recoveredRun: WorkflowRun = {
 					...loaded,

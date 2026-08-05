@@ -7,10 +7,6 @@ export function workflowWorkerLabel(action: "get" | "send" | "submit"): string {
 	return `workflow-worker · ${action}`;
 }
 
-export function workflowContextLabel(action: "get" | "wait-for-feedback"): string {
-	return `workflow-worker · ${action === "wait-for-feedback" ? "wait" : action}`;
-}
-
 export function workflowReportLabel(status: WorkerReport["status"], matchedRequirements?: number, plannedRequirements?: number): string {
 	const requirements = status === "completed" && matchedRequirements !== undefined && plannedRequirements !== undefined
 		? ` · ${matchedRequirements}/${plannedRequirements} requirements`
@@ -50,16 +46,4 @@ export function renderWorkerResult(
 	if (typeof question === "string") return new Text(theme.fg("success", `✓ question sent: ${compactText(question, 56)}`), 0, 0);
 	if (details?.context) return new Text(theme.fg("success", "✓ context received"), 0, 0);
 	return new Text(theme.fg("success", "✓ workflow-worker"), 0, 0);
-}
-
-// Compatibility aliases used by older consumers; the worker process still
-// registers only workflow_worker.
-export function renderContextCall(args: { readonly action: "get" | "wait-for-feedback" }, theme: Theme): Text {
-	return new Text(theme.fg("toolTitle", theme.bold(workflowContextLabel(args.action))), 0, 0);
-}
-export function renderReportCall(args: WorkerReport, theme: Theme): Text {
-	return new Text(theme.fg("toolTitle", theme.bold(workflowReportLabel(args.status))), 0, 0);
-}
-export function renderReportResult(result: { readonly details?: { readonly report?: WorkerReport; readonly validation?: ReportValidationResult } }, theme: Theme): Text {
-	return renderWorkerResult(result, {}, theme);
 }

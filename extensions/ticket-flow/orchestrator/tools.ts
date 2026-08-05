@@ -6,6 +6,7 @@ import type { PlanChange, WorkflowPlan, WorkflowRun } from "../domain.ts";
 import { formatFinalSummary } from "../audit.ts";
 import { THINKING_LEVELS, WORK_ITEM_STATUSES } from "../domain.ts";
 import type { WorkflowController } from "../controller.ts";
+import { ORCHESTRATOR_TOOL_NAMES } from "../tool-names.ts";
 import { renderDelegateCall, renderDelegateResult, renderPlanCall, renderPlanResult } from "./renderers.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) => Type.Object(properties, { additionalProperties: false });
@@ -58,7 +59,7 @@ export const WorkflowDelegateParameters = StrictObject({
 	comment: Type.Optional(Type.String()),
 	feedback: Type.Optional(Type.String()),
 	missingRequirements: Type.Optional(Type.Array(Type.String())),
-	until: Type.Optional(StringEnum(["connected", "ready", "progress", "report", "blocked", "exit", "any"] as const)),
+	until: Type.Optional(StringEnum(["progress", "report", "blocked", "exit", "any"] as const)),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
 	force: Type.Optional(Type.Boolean()),
 });
@@ -66,19 +67,7 @@ export const WorkflowDelegateParameters = StrictObject({
 export type WorkflowPlanInput = Static<typeof WorkflowPlanParameters>;
 export type WorkflowDelegateInput = Static<typeof WorkflowDelegateParameters>;
 
-/** Legacy schemas remain exported for migration of stored sessions, but are not registered. */
-export const WorkflowWorkerParameters = StrictObject({
-	action: StringEnum(["delegate", "wait", "read", "send", "close"] as const),
-	workItemId: Type.String(), message: Type.Optional(Type.String()), until: Type.Optional(StringEnum(["connected", "ready", "progress", "report", "blocked", "idle", "exit", "any"] as const)), timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })), lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_000 })),
-});
-export const WorkflowReviewReportParameters = StrictObject({
-	action: StringEnum(["inspect", "accept", "revise", "block"] as const), workItemId: Type.String(), comment: Type.Optional(Type.String()), feedback: Type.Optional(Type.String()), missingRequirements: Type.Optional(Type.Array(Type.String())), questions: Type.Optional(Type.Array(Type.String())), answers: Type.Optional(Type.Array(Type.String())),
-});
-export const WorkflowControlParameters = StrictObject({ action: StringEnum(["status", "pause", "resume", "stop", "recover"] as const) });
-
-export const ORCHESTRATOR_TOOL_NAMES = ["workflow_plan", "workflow_delegate"] as const;
-/** Compatibility name for code that only needs the active orchestrator surface. */
-export const WORKFLOW_TOOL_NAMES = ORCHESTRATOR_TOOL_NAMES;
+export { ORCHESTRATOR_TOOL_NAMES } from "../tool-names.ts";
 
 function result(text: string, run?: WorkflowRun, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text }], details: run === undefined ? details : { ...details, run } };

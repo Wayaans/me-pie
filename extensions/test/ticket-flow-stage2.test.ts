@@ -17,10 +17,8 @@ import type { WorkflowPlan, WorkItem } from "../ticket-flow/domain.ts";
 import ticketFlow from "../ticket-flow/index.ts";
 import { appendOrchestratorSystemPrompt, ORCHESTRATOR_SYSTEM_PROMPT } from "../ticket-flow/orchestrator/system-prompt.ts";
 import {
-	WorkflowControlParameters,
 	WorkflowDelegateParameters,
 	WorkflowPlanParameters,
-	WorkflowReviewReportParameters,
 	registerOrchestratorTools,
 } from "../ticket-flow/orchestrator/tools.ts";
 import { detectWorkflowRole } from "../ticket-flow/role.ts";
@@ -165,11 +163,7 @@ test("workflow tool schemas are strict and expose every legal action", () => {
 	for (const action of ["start", "wait", "send", "accept", "revise", "close"]) {
 		assert.equal(Check(WorkflowDelegateParameters, { action, workItemId: "domain" }), true);
 	}
-	assert.equal(Check(WorkflowReviewReportParameters, { action: "accept", workItemId: "domain" }), true, "legacy report schema remains decodable but is not registered");
-	for (const action of ["status", "pause", "resume", "stop"]) {
-		assert.equal(Check(WorkflowControlParameters, { action }), true);
-	}
-	assert.equal(Check(WorkflowControlParameters, { action: "status", extra: true }), false);
+	assert.equal(Check(WorkflowDelegateParameters, { action: "wait", workItemId: "domain", until: "connected" }), false, "connection and readiness are internal to atomic start");
 	assert.equal(Check(WorkflowDelegateParameters, { action: "spawn", workItemId: "domain" }), false);
 });
 

@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { assertCommandPrerequisites, ORCHESTRATOR_KICKOFF, parseTicketFlowCommand, RECOVERY_KICKOFF } from "./command.ts";
-import { WorkflowController, WORKFLOW_TOOL_NAMES } from "./controller.ts";
+import { WorkflowController } from "./controller.ts";
 import { appendOrchestratorSystemPrompt } from "./orchestrator/system-prompt.ts";
 import { registerOrchestratorTools } from "./orchestrator/tools.ts";
 import { discoverOrchestratorRecovery, recoverWithConfirmation, confirmActiveWorkerStop, resolveRecoveryIssue } from "./orchestrator/lifecycle.ts";
@@ -10,6 +10,7 @@ import type { WorkflowRun } from "./domain.ts";
 import { prepareWorkerLifecycle, type WorkerLifecycle } from "./worker/lifecycle.ts";
 import { registerWorkerTools } from "./worker/tools.ts";
 import { TmuxController } from "./tmux/controller.ts";
+import { filterWorkflowToolContext, isWorkflowToolAllowed, isWorkflowToolName, toolsForWorkflowRole, withoutWorkflowTools } from "./tool-names.ts";
 import { WORKFLOW_WIDGET_KEY, WorkflowTaskListWidget, renderWorkflowWidget } from "./widget.ts";
 
 export const WORKER_SYSTEM_PROMPT = `## Ticket Flow worker role
@@ -125,8 +126,8 @@ export function auditToolCallBlocked(event: { readonly toolName: string; readonl
 }
 
 export function workerActiveToolNames(previous: readonly string[], kind: "implementation" | "audit" | "fix"): string[] {
-	if (kind === "audit") return [...AUDIT_TOOL_NAMES];
-	return [...new Set([...previous, "workflow_worker"])];
+	if (kind === "audit") return toolsForWorkflowRole([...AUDIT_TOOL_NAMES], "worker");
+	return toolsForWorkflowRole(previous, "worker");
 }
 
 export interface TicketFlowExtensionOptions {
@@ -158,7 +159,9 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 			}
 		});
 		pi.on("before_agent_start", (event) => ({ systemPrompt: appendWorkerSystemPrompt(event.systemPrompt) }));
+		pi.on("context", (event) => ({ messages: filterWorkflowToolContext(event.messages, "worker") }));
 		pi.on("tool_call", (event) => {
+			if (isWorkflowToolName(event.toolName) && !isWorkflowToolAllowed(event.toolName, "worker")) return { block: true, reason: "This workflow tool was retired and is unavailable in Ticket Flow workers." };
 			if (event.toolName === "workflow_worker" && !lifecycle?.isStarted) return { block: true, reason: "Ticket Flow worker is inactive until its authenticated connection is ready." };
 			if (lifecycle?.environment.kind === "audit") {
 				const reason = auditToolCallBlocked(event);
@@ -274,13 +277,15 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		try {
 			const discovery = await discoverOrchestratorRecovery(controller, ctx);
 			if (controller.activeRun) {
-				pi.setActiveTools([...new Set([...pi.getActiveTools(), ...WORKFLOW_TOOL_NAMES])]);
+				pi.setActiveTools(toolsForWorkflowRole(pi.getActiveTools(), "orchestrator"));
 				showWidget(ctx, controller.activeRun);
 			}
-			else if (discovery.runs[0]) showWidget(ctx, discovery.runs[0].run);
-			else {
+			else if (discovery.runs[0]) {
+				pi.setActiveTools(withoutWorkflowTools(pi.getActiveTools()));
+				showWidget(ctx, discovery.runs[0].run);
+			} else {
 				// Registered workflow tools remain inactive until a run owns them.
-				pi.setActiveTools(pi.getActiveTools().filter((name) => !WORKFLOW_TOOL_NAMES.includes(name as (typeof WORKFLOW_TOOL_NAMES)[number])));
+				pi.setActiveTools(withoutWorkflowTools(pi.getActiveTools()));
 				clearWidget(ctx);
 			}
 		} catch (error) { notifyError(ctx, error); }
@@ -350,8 +355,13 @@ export default function ticketFlow(pi: ExtensionAPI, options: TicketFlowExtensio
 		return { systemPrompt: appendOrchestratorSystemPrompt(event.systemPrompt) };
 	});
 
+	pi.on("context", (event) => ({ messages: filterWorkflowToolContext(event.messages, "orchestrator") }));
+
 	pi.on("tool_call", (event) => {
-		if (WORKFLOW_TOOL_NAMES.includes(event.toolName as (typeof WORKFLOW_TOOL_NAMES)[number]) && !controller.activeRun) {
+		if (isWorkflowToolName(event.toolName) && !isWorkflowToolAllowed(event.toolName, "orchestrator")) {
+			return { block: true, reason: "This workflow tool was retired. Use workflow_plan, workflow_delegate, or /ticket-flow controls." };
+		}
+		if (isWorkflowToolName(event.toolName) && !controller.activeRun) {
 			return { block: true, reason: "Ticket Flow workflow tools are inactive outside an active owned run." };
 		}
 	});

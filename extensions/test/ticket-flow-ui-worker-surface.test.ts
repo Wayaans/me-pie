@@ -7,7 +7,7 @@ const profile = { model: "openai-codex/gpt-5.6-sol", thinking: "high" as const }
 
 test("worker activation preserves implementation tools and restricts audit tools", () => {
 	const normal = workerActiveToolNames(["read", "bash", "edit", "write", "workflow_plan"], "fix");
-	assert.deepEqual(normal, ["read", "bash", "edit", "write", "workflow_plan", "workflow_worker"]);
+	assert.deepEqual(normal, ["read", "bash", "edit", "write", "workflow_worker"]);
 	const audit = workerActiveToolNames(["read", "bash", "edit", "write", "rg", "workflow_plan"], "audit");
 	assert.deepEqual(audit, ["read", "grep", "find", "ls", "rg", "fd", "bash", "workflow_worker"]);
 	assert.equal(auditToolCallBlocked({ toolName: "edit", input: {} }) !== undefined, true);
