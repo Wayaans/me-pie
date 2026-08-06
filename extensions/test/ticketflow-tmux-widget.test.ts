@@ -123,10 +123,60 @@ function widgetRun(): TicketflowRun {
 	};
 }
 
-test("Ticket Flow widget never exceeds the requested terminal width, including tiny and Unicode widths", () => {
+test("Ticket Flow widget is visual, animated, and never exceeds the terminal width", () => {
 	const run = widgetRun();
 	for (let width = 0; width <= 120; width += 1) {
 		for (const line of renderTicketflowWidget(run, width)) assert.ok(visibleWidth(line) <= width, `width ${width}: ${JSON.stringify(line)}`);
 	}
-	assert.match(footerStatus(run), /^ticketflow · implementation 1\/2$/);
+
+	const firstFrame = renderTicketflowWidget(run, 100, { frame: 0 }).join("\n");
+	const nextFrame = renderTicketflowWidget(run, 100, { frame: 1 }).join("\n");
+	assert.match(firstFrame, /TICKET FLOW  RUNNING/);
+	assert.match(firstFrame, /◆ Implementation  ·  Ticket 1 of 2/);
+	assert.match(firstFrame, /Worker running · turn 1/);
+	assert.match(firstFrame, /✓ 2-completed\.md/);
+	assert.notEqual(firstFrame, nextFrame, "the running indicator should advance between frames");
+	assert.equal(footerStatus(run), "ticketflow · running · implementation 1/2");
+});
+
+test("Ticket Flow widget clearly distinguishes paused and pausing workflows", () => {
+	const running = widgetRun();
+	const { assignment: _assignment, worker: _worker, ...inactive } = running;
+	const paused: TicketflowRun = {
+		...inactive,
+		phase: "paused",
+		pause: { previousPhase: "implementation", reason: "user", message: "Ticket Flow is paused.", afterCurrentWorker: false },
+	};
+	const pausing: TicketflowRun = {
+		...running,
+		phase: "paused",
+		pause: { previousPhase: "implementation", reason: "user", message: "Pausing after current worker.", afterCurrentWorker: true },
+	};
+
+	assert.match(renderTicketflowWidget(paused, 100).join("\n"), /⏸ TICKET FLOW  PAUSED/);
+	assert.match(renderTicketflowWidget(paused, 100).join("\n"), /\/ticketflow resume/);
+	assert.equal(footerStatus(paused), "ticketflow · paused · implementation 1/2");
+	assert.match(renderTicketflowWidget(pausing, 100).join("\n"), /TICKET FLOW  PAUSING/);
+	assert.equal(footerStatus(pausing), "ticketflow · pausing · implementation 1/2");
+
+	const settled: TicketflowRun = { ...pausing, assignment: { ...pausing.assignment!, stage: "settled" } };
+	assert.match(renderTicketflowWidget(settled, 100).join("\n"), /TICKET FLOW  PAUSED/);
+	assert.equal(footerStatus(settled), "ticketflow · paused · implementation 1/2");
+});
+
+test("Ticket Flow widget removes terminal controls from persisted labels", () => {
+	const run = widgetRun();
+	const unsafe: TicketflowRun = {
+		...run,
+		setup: {
+			...run.setup,
+			workerProfile: { ...run.setup.workerProfile, model: "provider/model\u001b]0;owned\u0007" },
+		},
+		tickets: run.tickets.map((ticket, index) => index === 0
+			? { ...ticket, name: "unsafe\nname\u001b[31m-red\u001b[0m" }
+			: ticket),
+	};
+	const lines = renderTicketflowWidget(unsafe, 100);
+	for (const line of lines) assert.doesNotMatch(line, /[\n\r\u001b]/);
+	assert.match(lines.join("\n"), /unsafename-red/);
 });

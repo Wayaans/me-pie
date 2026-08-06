@@ -23,7 +23,7 @@ import {
 	renderTicketflowResult,
 	runWithTicketflowProgress,
 } from "./tool-ui.ts";
-import { footerStatus, renderTicketflowWidget, TICKETFLOW_WIDGET_KEY } from "./widget.ts";
+import { createTicketflowWidget, footerStatus, renderTicketflowWidget, TICKETFLOW_WIDGET_KEY } from "./widget.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) => Type.Object(properties, { additionalProperties: false });
 const WorkerId = Type.String({ minLength: 1 });
@@ -83,12 +83,10 @@ function showWidget(ctx: ExtensionContext, run: TicketflowRun | undefined): void
 		return;
 	}
 	if (ctx.mode === "tui") {
-		ctx.ui.setWidget(TICKETFLOW_WIDGET_KEY, () => ({
-			render: (width: number) => renderTicketflowWidget(run, width),
-			invalidate: () => undefined,
-		}));
+		ctx.ui.setWidget(TICKETFLOW_WIDGET_KEY, (tui, theme) => createTicketflowWidget(run, tui, theme));
 	} else ctx.ui.setWidget(TICKETFLOW_WIDGET_KEY, renderTicketflowWidget(run, 100));
-	ctx.ui.setStatus(TICKETFLOW_WIDGET_KEY, footerStatus(run));
+	const statusTone = run.phase === "paused" ? "warning" : run.phase === "failed" ? "error" : "accent";
+	ctx.ui.setStatus(TICKETFLOW_WIDGET_KEY, ctx.ui.theme.fg(statusTone, footerStatus(run)));
 }
 
 function notifyError(ctx: ExtensionContext, cause: unknown): void {
