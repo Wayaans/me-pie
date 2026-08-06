@@ -151,10 +151,12 @@ export default function mepieUi(pi: ExtensionAPI): void {
 				render(width: number) {
 					const directory = theme.fg("text", formatDirectory(ctx.cwd));
 					const fileLabel = gitInfo.changedFiles === 1 ? "file" : "files";
-					let git = gitInfo.branch
-						? theme.fg("text", sanitizeTerminalLabel(gitInfo.branch)) +
-							theme.fg("muted", ` · ${gitInfo.changedFiles} ${fileLabel} changed`)
-						: "";
+					let git = !gitInfo.isRepository
+						? theme.fg("muted", "No Git repository detected")
+						: gitInfo.branch
+							? theme.fg("text", sanitizeTerminalLabel(gitInfo.branch)) +
+								theme.fg("muted", ` · ${gitInfo.changedFiles} ${fileLabel} changed`)
+							: "";
 					if (gitInfo.pullRequest) {
 						const prLabel = `PR #${gitInfo.pullRequest.number}`;
 						const linkedPr = getCapabilities().hyperlinks
