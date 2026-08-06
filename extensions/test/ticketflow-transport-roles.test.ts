@@ -149,6 +149,8 @@ test("ticketflow_report returns terminate only after Main durably acknowledges t
 	try {
 		await pair.server.send({ command: "task", message: "exact task", turn: 1, requestId: "task-1" }, AbortSignal.timeout(2_000));
 		const tool = pair.pi.registered.find((candidate) => candidate.name === "ticketflow_report")!;
+		assert.equal(typeof (tool as { readonly renderCall?: unknown }).renderCall, "function");
+		assert.equal(typeof (tool as { readonly renderResult?: unknown }).renderResult, "function");
 		let completed = false;
 		const execution = Promise.resolve(tool.execute!("report-call", { status: "failed", summary: "failed safely" }, new AbortController().signal, undefined, workerContext())).then((result) => { completed = true; return result; });
 		await eventually(() => callbackStarted);

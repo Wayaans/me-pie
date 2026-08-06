@@ -47,7 +47,7 @@ export function validateAuditReport(report: WorkerReport, acceptedCommitIds: rea
 	}
 	const requirements = new Set<string>();
 	for (const verdict of report.verdicts) {
-		if (!verdict.requirement.trim() || !verdict.evidence.trim() || !hasFileLevelEvidence(verdict.evidence)) throw new Error("Audit verdicts require requirement text and path:line file-level evidence.");
+		if (!verdict.requirement.trim() || !verdict.evidence.trim() || !hasFileLevelEvidence(verdict.evidence)) throw new Error("Audit verdicts require requirement text and path:line file-level evidence. Send the same Worker a follow-up with instructions to submit a replacement audit report, then wait and close again.");
 		if (requirements.has(verdict.requirement)) throw new Error(`Duplicate audit verdict: ${verdict.requirement}`);
 		requirements.add(verdict.requirement);
 	}

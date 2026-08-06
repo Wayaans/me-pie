@@ -54,9 +54,13 @@ export function markDelivery(run: TicketflowRun, input: { readonly requestId: st
 	if (input.delivery === "task" && (assignment.turn !== 0 || assignment.stage !== "ready")) throw failure("The initial task may be sent exactly once to a ready assignment.");
 	if (input.delivery !== "task" && assignment.turn === 0) throw failure("The initial task must be sent before follow-up work.");
 	if (input.delivery === "steer" && (assignment.stage !== "running" || run.report !== undefined)) throw failure("Steering is allowed only during an active unreported worker turn.");
-	const reportedFollowUp = assignment.stage === "settled" && (run.report?.status === "blocked" || run.report?.status === "failed");
+	const reportedFollowUp = assignment.stage === "settled" && (
+		run.report?.status === "blocked"
+		|| run.report?.status === "failed"
+		|| (assignment.kind === "audit" && run.report?.status === "audit")
+	);
 	const resumedInterruptedFollowUp = assignment.stage === "ready" && assignment.turn > 0 && run.report === undefined;
-	if (input.delivery === "follow-up" && !reportedFollowUp && !resumedInterruptedFollowUp) throw failure("Follow-up is allowed only after a durable blocked/failed report, or an explicitly resumed interrupted turn.");
+	if (input.delivery === "follow-up" && !reportedFollowUp && !resumedInterruptedFollowUp) throw failure("Follow-up is allowed only after a durable blocked/failed report, a settled audit report, or an explicitly resumed interrupted turn.");
 	const turn = assignment.turn + 1;
 	const { lastSettledAt: _lastSettledAt, lastSettledTurn: _lastSettledTurn, ...unsettledWorker } = run.worker;
 	return revised(run, {

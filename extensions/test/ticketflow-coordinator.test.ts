@@ -38,6 +38,7 @@ class FakeWorkerBackend implements WorkerBackend {
 	readonly bridges = new Map<string, WorkerChannel>();
 	readonly sentMessages: string[] = [];
 	readonly handles = new Map<string, SerializedWorkerHandle>();
+	readonly turns = new Map<string, number>();
 	readonly ticketPath: string;
 	auditCommitIds: string[] = [];
 	auditReports: WorkerReport[] = [];
@@ -60,26 +61,28 @@ class FakeWorkerBackend implements WorkerBackend {
 			on: (name: string, callback: (event: any, ctx: any) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
 			sendUserMessage: async (message: string) => {
 				this.sentMessages.push(message);
+				const turn = (this.turns.get(input.assignmentId) ?? 0) + 1;
+				this.turns.set(input.assignmentId, turn);
 				if (input.kind === "implementation") {
 					await writeFile(this.ticketPath, "# Core\n\n- [x] Implement the core\n");
 					await writeFile(path.join(input.cwd, "core.ts"), `export const sequence = ${++this.commitSequence};\n`);
 					await git(input.cwd, "add", ".");
 					await git(input.cwd, "commit", "-m", "implement core");
 					const head = await git(input.cwd, "rev-parse", "HEAD");
-					bridge.submitReport({ status: "completed", summary: "implemented", commitIds: [head] }, 1);
-					bridge.notifySettled(1);
+					bridge.submitReport({ status: "completed", summary: "implemented", commitIds: [head] }, turn);
+					bridge.notifySettled(turn);
 				} else if (input.kind === "audit") {
 					bridge.submitReport(this.auditReports.shift() ?? {
 						status: "audit", summary: "clean audit", verdicts: [{ requirement: "Implement the core", verdict: "pass", evidence: "core.ts:1" }], findings: [], auditedCommitIds: [...this.auditCommitIds],
-					}, 1);
-					bridge.notifySettled(1);
+					}, turn);
+					bridge.notifySettled(turn);
 				} else if (input.kind === "fix") {
 					await writeFile(path.join(input.cwd, "core.ts"), `export const sequence = ${++this.commitSequence};\n`);
 					await git(input.cwd, "add", ".");
 					await git(input.cwd, "commit", "-m", "fix audit finding");
 					const head = await git(input.cwd, "rev-parse", "HEAD");
-					bridge.submitReport({ status: "completed", summary: "fixed", commitIds: [head] }, 1);
-					bridge.notifySettled(1);
+					bridge.submitReport({ status: "completed", summary: "fixed", commitIds: [head] }, turn);
+					bridge.notifySettled(turn);
 				}
 			},
 		};
@@ -195,6 +198,46 @@ test("audit findings always create a fixer and a fresh audit before clean comple
 	assert.equal(run.phase, "completed");
 	assert.equal(run.auditRounds.length, 2);
 	assert.deepEqual(run.auditRounds.map((round) => round.status), ["findings", "clean"]);
+	await Effect.runPromise(coordinator.shutdown());
+});
+
+test("a rejected audit report can be replaced by a follow-up turn from the same Worker", async () => {
+	const project = await repository();
+	const agentDir = await temp("ticketflow-coordinator-audit-recovery-agent-");
+	const prepared = await prepareSetup({ projectPath: project, ticketsDirectory: "tickets", referencePaths: [], workerProfile: profile, delegationTemplate: "Implement {ticketPath}" });
+	const backend = new FakeWorkerBackend(prepared.tickets[0]!.path);
+	let sequence = 0;
+	const coordinator = new TicketflowCoordinator({ backend, agentDir, newId: () => `audit-recovery-id-${++sequence}` });
+	await Effect.runPromise(coordinator.createRun({ projectPath: project, orchestratorSessionId: "main-session", setup: prepared.setup, tickets: prepared.tickets }));
+	const implementation = await Effect.runPromise(coordinator.delegate());
+	await Effect.runPromise(coordinator.send({ workerId: implementation.workerId, delivery: "task", message: implementation.initialTask }));
+	await Effect.runPromise(coordinator.wait(implementation.workerId));
+	const auditRun = await Effect.runPromise(coordinator.close(implementation.workerId));
+	backend.auditCommitIds = [...auditRun.git.acceptedCommitIds];
+	backend.auditReports.push(
+		{
+			status: "audit", summary: "structurally inadequate", auditedCommitIds: [...backend.auditCommitIds],
+			verdicts: [{ requirement: "Implement the core", verdict: "pass", evidence: "core.ts" }], findings: [],
+		},
+		{
+			status: "audit", summary: "corrected", auditedCommitIds: [...backend.auditCommitIds],
+			verdicts: [{ requirement: "Implement the core", verdict: "pass", evidence: "core.ts:1" }], findings: [],
+		},
+	);
+	const auditor = await Effect.runPromise(coordinator.delegate());
+	await Effect.runPromise(coordinator.send({ workerId: auditor.workerId, delivery: "task", message: auditor.initialTask }));
+	await Effect.runPromise(coordinator.wait(auditor.workerId));
+	await assert.rejects(Effect.runPromise(coordinator.close(auditor.workerId)), /path:line file-level evidence/);
+
+	await Effect.runPromise(coordinator.send({
+		workerId: auditor.workerId,
+		delivery: "follow-up",
+		message: "Replace the audit report with requirement text and path:line evidence for every verdict.",
+	}));
+	const corrected = await Effect.runPromise(coordinator.wait(auditor.workerId));
+	assert.equal(corrected.turn, 2);
+	assert.equal(corrected.report?.status, "audit");
+	assert.equal((await Effect.runPromise(coordinator.close(auditor.workerId))).phase, "completed");
 	await Effect.runPromise(coordinator.shutdown());
 });
 

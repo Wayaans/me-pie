@@ -3,7 +3,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-wo
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Effect } from "effect";
 import { Type } from "typebox";
-import { TicketflowCoordinator } from "./coordinator.ts";
+import { TicketflowCoordinator, type DelegateResult, type WaitResult } from "./coordinator.ts";
 import { assertTmuxSetupContext, parseTicketflowCommand, runSetupWizard, ticketflowArgumentCompletions } from "./command.ts";
 import { assertNoLegacyRun, discoverRuns } from "./store.ts";
 import type { AssignmentKind, ThinkingLevel, TicketflowRun } from "./model.ts";
@@ -16,6 +16,13 @@ import {
 	MAIN_TICKETFLOW_TOOLS,
 	withoutTicketflowTools,
 } from "./tool-names.ts";
+import {
+	formatElapsed,
+	formatWaitResultMarkdown,
+	renderTicketflowCall,
+	renderTicketflowResult,
+	runWithTicketflowProgress,
+} from "./tool-ui.ts";
 import { footerStatus, renderTicketflowWidget, TICKETFLOW_WIDGET_KEY } from "./widget.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) => Type.Object(properties, { additionalProperties: false });
@@ -26,7 +33,8 @@ You coordinate one visible, strictly sequential Ticket Flow run. Do not implemen
 - Use ticketflow_delegate to open only the durable next assignment.
 - Copy the returned initialTask byte-for-byte into ticketflow_send delivery=task. Never prefix or suffix it.
 - Use ticketflow_wait until the worker reaches agent_settled. A report and settlement are separate facts.
-- A blocked report is one settled turn: obtain an answer, send a follow-up, then wait again.
+- A blocked report is one settled turn: obtain an answer, send it as a follow-up, then wait again.
+- If ticketflow_close rejects an audit report, send correction instructions as a follow-up to the same Worker, wait for its replacement report, then close again.
 - A failed or unreported turn never completes an assignment.
 - Use ticketflow_close only after a completed implementation/fix report or audit report. Close is the only cursor-advancing operation.
 - Use ticketflow_resume to reopen the exact persisted Pi session. It never resends old work.
@@ -94,26 +102,48 @@ export function registerMainTools(pi: ExtensionAPI, coordinator: TicketflowCoord
 		description: "Spawn the next durable Ticket Flow assignment in one owned tmux window. Does not send work.",
 		parameters: StrictObject({}),
 		executionMode: "sequential",
-		async execute(_id, _params, signal, _onUpdate, ctx) {
-			const result = await runEffect(coordinator.delegate(), signal);
+		async execute(_id, _params, signal, onUpdate, ctx) {
+			const { value: result, elapsedMs } = await runWithTicketflowProgress("Opening Worker", onUpdate, () => runEffect(coordinator.delegate(), signal));
 			showWidget(ctx, coordinator.activeRun);
-			return textResult(`Worker ${result.workerId} is ready (${result.assignmentKind}). Send this exact initial task with ticketflow_send:\n\n${result.initialTask}`, { result, runId: coordinator.activeRun?.id, revision: coordinator.activeRun?.revision, phase: coordinator.activeRun?.phase });
+			return textResult(`Worker ${result.workerId} is ready (${result.assignmentKind}). Send this exact initial task with ticketflow_send:\n\n${result.initialTask}`, { result, elapsedMs, runId: coordinator.activeRun?.id, revision: coordinator.activeRun?.revision, phase: coordinator.activeRun?.phase });
+		},
+		renderCall(_args, theme) {
+			return renderTicketflowCall("◆", "Delegate", undefined, theme);
+		},
+		renderResult(result, options, theme, context) {
+			const details = result.details as { readonly result?: DelegateResult } | undefined;
+			const delegated = details?.result;
+			return renderTicketflowResult(result, options, theme, context, {
+				label: "Worker ready",
+				...(delegated ? { meta: `${delegated.assignmentKind} · ${delegated.workerId}` } : {}),
+			});
 		},
 	});
 	pi.registerTool({
 		name: "ticketflow_send",
 		label: "Ticket Flow send",
-		description: "Send the exact initial task, steering, answer, or follow-up to the active Worker.",
+		description: "Send the exact initial task, active-turn steering, or a follow-up (including answers and audit corrections) to the active Worker.",
 		parameters: StrictObject({
 			workerId: WorkerId,
 			delivery: StringEnum(["task", "steer", "follow-up"] as const),
 			message: Type.String({ minLength: 1 }),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const run = await runEffect(coordinator.send(params), signal);
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const { value: run, elapsedMs } = await runWithTicketflowProgress("Delivering", onUpdate, () => runEffect(coordinator.send(params), signal));
 			showWidget(ctx, run);
-			return textResult(`Delivered ${params.delivery} to ${params.workerId}; turn ${run.assignment?.turn}.`, { runId: run.id, revision: run.revision, phase: run.phase, turn: run.assignment?.turn });
+			return textResult(`Delivered ${params.delivery} to ${params.workerId}; turn ${run.assignment?.turn}.`, { elapsedMs, runId: run.id, revision: run.revision, phase: run.phase, turn: run.assignment?.turn });
+		},
+		renderCall(args, theme) {
+			return renderTicketflowCall("→", "Send", `${args.delivery} · ${args.workerId}`, theme);
+		},
+		renderResult(result, options, theme, context) {
+			const details = result.details as { readonly turn?: number } | undefined;
+			return renderTicketflowResult(result, options, theme, context, {
+				label: "Delivered",
+				...(details?.turn ? { meta: `turn ${details.turn}` } : {}),
+				markdown: context.args.message,
+			});
 		},
 	});
 	pi.registerTool({
@@ -122,10 +152,26 @@ export function registerMainTools(pi: ExtensionAPI, coordinator: TicketflowCoord
 		description: "Wait specifically for the active Worker agent_settled event and return its latest durable report. Cancelling only stops this wait.",
 		parameters: StrictObject({ workerId: WorkerId }),
 		executionMode: "sequential",
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const result = await runEffect(coordinator.wait(params.workerId), signal);
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const { value: result, elapsedMs } = await runWithTicketflowProgress("Waiting", onUpdate, () => runEffect(coordinator.wait(params.workerId), signal));
 			showWidget(ctx, coordinator.activeRun);
-			return textResult(JSON.stringify(result, null, 2), { result, runId: coordinator.activeRun?.id, revision: coordinator.activeRun?.revision, phase: coordinator.activeRun?.phase });
+			return textResult(formatWaitResultMarkdown(result), { result, elapsedMs, runId: coordinator.activeRun?.id, revision: coordinator.activeRun?.revision, phase: coordinator.activeRun?.phase });
+		},
+		renderCall(args, theme) {
+			return renderTicketflowCall("◷", "Wait", args.workerId, theme);
+		},
+		renderResult(result, options, theme, context) {
+			const details = result.details as { readonly result?: WaitResult; readonly elapsedMs?: number } | undefined;
+			const waited = details?.result;
+			const meta = waited
+				? `turn ${waited.turn} · ${waited.status} · ${formatElapsed(details?.elapsedMs ?? 0)}`
+				: undefined;
+			return renderTicketflowResult(result, options, theme, context, {
+				label: "Settled",
+				...(meta ? { meta } : {}),
+				...(waited ? { markdown: formatWaitResultMarkdown(waited) } : {}),
+				...(waited?.status === "unreported" ? { tone: "warning" as const } : {}),
+			});
 		},
 	});
 	pi.registerTool({
@@ -134,10 +180,17 @@ export function registerMainTools(pi: ExtensionAPI, coordinator: TicketflowCoord
 		description: "Verify the completion gate, advance the durable cursor, and close only the verified owned Worker.",
 		parameters: StrictObject({ workerId: WorkerId }),
 		executionMode: "sequential",
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const run = await runEffect(coordinator.close(params.workerId), signal);
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const { value: run, elapsedMs } = await runWithTicketflowProgress("Verifying", onUpdate, () => runEffect(coordinator.close(params.workerId), signal));
 			showWidget(ctx, run);
-			return textResult(`Closed ${params.workerId}; Ticket Flow is now ${run.phase}.`, { runId: run.id, revision: run.revision, phase: run.phase });
+			return textResult(`Closed ${params.workerId}; Ticket Flow is now ${run.phase}.`, { elapsedMs, runId: run.id, revision: run.revision, phase: run.phase });
+		},
+		renderCall(args, theme) {
+			return renderTicketflowCall("◇", "Close", args.workerId, theme);
+		},
+		renderResult(result, options, theme, context) {
+			const details = result.details as { readonly phase?: string } | undefined;
+			return renderTicketflowResult(result, options, theme, context, { label: "Closed", ...(details?.phase ? { meta: details.phase } : {}) });
 		},
 	});
 	pi.registerTool({
@@ -146,10 +199,16 @@ export function registerMainTools(pi: ExtensionAPI, coordinator: TicketflowCoord
 		description: "Reopen and verify the exact persisted Pi Worker session. Never resends the old task.",
 		parameters: StrictObject({ workerId: WorkerId }),
 		executionMode: "sequential",
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const result = await runEffect(coordinator.resumeWorker(params.workerId), signal);
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const { value: result, elapsedMs } = await runWithTicketflowProgress("Reopening", onUpdate, () => runEffect(coordinator.resumeWorker(params.workerId), signal));
 			showWidget(ctx, coordinator.activeRun);
-			return textResult(`Reopened exact Pi session ${result.sessionId}; send new follow-up work explicitly.`, { workerId: result.workerId, sessionId: result.sessionId, sessionFile: result.sessionFile, runId: coordinator.activeRun?.id, revision: coordinator.activeRun?.revision });
+			return textResult(`Reopened exact Pi session ${result.sessionId}; send new follow-up work explicitly.`, { elapsedMs, workerId: result.workerId, sessionId: result.sessionId, sessionFile: result.sessionFile, runId: coordinator.activeRun?.id, revision: coordinator.activeRun?.revision });
+		},
+		renderCall(args, theme) {
+			return renderTicketflowCall("↻", "Resume", args.workerId, theme);
+		},
+		renderResult(result, options, theme, context) {
+			return renderTicketflowResult(result, options, theme, context, { label: "Worker reopened" });
 		},
 	});
 	pi.registerTool({
@@ -158,10 +217,16 @@ export function registerMainTools(pi: ExtensionAPI, coordinator: TicketflowCoord
 		description: "Abort only the current Worker turn, wait for settlement, and preserve the Pi session for resume.",
 		parameters: StrictObject({ workerId: WorkerId }),
 		executionMode: "sequential",
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const run = await runEffect(coordinator.abort(params.workerId), signal);
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const { value: run, elapsedMs } = await runWithTicketflowProgress("Aborting", onUpdate, () => runEffect(coordinator.abort(params.workerId), signal));
 			showWidget(ctx, run);
-			return textResult(`Aborted the active turn for ${params.workerId}; the session remains resumable.`, { runId: run.id, revision: run.revision, phase: run.phase });
+			return textResult(`Aborted the active turn for ${params.workerId}; the session remains resumable.`, { elapsedMs, runId: run.id, revision: run.revision, phase: run.phase });
+		},
+		renderCall(args, theme) {
+			return renderTicketflowCall("■", "Abort", args.workerId, theme);
+		},
+		renderResult(result, options, theme, context) {
+			return renderTicketflowResult(result, options, theme, context, { label: "Turn aborted" });
 		},
 	});
 }

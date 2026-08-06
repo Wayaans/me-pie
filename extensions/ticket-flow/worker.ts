@@ -5,6 +5,12 @@ import { Value } from "typebox/value";
 import type { ThinkingLevel, WorkerIdentity, WorkerProfile, WorkerReport } from "./model.ts";
 import { exactModelParts, THINKING_LEVELS } from "./model.ts";
 import {
+	formatWorkerReportMarkdown,
+	renderTicketflowCall,
+	renderTicketflowResult,
+	runWithTicketflowProgress,
+} from "./tool-ui.ts";
+import {
 	MAX_TRANSPORT_TEXT_BYTES,
 	TRANSPORT_VERSION,
 	WorkerReportSchema,
@@ -202,7 +208,7 @@ export class WorkerChannel {
 			label: "Ticket Flow report",
 			description: "Submit the structured report for the current Ticket Flow assignment turn.",
 			parameters: ReportParametersSchema,
-			execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+			execute: async (_toolCallId, params, signal, onUpdate, ctx) => {
 				if (!Value.Check(WorkerReportSchema, params)) throw bridgeError("ticketflow_report parameters do not match the exact report union.");
 				this.activeContext = ctx;
 				if (this.currentTurn < 1) throw bridgeError("ticketflow_report is unavailable before Main sends the first task.");
@@ -213,8 +219,18 @@ export class WorkerChannel {
 				const eventId = this.queueReport(report);
 				// The worker may terminate its turn only after Main has durably persisted
 				// and acknowledged the immutable report.
-				await this.waitForEventAcknowledgement(eventId, signal);
+				await runWithTicketflowProgress("Submitting", onUpdate, () => this.waitForEventAcknowledgement(eventId, signal));
 				return textResult("Ticket Flow report durably submitted.", report);
+			},
+			renderCall(args, theme) {
+				return renderTicketflowCall("↥", "Report", args.status, theme);
+			},
+			renderResult(result, options, theme, context) {
+				const report = options.isPartial || context.isError ? undefined : result.details as WorkerReport | undefined;
+				return renderTicketflowResult(result, options, theme, context, {
+					label: "Report submitted",
+					...(report ? { markdown: formatWorkerReportMarkdown(report) } : {}),
+				});
 			},
 			executionMode: "sequential",
 		});

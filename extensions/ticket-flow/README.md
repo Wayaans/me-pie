@@ -60,9 +60,11 @@ Main receives exactly these Ticket Flow tools while it owns a run:
 | `ticketflow_resume` | Reopen and verify the exact persisted Pi session. |
 | `ticketflow_abort` | Abort only the active turn while preserving the session. |
 
+In the TUI, each tool uses compact pending, success, and failure states. `ticketflow_send` renders the delivered message as Markdown, while `ticketflow_wait` shows live elapsed time and renders the durable report as Markdown. `ticketflow_delegate` keeps the initial task out of its visible result; the task appears when `ticketflow_send` delivers it.
+
 Workers receive only `ticketflow_report` from Ticket Flow. Implementation and fix Workers retain normal implementation tools. Audit Workers receive only `read`, `grep`, `find`, `ls`, `rg`, `fd`, and `ticketflow_report`; raw tools and `!`/`!!` user shell commands are blocked.
 
-A report, `agent_settled`, completion acceptance, and tmux closure are separate durable facts. Cancelling `ticketflow_wait` stops only that wait; it never aborts the Worker. A blocked report settles one turn, after which Main may send an answer or follow-up and wait again.
+A report, `agent_settled`, completion acceptance, and tmux closure are separate durable facts. Cancelling `ticketflow_wait` stops only that wait; it never aborts the Worker. A blocked report settles one turn, after which Main may send an answer as a follow-up and wait again. A settled audit report remains follow-up eligible until `ticketflow_close` accepts it. If the close gate rejects its structure or evidence, Main sends correction instructions to the same Worker, waits for a replacement report, and retries close.
 
 ## Lifecycle
 
