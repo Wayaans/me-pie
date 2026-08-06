@@ -4,6 +4,6 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 - [x] The `sunrise` collection contains exactly one new `quote.md` file with exactly one non-empty Markdown blockquote and no other content except surrounding whitespace.
