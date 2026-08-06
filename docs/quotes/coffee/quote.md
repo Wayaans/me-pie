@@ -1,1 +1,1 @@
-> Coffee: because debugging is easier when the variables are caffeinated.
+> Coffee is a hug in a mug for every unfinished task.
