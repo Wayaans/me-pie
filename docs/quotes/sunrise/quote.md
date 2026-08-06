@@ -1,1 +1,1 @@
-> Every sunrise is a fresh commit from the sky.
+> Dawn is proof that even the horizon knows how to start over.
