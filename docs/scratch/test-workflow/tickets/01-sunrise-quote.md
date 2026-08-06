@@ -6,4 +6,4 @@
 
 **Status:** ready-for-agent
 
-- [ ] The `sunrise` collection contains exactly one new `quote.md` file with exactly one non-empty Markdown blockquote and no other content except surrounding whitespace.
+- [x] The `sunrise` collection contains exactly one new `quote.md` file with exactly one non-empty Markdown blockquote and no other content except surrounding whitespace.
