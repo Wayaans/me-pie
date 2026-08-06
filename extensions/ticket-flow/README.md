@@ -29,8 +29,8 @@ A ticket is complete only when every Markdown checkbox in that ticket is checked
 
 `/ticketflow tmux` opens a native Pi setup form for:
 
-- Tickets directory
-- optional reference file paths, one per line
+- Tickets directory, with `@` path autocomplete
+- optional reference file paths, one per line, with `@` path autocomplete
 - exact Worker `provider/model`
 - explicit Worker thinking level
 - immutable delegation prompt template

@@ -2,6 +2,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { ThinkingLevel, WorkerProfile } from "./model.ts";
 import { THINKING_LEVELS } from "./model.ts";
+import { editPathAttachments, normalizePathAttachment, normalizeReferenceAttachments } from "./path-attachments.ts";
 import { prepareSetup, type PreparedSetup } from "./tickets.ts";
 
 export type TicketflowCommand =
@@ -39,18 +40,24 @@ export function assertTmuxSetupContext(ctx: Pick<ExtensionCommandContext, "mode"
 	if (!environment.TMUX?.trim()) throw new Error("/ticketflow tmux requires the current Pi client to be inside tmux.");
 }
 
-function lines(value: string | undefined): string[] {
-	return (value ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
-}
-
 function defaultModel(ctx: ExtensionCommandContext): string {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 }
 
 export async function runSetupWizard(ctx: ExtensionCommandContext): Promise<PreparedSetup | undefined> {
-	const ticketsDirectory = await ctx.ui.input("Tickets", "Directory containing numbered Markdown implementation tickets");
-	if (ticketsDirectory === undefined) return undefined;
-	const referenceText = await ctx.ui.editor("Other Reference", "");
+	const ticketsText = await editPathAttachments(ctx, {
+		title: "Tickets directory",
+		description: "Select the directory containing numbered Markdown implementation tickets.",
+		kind: "directory",
+	});
+	if (ticketsText === undefined) return undefined;
+	const ticketsDirectory = normalizePathAttachment(ticketsText, "Tickets directory");
+	const referenceText = await editPathAttachments(ctx, {
+		title: "Reference files",
+		description: "Optional files, one attachment per line.",
+		kind: "file",
+		multiline: true,
+	});
 	if (referenceText === undefined) return undefined;
 	const model = await ctx.ui.input("Model worker", defaultModel(ctx) || "Exact provider/model");
 	if (model === undefined) return undefined;
@@ -66,7 +73,7 @@ export async function runSetupWizard(ctx: ExtensionCommandContext): Promise<Prep
 	const prepared = await prepareSetup({
 		projectPath: ctx.cwd,
 		ticketsDirectory,
-		referencePaths: lines(referenceText),
+		referencePaths: normalizeReferenceAttachments(referenceText),
 		workerProfile,
 		delegationTemplate,
 	});

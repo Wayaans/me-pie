@@ -10,6 +10,11 @@ import {
 	ticketflowArgumentCompletions,
 } from "../ticket-flow/command.ts";
 import {
+	createPathAttachmentProvider,
+	normalizePathAttachment,
+	normalizeReferenceAttachments,
+} from "../ticket-flow/path-attachments.ts";
+import {
 	COMPLETION_CONVENTION,
 	DELEGATION_PLACEHOLDERS,
 	isTicketComplete,
@@ -118,18 +123,42 @@ test("setup enforces the all-Markdown-checkbox completion convention", async () 
 	await assert.rejects(prepareSetup(setupInput(noCheckboxProject, noCheckbox)), /no Markdown checkbox/);
 });
 
-test("setup wizard asks questions in its documented order and confirms the prepared natural order", async () => {
+test("setup path attachments normalize @ completion values and preserve ordinary paths", () => {
+	assert.equal(normalizePathAttachment("@docs/tickets/ ", "Tickets directory"), "docs/tickets/");
+	assert.equal(normalizePathAttachment('@"docs/ticket fixtures/"', "Tickets directory"), "docs/ticket fixtures/");
+	assert.equal(normalizePathAttachment("docs/tickets", "Tickets directory"), "docs/tickets");
+	assert.deepEqual(normalizeReferenceAttachments('@reference.md\n@"docs/reference notes.md"\n'), ["reference.md", "docs/reference notes.md"]);
+	assert.throws(() => normalizePathAttachment("@first.md\n@second.md", "Tickets directory"), /exactly one path/);
+	assert.throws(() => normalizePathAttachment('@"unterminated', "Reference path"), /unterminated/);
+});
+
+test("setup path autocomplete falls back to directory browsing when fd is unavailable", async () => {
+	const project = await temp("ticketflow-path-autocomplete-");
+	await mkdir(path.join(project, "tickets"));
+	await writeFile(path.join(project, "reference.md"), "reference\n");
+	const signal = new AbortController().signal;
+	const directoryProvider = createPathAttachmentProvider(project, "directory", null);
+	const directorySuggestions = await directoryProvider.getSuggestions(["@t"], 0, 2, { signal });
+	assert.deepEqual(directorySuggestions?.items.map((item) => item.value), ["@tickets/"]);
+	const fileProvider = createPathAttachmentProvider(project, "file", null);
+	const fileSuggestions = await fileProvider.getSuggestions(["@r"], 0, 2, { signal });
+	assert.deepEqual(fileSuggestions?.items.map((item) => item.value), ["@reference.md"]);
+});
+
+test("setup wizard asks for path attachments before the remaining fields and confirms the prepared order", async () => {
 	const project = await temp("ticketflow-command-wizard-");
 	const ticketsDirectory = await makeTicketDirectory(project, ["1-first.md"]);
 	const reference = path.join(project, "reference.md");
 	await writeFile(reference, "reference\n");
 	const calls: string[] = [];
+	const attachments = [`@${ticketsDirectory}`, `@${reference}`];
 	const ctx = {
 		cwd: project,
 		model: { provider: "provider", id: "model" },
 		ui: {
-			input: async (label: string) => { calls.push(`input:${label}`); return label === "Tickets" ? ticketsDirectory : "provider/model"; },
-			editor: async (label: string, initial: string) => { calls.push(`editor:${label}`); return label === "Other Reference" ? reference : initial; },
+			custom: async () => { calls.push("custom:path attachment"); return attachments.shift(); },
+			input: async (label: string) => { calls.push(`input:${label}`); return "provider/model"; },
+			editor: async (label: string, initial: string) => { calls.push(`editor:${label}`); return initial; },
 			select: async (label: string) => { calls.push(`select:${label}`); return "medium"; },
 			confirm: async (label: string, message: string) => { calls.push(`confirm:${label}:${message.includes("1-first.md")}`); return true; },
 		},
@@ -137,7 +166,7 @@ test("setup wizard asks questions in its documented order and confirms the prepa
 	const prepared = await runSetupWizard(ctx);
 	assert.ok(prepared);
 	assert.deepEqual(calls.map((call) => call.split(":").slice(0, 2).join(":")), [
-		"input:Tickets", "editor:Other Reference", "input:Model worker", "select:Thinking worker", "editor:Delegation prompt", "confirm:Start Ticket Flow?",
+		"custom:path attachment", "custom:path attachment", "input:Model worker", "select:Thinking worker", "editor:Delegation prompt", "confirm:Start Ticket Flow?",
 	]);
 	assert.match(calls.at(-1)!, /true$/);
 	assert.equal(prepared.tickets[0]!.name, "1-first.md");
