@@ -1,456 +1,143 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import path from "node:path";
-import { access, lstat, readFile, realpath } from "node:fs/promises";
 import { promisify } from "node:util";
-import { Effect } from "effect";
-import type { GitRunState } from "./domain.ts";
+import type { GitState } from "./model.ts";
 
 const execFileAsync = promisify(execFile);
+const COMMIT = /^[0-9a-fA-F]{4,64}$/;
 
-export interface GitCommandRunner {
-	readonly run: (args: readonly string[], cwd: string, signal?: AbortSignal) => Promise<{ readonly stdout: string; readonly stderr: string; readonly code: number }>;
+export interface GitRunner {
+	run(args: readonly string[], cwd: string, signal?: AbortSignal): Promise<{ readonly stdout: string; readonly stderr: string; readonly code: number }>;
 }
 
-export const nodeGitRunner: GitCommandRunner = {
-	run: async (args, cwd, signal) => {
+export const nodeGitRunner: GitRunner = {
+	async run(args, cwd, signal) {
 		try {
 			const result = await execFileAsync("git", [...args], { cwd, signal, encoding: "utf8" });
 			return { stdout: result.stdout, stderr: result.stderr, code: 0 };
 		} catch (cause) {
-			const error = cause as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number };
-			return { stdout: error.stdout ?? "", stderr: error.stderr ?? error.message ?? String(cause), code: typeof error.code === "number" ? error.code : 1 };
+			const error = cause as Error & { readonly stdout?: string; readonly stderr?: string; readonly code?: number };
+			return { stdout: error.stdout ?? "", stderr: error.stderr ?? error.message, code: typeof error.code === "number" ? error.code : 1 };
 		}
 	},
 };
 
-export interface GitPreflight {
-	readonly repository: string;
-	readonly baselineCommit: string;
-	readonly baselineBranch: string;
-	readonly workflowBranch: string;
-	readonly clean: boolean;
-	readonly changedFiles: readonly string[];
-}
-
-export interface GitAcceptanceContext {
-	readonly state: GitRunState;
-	/** The active implementation/fix report is the only source of new commits. */
-	readonly workItemId: string;
-	readonly workItemKind: "implementation" | "fix";
-}
-
-export interface GitStatusEntry {
-	readonly indexStatus: string;
-	readonly worktreeStatus: string;
-	readonly path: string;
-	readonly originalPath?: string;
-}
-
-const COMMIT_HASH = /^[0-9a-fA-F]{4,64}$/;
-
-function nonEmpty(value: string, field: string): string {
-	const normalized = value.trim();
-	if (!normalized || normalized !== value || /[\0\r\n\t ]/.test(value)) throw new Error(`Git ${field} must be an exact non-empty value.`);
-	return normalized;
-}
-
-function exactCommitHash(value: string): string {
-	if (!COMMIT_HASH.test(value)) throw new Error(`Invalid commit ID: ${value}`);
-	return value.toLowerCase();
-}
-
-async function command(runner: GitCommandRunner, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<string> {
+async function command(cwd: string, args: readonly string[], runner: GitRunner, signal?: AbortSignal): Promise<string> {
 	const result = await runner.run(args, cwd, signal);
 	if (result.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim() || "unknown error"}`);
 	return result.stdout.trim();
 }
 
-export async function gitStatusEntries(cwd: string, runner: GitCommandRunner = nodeGitRunner, signal?: AbortSignal): Promise<readonly GitStatusEntry[]> {
-	const result = await runner.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd, signal);
-	if (result.code !== 0) throw new Error(`git status failed: ${result.stderr.trim() || "unknown error"}`);
-	const fields = result.stdout.split("\0");
-	const entries: GitStatusEntry[] = [];
-	for (let index = 0; index < fields.length; index += 1) {
-		const field = fields[index];
-		if (!field) continue;
-		if (field.length < 4 || field[2] !== " ") throw new Error("git status returned malformed porcelain output");
-		const indexStatus = field[0]!;
-		const worktreeStatus = field[1]!;
-		const currentPath = field.slice(3);
-		if (!currentPath) throw new Error("git status returned an empty changed path");
-		if (indexStatus === "R" || indexStatus === "C" || worktreeStatus === "R" || worktreeStatus === "C") {
-			const originalPath = fields[index + 1];
-			if (!originalPath) throw new Error("git status returned an incomplete rename record");
-			entries.push({ indexStatus, worktreeStatus, path: currentPath, originalPath });
-			index += 1;
-		} else {
-			entries.push({ indexStatus, worktreeStatus, path: currentPath });
-		}
-	}
-	return entries;
+export async function gitStatus(cwd: string, runner: GitRunner = nodeGitRunner, signal?: AbortSignal): Promise<readonly string[]> {
+	const output = await command(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], runner, signal);
+	if (!output) return [];
+	return output.split("\0").filter(Boolean).map((entry) => entry.slice(3));
 }
 
-async function statusFiles(cwd: string, runner: GitCommandRunner, signal?: AbortSignal): Promise<string[]> {
-	const entries = await gitStatusEntries(cwd, runner, signal);
-	return [...new Set(entries.flatMap((entry) => entry.originalPath === undefined ? [entry.path] : [entry.path, entry.originalPath]))];
+export async function assertCleanWorktree(cwd: string, runner: GitRunner = nodeGitRunner, signal?: AbortSignal): Promise<void> {
+	const changed = await gitStatus(cwd, runner, signal);
+	if (changed.length > 0) throw new Error(`Ticket Flow requires a clean worktree; changed paths: ${changed.join(", ")}`);
 }
 
-export async function isGitRepository(cwd: string): Promise<boolean> {
-	try { await access(`${cwd}/.git`); return true; } catch { return false; }
+export async function gitHead(cwd: string, runner: GitRunner = nodeGitRunner, signal?: AbortSignal): Promise<string> {
+	return command(cwd, ["rev-parse", "--verify", "HEAD"], runner, signal);
 }
 
-/** Check cleanliness and capture the exact baseline before a run mutates anything. */
-export async function gitPreflight(cwd: string, runId: string, runner: GitCommandRunner = nodeGitRunner, signal?: AbortSignal): Promise<GitPreflight | undefined> {
-	if (!(await isGitRepository(cwd))) return undefined;
-	const changedFiles = await statusFiles(cwd, runner, signal);
-	if (changedFiles.length > 0) throw new Error(`Ticket Flow requires a clean worktree before starting; changed paths: ${changedFiles.join(", ")}`);
-	const baselineCommit = nonEmpty(await command(runner, ["rev-parse", "HEAD"], cwd, signal), "baseline commit");
-	const baselineBranch = nonEmpty(await command(runner, ["branch", "--show-current"], cwd, signal), "baseline branch");
-	// Main is the only branch Ticket Flow may leave. An invocation from any
-	// feature/staging branch must preserve that branch and use it in place.
-	const workflowBranch = baselineBranch === "main"
-		? `mepie/ticket-flow/${runId.replace(/[^A-Za-z0-9_.-]/g, "-")}`
-		: baselineBranch;
-	if (baselineBranch === "main") {
-		const existing = await runner.run(["show-ref", "--verify", "--quiet", `refs/heads/${workflowBranch}`], cwd, signal);
-		if (existing.code === 0) {
-			const existingHead = await command(runner, ["rev-parse", workflowBranch], cwd, signal);
-			if (existingHead !== baselineCommit) throw new Error(`Workflow branch ${workflowBranch} already contains commits; refusing to reuse it for a new run.`);
-			await command(runner, ["switch", workflowBranch], cwd, signal);
-		} else {
-			await command(runner, ["switch", "-c", workflowBranch], cwd, signal);
-		}
-	}
-	return { repository: cwd, baselineCommit, baselineBranch, workflowBranch, clean: true, changedFiles: [] };
+export async function gitBranch(cwd: string, runner: GitRunner = nodeGitRunner, signal?: AbortSignal): Promise<string> {
+	const branch = await command(cwd, ["branch", "--show-current"], runner, signal);
+	if (!branch) throw new Error("Ticket Flow cannot run on a detached HEAD.");
+	return branch;
 }
 
-export function gitStateFromPreflight(preflight: GitPreflight): GitRunState {
-	return {
-		repository: preflight.repository,
-		baselineCommit: preflight.baselineCommit,
-		baselineBranch: preflight.baselineBranch,
-		workflowBranch: preflight.workflowBranch,
-		acceptedCommitIds: [],
-		cleanPreflight: preflight.clean,
-	};
+export async function gitPreflight(cwd: string, runner: GitRunner = nodeGitRunner, signal?: AbortSignal): Promise<GitState> {
+	const inside = await runner.run(["rev-parse", "--is-inside-work-tree"], cwd, signal);
+	if (inside.code !== 0 || inside.stdout.trim() !== "true") throw new Error("Ticket Flow requires a Git worktree.");
+	await assertCleanWorktree(cwd, runner, signal);
+	const baselineCommit = await gitHead(cwd, runner, signal);
+	const branch = await gitBranch(cwd, runner, signal);
+	return { baselineCommit, branch, acceptedCommitIds: [], acceptedHead: baselineCommit };
 }
 
-export async function gitHead(cwd: string, runner: GitCommandRunner = nodeGitRunner, signal?: AbortSignal): Promise<string | undefined> {
-	if (!(await isGitRepository(cwd))) return undefined;
-	return command(runner, ["rev-parse", "HEAD"], cwd, signal);
+async function canonicalCommit(cwd: string, value: string, runner: GitRunner, signal?: AbortSignal): Promise<string> {
+	if (!COMMIT.test(value)) throw new Error(`Invalid commit ID: ${value}`);
+	return command(cwd, ["rev-parse", "--verify", "--end-of-options", `${value}^{commit}`], runner, signal);
 }
 
-function safeCommitPart(value: string): string {
-	const result = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
-	return result.slice(0, 80) || "item";
-}
-
-export function completionCommitMessage(runId: string, workItemId: string): string {
-	return `mepie(ticket-flow): record completion ${safeCommitPart(runId)}/${safeCommitPart(workItemId)}`;
-}
-
-export interface CompletionCommitInput {
-	readonly projectPath: string;
-	readonly runId: string;
-	readonly workItemId: string;
-	readonly paths: readonly string[];
-	/** Accepted worker commits must be ancestors of the dedicated commit. */
-	readonly expectedParentCommitIds?: readonly string[];
-	readonly runner?: GitCommandRunner;
-	readonly signal?: AbortSignal;
-}
-
-export interface CompletionCommitResult {
-	readonly commitId?: string;
-	readonly paths: readonly string[];
-	readonly alreadyCommitted: boolean;
-}
-
-function statusPathSet(entries: readonly GitStatusEntry[]): Set<string> {
-	return new Set(entries.flatMap((entry) => entry.originalPath === undefined ? [entry.path] : [entry.path, entry.originalPath]));
-}
-
-async function assertSafeCompletionPath(projectPath: string, candidate: string): Promise<string> {
-	const canonicalProject = await realpath(projectPath);
-	const absolute = path.resolve(canonicalProject, candidate);
-	const relative = path.relative(canonicalProject, absolute);
-	if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || relative.split(path.sep).some((part) => part === ".git" || part.startsWith(".git")) || /[\0\r\n]/.test(relative)) {
-		throw new Error(`Completion commit path is outside the project or targets repository control data: ${candidate}`);
-	}
-	return relative.split(path.sep).join("/");
-}
-
-function assertOnlyExpectedChanges(entries: readonly GitStatusEntry[], expected: ReadonlySet<string>, requireStaged: boolean): void {
-	const actual = statusPathSet(entries);
-	for (const changed of actual) if (!expected.has(changed)) throw new Error(`Completion mutation changed an undeclared path: ${changed}`);
-	for (const expectedPath of expected) if (!actual.has(expectedPath)) throw new Error(`Completion mutation did not produce the declared path: ${expectedPath}`);
-	if (requireStaged && entries.some((entry) => entry.indexStatus === " " || entry.worktreeStatus !== " ")) {
-		throw new Error("Completion mutation was not fully staged or left a worktree change after staging.");
-	}
-}
-
-async function completionPathSnapshot(cwd: string, paths: readonly string[]): Promise<string> {
-	const snapshot: Array<{ readonly path: string; readonly kind: "missing" | "file"; readonly mode?: number; readonly hash?: string }> = [];
-	for (const relative of paths) {
-		const absolute = path.join(cwd, relative);
-		try {
-			const metadata = await lstat(absolute);
-			if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`Completion path changed to an unsafe file type while staging: ${relative}`);
-			const content = await readFile(absolute);
-			snapshot.push({ path: relative, kind: "file", mode: metadata.mode, hash: createHash("sha256").update(content).digest("hex") });
-		} catch (cause) {
-			if ((cause as NodeJS.ErrnoException).code === "ENOENT") snapshot.push({ path: relative, kind: "missing" });
-			else throw cause;
-		}
-	}
-	return JSON.stringify(snapshot);
-}
-
-async function commitChangedPaths(cwd: string, runner: GitCommandRunner, signal?: AbortSignal): Promise<readonly string[]> {
-	const result = await runner.run(["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", "-z", "HEAD"], cwd, signal);
-	if (result.code !== 0) throw new Error(`git diff-tree failed: ${result.stderr.trim() || "unknown error"}`);
-	const fields = result.stdout.split("\0");
-	const paths: string[] = [];
-	for (let index = 0; index < fields.length; index += 1) {
-		const status = fields[index];
-		if (!status) continue;
-		if (status.startsWith("R") || status.startsWith("C")) {
-			const original = fields[index + 1];
-			const current = fields[index + 2];
-			if (!original || !current) throw new Error("git diff-tree returned an incomplete rename record");
-			paths.push(original, current);
-			index += 2;
-		} else {
-			const current = fields[index + 1];
-			if (!current) throw new Error("git diff-tree returned an incomplete path record");
-			paths.push(current);
-			index += 1;
-		}
-	}
-	return paths;
-}
-
-/**
- * Turn the already-applied, plan-approved mutation into a dedicated commit.
- * Only exact paths are staged; a clean postcondition is checked both before
- * and after the commit.  The deterministic subject lets recovery recognize a
- * commit made just before a process crash.
- */
-export async function commitCompletionMutation(input: CompletionCommitInput): Promise<CompletionCommitResult> {
-	const runner = input.runner ?? nodeGitRunner;
-	if (!(await isGitRepository(input.projectPath))) return { paths: [], alreadyCommitted: false };
-	const expected = new Set(await Promise.all(input.paths.map((candidate) => assertSafeCompletionPath(input.projectPath, candidate))));
-	if (expected.size === 0) {
-		const clean = await gitStatusEntries(input.projectPath, runner, input.signal);
-		if (clean.length > 0) throw new Error(`Ledger-only completion requires a clean worktree: ${[...statusPathSet(clean)].join(", ")}`);
-		return { paths: [], alreadyCommitted: false };
-	}
-	const message = completionCommitMessage(input.runId, input.workItemId);
-	const expectedParents = input.expectedParentCommitIds === undefined ? [] : await canonicalCommitIds(input.projectPath, input.expectedParentCommitIds, runner, input.signal);
-	const assertExpectedParent = async (head: string): Promise<void> => {
-		if (expectedParents.length === 0) return;
-		const parent = await canonicalCommitId(input.projectPath, await command(runner, ["rev-parse", "--verify", `${head}^`], input.projectPath, input.signal), runner, input.signal);
-		if (!expectedParents.includes(parent)) throw new Error("Completion commit is not immediately after the exact reported worker branch tip.");
-	};
-	const initial = await gitStatusEntries(input.projectPath, runner, input.signal);
-	if (initial.length > 0) {
-		// Recovery may arrive after mutation or after `git add`; accept only the
-		// exact declared set.  Anything else is an immediate security failure.
-		assertOnlyExpectedChanges(initial, expected, false);
-	}
-	const headMessageResult = await runner.run(["log", "-1", "--format=%s", "HEAD"], input.projectPath, input.signal);
-	if (headMessageResult.code === 0 && headMessageResult.stdout.trim() === message && initial.length === 0) {
-		const existingHead = await gitHead(input.projectPath, runner, input.signal);
-		if (!existingHead) throw new Error("Existing completion commit has no reachable HEAD.");
-		await assertExpectedParent(existingHead);
-		const changed = await commitChangedPaths(input.projectPath, runner, input.signal);
-		if (new Set(changed).size !== expected.size || changed.some((candidate) => !expected.has(candidate))) throw new Error("Existing completion commit contains undeclared paths.");
-		const commitId = await gitHead(input.projectPath, runner, input.signal);
-		if (!commitId) throw new Error("Existing completion commit has no reachable ID.");
-		return { commitId, paths: [...expected], alreadyCommitted: true };
-	}
-	if (initial.length === 0) return { paths: [...expected], alreadyCommitted: false };
-	const expectedPaths = [...expected].sort();
-	if (expectedParents.length > 0) {
-		const parentHead = await canonicalCommitId(input.projectPath, await command(runner, ["rev-parse", "HEAD"], input.projectPath, input.signal), runner, input.signal);
-		if (!expectedParents.includes(parentHead)) throw new Error("Completion mutation is not based on the exact reported worker branch tip.");
-	}
-	const mutationSnapshot = await completionPathSnapshot(input.projectPath, expectedPaths);
-	const add = await runner.run(["add", "--", ...expectedPaths], input.projectPath, input.signal);
-	if (add.code !== 0) throw new Error(`git add completion paths failed: ${add.stderr.trim() || "unknown error"}`);
-	const stagedSnapshot = await completionPathSnapshot(input.projectPath, expectedPaths);
-	if (stagedSnapshot !== mutationSnapshot) throw new Error("Completion mutation content changed while staging; refusing to commit raced content.");
-	const staged = await gitStatusEntries(input.projectPath, runner, input.signal);
-	assertOnlyExpectedChanges(staged, expected, true);
-	const commit = await runner.run(["commit", "--no-verify", "--no-gpg-sign", "-m", message], input.projectPath, input.signal);
-	if (commit.code !== 0) throw new Error(`git completion commit failed: ${commit.stderr.trim() || "unknown error"}`);
-	const commitId = await gitHead(input.projectPath, runner, input.signal);
-	if (!commitId) throw new Error("Git completion commit succeeded without a reachable HEAD.");
-	await assertExpectedParent(commitId);
-	const changed = await commitChangedPaths(input.projectPath, runner, input.signal);
-	if (new Set(changed).size !== expected.size || changed.some((candidate) => !expected.has(candidate))) throw new Error("Git completion commit contains undeclared paths.");
-	const after = await gitStatusEntries(input.projectPath, runner, input.signal);
-	if (after.length > 0) throw new Error(`Git completion commit left the worktree dirty: ${[...statusPathSet(after)].join(", ")}`);
-	return { commitId, paths: [...expected], alreadyCommitted: false };
-}
-
-async function canonicalCommitId(cwd: string, commit: string, runner: GitCommandRunner, signal?: AbortSignal): Promise<string> {
-	const value = exactCommitHash(commit);
-	// Hashes are validated before interpolation, and --end-of-options prevents
-	// any future Git option parsing if this boundary is changed.
-	return nonEmpty(await command(runner, ["rev-parse", "--verify", "--end-of-options", `${value}^{commit}`], cwd, signal), "resolved commit ID").toLowerCase();
-}
-
-export async function canonicalCommitIds(cwd: string, commitIds: readonly string[], runner: GitCommandRunner = nodeGitRunner, signal?: AbortSignal): Promise<readonly string[]> {
-	if (!(await isGitRepository(cwd))) throw new Error("Git commit tracking requires a repository.");
-	if (new Set(commitIds).size !== commitIds.length) throw new Error("Reported commit IDs must be unique within the active attempt.");
-	const resolved: string[] = [];
-	for (const commit of commitIds) resolved.push(await canonicalCommitId(cwd, commit, runner, signal));
-	if (new Set(resolved).size !== resolved.length) throw new Error("Reported commit IDs must resolve to unique commits.");
-	return resolved;
-}
-
-/**
- * Validate only the safe, exact commit-ish boundary. The contextual ancestry
- * checks live in validateAcceptedCommitIds so callers cannot accidentally use
- * existence-only validation for acceptance.
- */
-export async function validateCommitIds(cwd: string, commitIds: readonly string[], runner: GitCommandRunner = nodeGitRunner, signal?: AbortSignal): Promise<void> {
-	await canonicalCommitIds(cwd, commitIds, runner, signal);
-}
-
-async function isAncestor(runner: GitCommandRunner, ancestor: string, descendant: string, cwd: string, signal?: AbortSignal): Promise<boolean> {
+async function isAncestor(cwd: string, ancestor: string, descendant: string, runner: GitRunner, signal?: AbortSignal): Promise<boolean> {
 	const result = await runner.run(["merge-base", "--is-ancestor", ancestor, descendant], cwd, signal);
 	if (result.code === 0) return true;
 	if (result.code === 1) return false;
-	throw new Error(`git merge-base --is-ancestor failed: ${result.stderr.trim() || "unknown error"}`);
+	throw new Error(`git merge-base failed: ${result.stderr.trim()}`);
 }
 
-/** Validate report commits again while a completion transaction is being
- * recovered. Unlike first acceptance, the expected mutation may already make
- * the worktree dirty, and a worker commit may already be in the accepted set. */
-export async function validateAttemptCommitIds(
-	cwd: string,
-	state: GitRunState,
-	commitIds: readonly string[],
-	runner: GitCommandRunner = nodeGitRunner,
-	signal?: AbortSignal,
-	expectedCompletionSubject?: string,
-): Promise<readonly string[]> {
-	if (!(await isGitRepository(cwd))) throw new Error("Git commit tracking requires a repository.");
-	if (new Set(commitIds).size !== commitIds.length) throw new Error("Reported commit IDs must be unique within the active attempt.");
-	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Acceptance requires the persisted workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
-	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
-	const baseline = await canonicalCommitId(cwd, state.baselineCommit, runner, signal);
-	const attemptBase = state.attemptBaseCommit === undefined ? baseline : await canonicalCommitId(cwd, state.attemptBaseCommit, runner, signal);
-	const canonical = await canonicalCommitIds(cwd, commitIds, runner, signal);
-	for (const commit of canonical) {
-		if (commit === baseline || commit === attemptBase) throw new Error(`Commit ${commit} introduced no new work during the active attempt.`);
-		if (!(await isAncestor(runner, baseline, commit, cwd, signal))) throw new Error(`Commit ${commit} is not a descendant of the run baseline.`);
-		if (!(await isAncestor(runner, attemptBase, commit, cwd, signal))) throw new Error(`Commit ${commit} was not introduced after the active implementation/fix attempt began.`);
-		if (!(await isAncestor(runner, commit, head, cwd, signal))) throw new Error(`Commit ${commit} is not reachable from the workflow branch current HEAD.`);
+export async function assertAttemptReady(cwd: string, state: GitState, runner: GitRunner = nodeGitRunner, signal?: AbortSignal): Promise<string> {
+	await assertCleanWorktree(cwd, runner, signal);
+	const branch = await gitBranch(cwd, runner, signal);
+	if (branch !== state.branch) throw new Error(`Assignment requires persisted branch ${state.branch}, found ${branch}.`);
+	const head = await canonicalCommit(cwd, await gitHead(cwd, runner, signal), runner, signal);
+	const expected = await canonicalCommit(cwd, state.acceptedHead, runner, signal);
+	if (head !== expected) throw new Error("Assignment HEAD must exactly equal the latest accepted tip before launch.");
+	return head;
+}
+
+export interface VerifiedCommits {
+	readonly commitIds: readonly string[];
+	readonly head: string;
+}
+
+export async function verifyWorkerCommits(input: {
+	readonly cwd: string;
+	readonly state: GitState;
+	readonly attemptBaseCommit: string;
+	readonly reportedCommitIds: readonly string[];
+	readonly runner?: GitRunner;
+	readonly signal?: AbortSignal;
+}): Promise<VerifiedCommits> {
+	const runner = input.runner ?? nodeGitRunner;
+	await assertCleanWorktree(input.cwd, runner, input.signal);
+	const branch = await gitBranch(input.cwd, runner, input.signal);
+	if (branch !== input.state.branch) throw new Error(`Worker changed branches: expected ${input.state.branch}, found ${branch}.`);
+	if (input.reportedCommitIds.length === 0) throw new Error("Completed implementation/fix reports require at least one commit ID.");
+	if (new Set(input.reportedCommitIds).size !== input.reportedCommitIds.length) throw new Error("Reported commit IDs must be unique.");
+	const head = await canonicalCommit(input.cwd, await gitHead(input.cwd, runner, input.signal), runner, input.signal);
+	const baseline = await canonicalCommit(input.cwd, input.state.baselineCommit, runner, input.signal);
+	const attemptBase = await canonicalCommit(input.cwd, input.attemptBaseCommit, runner, input.signal);
+	const accepted = new Set(await Promise.all(input.state.acceptedCommitIds.map((commit) => canonicalCommit(input.cwd, commit, runner, input.signal))));
+	const commitIds = await Promise.all(input.reportedCommitIds.map((commit) => canonicalCommit(input.cwd, commit, runner, input.signal)));
+	if (new Set(commitIds).size !== commitIds.length) throw new Error("Reported commit IDs resolve to duplicate commits.");
+	for (const commit of commitIds) {
+		if (commit === baseline || commit === attemptBase || accepted.has(commit)) throw new Error(`Commit ${commit} is not new for this assignment.`);
+		if (!await isAncestor(input.cwd, baseline, commit, runner, input.signal)) throw new Error(`Commit ${commit} is outside the run history.`);
+		if (!await isAncestor(input.cwd, attemptBase, commit, runner, input.signal)) throw new Error(`Commit ${commit} predates the active assignment.`);
+		if (!await isAncestor(input.cwd, commit, head, runner, input.signal)) throw new Error(`Commit ${commit} is not reachable from current HEAD.`);
 	}
-	if (!canonical.includes(head)) {
-		if (!expectedCompletionSubject) throw new Error("Reported commits do not include the workflow branch current HEAD.");
-		const subject = await command(runner, ["log", "-1", "--format=%s", "HEAD"], cwd, signal);
-		if (subject !== expectedCompletionSubject) throw new Error("Workflow branch HEAD is neither a reported worker commit nor the expected completion commit.");
-		const parent = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "--verify", "HEAD^"], cwd, signal), runner, signal);
-		if (!canonical.includes(parent)) throw new Error("Expected completion commit is not immediately after the exact reported worker branch tip.");
+	if (!commitIds.includes(head)) throw new Error("Reported commit IDs must include current HEAD as the exact accepted tip.");
+	const exactHistory = (await command(input.cwd, ["rev-list", "--reverse", `${attemptBase}..${head}`], runner, input.signal)).split("\n").filter(Boolean);
+	if (exactHistory.length !== commitIds.length || exactHistory.some((commit, index) => commit !== commitIds[index])) {
+		throw new Error("Reported commit IDs must exactly equal every commit introduced by the active assignment in chronological order.");
 	}
-	return canonical;
+	return { commitIds, head };
 }
 
-/**
- * Acceptance boundary for implementation/fix reports. Every commit must be a
- * new descendant of the run baseline, reachable from the dedicated workflow
- * branch and current HEAD, and the checkout must still be clean. No staging or
- * automatic repair is performed here; unrelated changes are rejected.
- */
-export async function validateAcceptedCommitIds(
-	cwd: string,
-	state: GitRunState,
-	commitIds: readonly string[],
-	runner: GitCommandRunner = nodeGitRunner,
-	signal?: AbortSignal,
-): Promise<readonly string[]> {
-	if (!(await isGitRepository(cwd))) throw new Error("Git commit tracking requires a repository.");
-	const changed = await statusFiles(cwd, runner, signal);
-	if (changed.length > 0) throw new Error(`Worktree must be clean at acceptance; changed paths: ${changed.join(", ")}`);
-	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Acceptance requires the persisted workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
-	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
-	const baseline = await canonicalCommitId(cwd, state.baselineCommit, runner, signal);
-	const attemptBase = state.attemptBaseCommit === undefined ? baseline : await canonicalCommitId(cwd, state.attemptBaseCommit, runner, signal);
-	const alreadyAccepted = new Set(await canonicalCommitIds(cwd, state.acceptedCommitIds, runner, signal));
-	const canonical = await canonicalCommitIds(cwd, commitIds, runner, signal);
-	for (const commit of canonical) {
-		if (alreadyAccepted.has(commit)) throw new Error(`Commit ${commit} was already accepted by this run.`);
-		if (commit === baseline) throw new Error(`Commit ${commit} is the run baseline and introduced no new work.`);
-		if (commit === attemptBase) throw new Error(`Commit ${commit} introduced no new work during the active attempt.`);
-		if (!(await isAncestor(runner, baseline, commit, cwd, signal))) throw new Error(`Commit ${commit} is not a descendant of the run baseline.`);
-		if (!(await isAncestor(runner, attemptBase, commit, cwd, signal))) throw new Error(`Commit ${commit} was not introduced after the active implementation/fix attempt began.`);
-		if (!(await isAncestor(runner, commit, head, cwd, signal))) throw new Error(`Commit ${commit} is not reachable from the workflow branch current HEAD.`);
+export async function assertExactAuditScope(input: {
+	readonly cwd: string;
+	readonly state: GitState;
+	readonly acceptedCommitIds: readonly string[];
+	readonly acceptedHead: string;
+	readonly runner?: GitRunner;
+	readonly signal?: AbortSignal;
+}): Promise<void> {
+	const runner = input.runner ?? nodeGitRunner;
+	await assertCleanWorktree(input.cwd, runner, input.signal);
+	if (await gitBranch(input.cwd, runner, input.signal) !== input.state.branch) throw new Error("Audit checkout branch does not match the persisted workflow branch.");
+	const head = await canonicalCommit(input.cwd, await gitHead(input.cwd, runner, input.signal), runner, input.signal);
+	const expectedHead = await canonicalCommit(input.cwd, input.acceptedHead, runner, input.signal);
+	if (head !== expectedHead) throw new Error("Audit HEAD does not exactly match the accepted implementation/fix tip.");
+	if (input.acceptedCommitIds.length !== input.state.acceptedCommitIds.length || input.acceptedCommitIds.some((commit, index) => commit !== input.state.acceptedCommitIds[index])) {
+		throw new Error("Audit accepted commit set differs from durable Git state.");
 	}
-	if (!canonical.includes(head)) throw new Error("Reported commits must include the workflow branch current HEAD as the exact accepted tip.");
-	return canonical;
-}
-
-/** Validate commits already persisted in a completion history without applying
- * the "new during this attempt" rule used for a worker report. */
-export async function validateAcceptedCommitHistory(
-	cwd: string,
-	state: GitRunState,
-	commitIds: readonly string[],
-	runner: GitCommandRunner = nodeGitRunner,
-	signal?: AbortSignal,
-): Promise<readonly string[]> {
-	if (!(await isGitRepository(cwd))) throw new Error("Git completion history requires a repository.");
-	const changed = await statusFiles(cwd, runner, signal);
-	if (changed.length > 0) throw new Error(`Worktree must be clean while validating completion history; changed paths: ${changed.join(", ")}`);
-	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Completion history requires the persisted workflow branch ${state.workflowBranch}.`);
-	const canonical = await canonicalCommitIds(cwd, commitIds, runner, signal);
-	const persisted = new Set((await canonicalCommitIds(cwd, state.acceptedCommitIds, runner, signal)).map((commit) => commit.toLowerCase()));
-	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
-	for (const commit of canonical) {
-		if (!persisted.has(commit)) throw new Error(`Completion commit ${commit} is not in the persisted accepted commit set.`);
-		if (!(await isAncestor(runner, state.baselineCommit, commit, cwd, signal)) || !(await isAncestor(runner, commit, head, cwd, signal))) {
-			throw new Error(`Persisted completion commit ${commit} is not a reachable descendant of the workflow baseline.`);
-		}
-	}
-	return canonical;
-}
-
-export async function assertGitReadyForAudit(cwd: string, state: GitRunState, runner: GitCommandRunner = nodeGitRunner, signal?: AbortSignal): Promise<void> {
-	if (!(await isGitRepository(cwd))) return;
-	const changed = await statusFiles(cwd, runner, signal);
-	if (changed.length > 0) throw new Error(`Worktree must be clean before audit; changed paths: ${changed.join(", ")}`);
-	const branch = await command(runner, ["branch", "--show-current"], cwd, signal);
-	if (branch !== state.workflowBranch) throw new Error(`Audit requires the persisted workflow branch ${state.workflowBranch}; current branch is ${branch || "detached"}.`);
-	const canonicalAccepted = await canonicalCommitIds(cwd, state.acceptedCommitIds, runner, signal);
-	if (new Set(canonicalAccepted).size !== canonicalAccepted.length) throw new Error("Accepted Git commits must be unique before audit.");
-	const head = await canonicalCommitId(cwd, await command(runner, ["rev-parse", "HEAD"], cwd, signal), runner, signal);
-	for (const commit of canonicalAccepted) {
-		if (!(await isAncestor(runner, state.baselineCommit, commit, cwd, signal)) || !(await isAncestor(runner, commit, head, cwd, signal))) {
-			throw new Error(`Accepted commit ${commit} is not a reachable descendant of the baseline at audit time.`);
-		}
-	}
-}
-
-export function mergeAcceptedCommitIds(state: GitRunState, commitIds: readonly string[], currentHead?: string): GitRunState {
-	const normalized = commitIds.map((commit) => exactCommitHash(commit));
-	if (new Set(normalized).size !== normalized.length) throw new Error("Accepted Git commit IDs must be unique.");
-	if (normalized.some((commit) => state.acceptedCommitIds.includes(commit))) throw new Error("Accepted Git commit IDs must not be repeated across work items.");
-	return {
-		...state,
-		acceptedCommitIds: [...state.acceptedCommitIds, ...normalized],
-		...(currentHead === undefined ? {} : { currentHead }),
-	};
-}
-
-
-export function runGitPreflight(cwd: string, runId: string, runner?: GitCommandRunner, signal?: AbortSignal): Effect.Effect<GitPreflight | undefined, Error> {
-	return Effect.tryPromise({ try: () => gitPreflight(cwd, runId, runner, signal), catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)) });
+	const canonical = await Promise.all(input.acceptedCommitIds.map((commit) => canonicalCommit(input.cwd, commit, runner, input.signal)));
+	if (new Set(canonical).size !== canonical.length || !canonical.includes(expectedHead)) throw new Error("Audit accepted commit set must be unique and contain exact accepted HEAD.");
+	for (const commit of canonical) if (!await isAncestor(input.cwd, input.state.baselineCommit, commit, runner, input.signal) || !await isAncestor(input.cwd, commit, head, runner, input.signal)) throw new Error(`Audit commit ${commit} is outside the accepted history.`);
+	const exactHistory = (await command(input.cwd, ["rev-list", "--reverse", `${input.state.baselineCommit}..${expectedHead}`], runner, input.signal)).split("\n").filter(Boolean);
+	if (exactHistory.length !== canonical.length || exactHistory.some((commit, index) => commit !== canonical[index])) throw new Error("Audit accepted commit set must exactly equal the complete implementation/fix history.");
 }

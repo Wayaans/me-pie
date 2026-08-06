@@ -1,96 +1,129 @@
 # Ticket Flow
 
-Ticket Flow is an explicit, crash-safe workflow for ordered implementation tickets, fresh audits, and audit fixes:
+Ticket Flow coordinates numbered implementation tickets through one persistent Pi Worker at a time. It is deliberately sequential and explicit: Main delegates, sends, waits, and closes each Assignment before the cursor can move.
+
+This version is a breaking replacement for the former planning workflow. It has no model-authored plan, dependency graph, `workflow_*` compatibility tools, event journal, or automatic continuation prompt.
+
+## Requirements
+
+- Pi TUI mode
+- a functioning current tmux session
+- a clean Git worktree on a named branch
+- numbered Markdown ticket files (`01-name.md`, `02-name.md`, …)
+- at least one Markdown task-list checkbox in every ticket
+
+A ticket is complete only when every Markdown checkbox in that ticket is checked. Workers, not Main, own implementation commits and ticket marking.
+
+## Commands
 
 ```text
-Main → workflow_delegate → owned tmux Pi worker → authenticated Unix socket
+/ticketflow tmux
+/ticketflow herdr       # not supported yet
+/ticketflow cmux        # not supported yet
+/ticketflow status
+/ticketflow pause
+/ticketflow resume
+/ticketflow stop
+/ticketflow cancel      # confirmed stop alias
 ```
 
-Main plans and reviews reports; workers implement or perform read-only audits. A completed implementation plan is **not** complete until a fresh clean audit is accepted.
+`/ticketflow tmux` opens a native Pi setup form for:
 
-## Start and controls
+- Tickets directory
+- optional reference file paths, one per line
+- exact Worker `provider/model`
+- explicit Worker thinking level
+- immutable delegation prompt template
 
-Run inside Pi TUI and an active tmux client:
+Supported delegation placeholders are:
 
 ```text
-/ticket-flow tmux <free-form prompt>
-/ticket-flow status
-/ticket-flow pause
-/ticket-flow resume
-/ticket-flow stop
+{ticketPath}
+{ticketName}
+{ticketIndex}
+{ticketCount}
+{referencePaths}
 ```
 
-`tmux <prompt>` is the only start syntax. User controls do not require a new worker. `status` toggles the task-list widget in the current Pi session; the session that starts a run shows it automatically, while other sessions keep it hidden until their first `status` invocation. `pause`, `resume`, and `stop` discover and safely attach a detached durable run when needed without changing widget visibility. Stop confirms before closing an owned active worker. Recovery never creates a duplicate worker. Command arguments autocomplete in the Pi editor.
+Ticket Flow replaces these placeholders only. The resulting task is sent to the Worker without any prefix or suffix. Setup rejects duplicate, missing, or ambiguous ticket numbers and displays the canonical order for confirmation before creating durable state.
 
-## Main tools
+## Tool roles
 
-Only these tools are active while an owned run exists:
+Main receives exactly these Ticket Flow tools while it owns a run:
 
-- `workflow_plan` — `get`, `save`, or typed `update`. Save a complete normalized plan and set `finalized: true` only after all clarification questions, exact profiles, dependencies, and completion mutations are resolved. Put an explicit `auditProfile` in the plan; there is no audit-model fallback.
-- `workflow_delegate` — `start`, `wait`, `send`, `accept`, `revise`, or `close`. Progression is explicit: accepting a ticket never starts the next worker.
+| Tool | Responsibility |
+| --- | --- |
+| `ticketflow_delegate` | Spawn the durable next Assignment; do not send work. |
+| `ticketflow_send` | Send the exact task, steering, answer, or follow-up. |
+| `ticketflow_wait` | Wait for `agent_settled` and return the durable report. |
+| `ticketflow_close` | Verify gates, advance the cursor, and close the owned Worker. |
+| `ticketflow_resume` | Reopen and verify the exact persisted Pi session. |
+| `ticketflow_abort` | Abort only the active turn while preserving the session. |
 
-Default tool rows use the same compact tool-plus-command form as `workflow-worker` (for example, `workflow-plan · save` and `workflow-delegate · start`). Full run/plan state is in tool `details` and the owner-only `plan.json` snapshot.
+Workers receive only `ticketflow_report` from Ticket Flow. Implementation and fix Workers retain normal implementation tools. Audit Workers receive only `read`, `grep`, `find`, `ls`, `rg`, `fd`, and `ticketflow_report`; raw tools and `!`/`!!` user shell commands are blocked.
 
-`workflow_delegate start` is one recoverable transaction. It persists checkpoints while it creates the owned tmux window, launches Pi, verifies the exact provider/model/thinking profile, authenticates the native connection, and delivers the exact planned prompt. Visible substep updates are emitted while the transaction runs. A failed or cancelled substep pauses safely for recovery. Main keeps scheduling bounded continuation turns while durable state changes and the run remains actionable, so finalizing a plan cannot silently end the workflow; it stops only for completion, failure, pause, or a genuine user decision.
+A report, `agent_settled`, completion acceptance, and tmux closure are separate durable facts. Cancelling `ticketflow_wait` stops only that wait; it never aborts the Worker. A blocked report settles one turn, after which Main may send an answer or follow-up and wait again.
 
-## Worker tool
-
-A worker process exposes exactly one workflow tool:
-
-- `workflow_worker get` — retrieve authoritative context;
-- `workflow_worker send` — send a question to Main; blocking sends keep the authenticated socket open until Main replies (use `workflow_delegate send` for the reply), with cancellation and a bounded timeout;
-- `workflow_worker submit` — send progress, blocker, failure, implementation, or audit reports.
-
-A blocking question first appears as a blocked worker event (`workflow_delegate wait --until blocked`); Main replies with `workflow_delegate send` without restarting the worker. Audit workers receive only structured read, search, and listing tools; raw shell execution is unavailable because shell expansion, PATH helpers, and command flags cannot provide a reliable read-only guarantee. Implementation and fix workers retain normal Pi implementation tools.
-
-## Widget
-
-A bordered task-list widget can remain above the editor while a run is active or recoverable. Its title reports each live step—planning, ticket analysis, plan updates/finalization, delegation, worker verification, report review, audit, audit fixes, and finalization. It also shows compact item statuses, an animated current-step marker, current model/thinking, tmux stable display/window/pane IDs, clarification blockers, and audit/fix rounds. Widget visibility is session-local: a newly started run is shown in its starting session, recoverable runs stay hidden in other sessions, and `/ticket-flow status` toggles show/hide for the current session. Stopped, completed, and no-run states clear it.
-
-## Durable state and ownership
-
-All authoritative runtime data is in the owner-only global `plan.json`:
+## Lifecycle
 
 ```text
-<agent-dir>/state/ticket-flow/<project-hash>/<run-id>/
-├── plan.json       # complete run/plan snapshot and checkpoints
-├── state.json      # non-authoritative legacy pointer only
-├── events.jsonl
-└── reports/
+implementation ticket
+  delegate -> send exact task -> wait
+    blocked -> send answer/follow-up -> wait
+    failed or unreported -> user intervention
+    completed -> close gate
+
+all tickets complete
+  fresh read-only audit
+    clean -> completed
+    findings -> fixer -> fresh audit
 ```
 
-The snapshot includes the original prompt, ticket/spec paths, exact profiles and prompts, stable tmux IDs, Pi identities, attempts/history/report references, timestamps, plan-approved completion targets, completion checkpoints, Git baseline/current head/accepted commits (including dedicated completion commits), audit rounds/findings/fix links, and final state. Authentication tokens remain in a separate owner-only file and are never stored in plan, events, or reports. Ambiguous journal appends remain pending and are reconciled by event ID during recovery.
+Only `ticketflow_close` advances the cursor. Exactly one Assignment and one Worker may be active. Only a clean audit can complete a run.
 
-A project lock, authenticated native protocol, stable tmux ownership tags, immutable report files, cancellation, and idempotent recovery protect against duplicate or foreign workers. Workflow tools are guarded both by dynamic activation and at execution time; prior active tools are restored conservatively when the run ends.
+Implementation and fix close gates require:
 
-## Git policy
+- a durable completed report
+- the same Worker turn at `agent_settled`
+- new reported commits reachable from the current named branch, including exact HEAD
+- a clean worktree
+- for implementation, every checkbox in the canonical ticket checked
 
-For a Git checkout, Ticket Flow requires a clean preflight and records the baseline. It creates and switches to `mepie/ticket-flow/<run-id>` only when the starting branch is exactly `main`; from every other branch it preserves and uses the current branch without creating or switching branches. Implementation/fix reports identify their commits; accepted commit IDs are persisted. Plan-driven completion mutations are staged only by their exact declared paths and committed with a deterministic `mepie(ticket-flow): record completion …` subject; unrelated staged or changed paths abort the transaction. Ledger-only completion creates no commit. Audits use only the persisted accepted commit set and never claim to audit uncommitted changes. Fix workers may modify the checkout and must report their implementation commits; only audit workers are read-only.
+Audit launch and close require a clean worktree, exact accepted HEAD, and an exact accepted commit set. Audit reports must repeat that set exactly, give one verdict for every canonical ticket checkbox requirement, and cite verified in-project `path:line` evidence. Audit tasks use the immutable prompt from the redesign contract, with only its two placeholders substituted. Repeated identical findings without a new accepted commit pause the run.
 
-## Completion mutations
+## Pause, abort, resume, and stop
 
-Every mutation is plan-driven, previewable in the durable strategy, and idempotent:
+- **Pause** prevents new progression. A running Worker may finish its turn; the widget says “pausing after current worker.”
+- **Abort** calls the Worker Pi context abort for the current turn, waits for settlement, and preserves the session.
+- **Resume** restores progression and reopens the exact persisted Worker session when its process/window is gone. It never resends old work. If a process died at an ambiguous command boundary, Ticket Flow marks the turn interrupted, pauses, and requires an explicit resume plus follow-up rather than risking duplicate delivery.
+- **Stop/cancel** terminally aborts when needed, closes only a fully verified owned tmux window, releases the project lock, and cancels the run.
 
-- `ledger-only`;
-- exact `text-replacement`;
-- `markdown-checkbox`;
-- `frontmatter`;
-- `append`/`append-markdown`;
-- `rename-file` or `move-file`.
+## Durable state and recovery
 
-Every non-ledger target must be one of the item's declared ticket/source/specification paths or an explicit `completionTargets` path approved during planning. Targets are canonicalized inside the trusted checkout, `.git`/repository-control paths, symlinks, and multiply-linked files are refused, and mutations use the same file-mutation queue as Pi's built-in edit/write tools.
+Ticket Flow stores global owner-only state under Pi's agent directory:
 
-## Audit and fixes
+```text
+state/ticketflow/<project-sha256>/<run-id>/
+├── run.json
+├── reports/              # immutable identity-bound reports
+└── .transport-token      # separate credential, never copied into JSON
 
-After implementation items are accepted, Ticket Flow creates a fresh read-only audit item. Its prompt is immutable and exactly the approved template, substituting only feature name, accepted commit IDs/range, ticket path, and spec path. Audit reports contain requirement verdicts, file-level evidence, and findings. Findings schedule a fix item, then a fresh audit. A clean audit permits terminal completion. The same unresolved finding twice without changed evidence pauses for the user.
+state/ticketflow/<project-sha256>.lock/
+└── owner.json
+```
 
-## Development
+`run.json` is the only authoritative workflow snapshot. There is no `state.json`, `plan.json`, or authoritative event journal. Writes are atomic and owner-only. Reports are content-hashed, owner-only, and never overwritten.
 
-Use Bun only:
+Before creating tmux, the coordinator persists a launch intent. tmux windows are tagged with run, Assignment, and operation IDs. Recovery reconciles the exact tags and stable socket/session/window/pane IDs, so a crash after window creation cannot create a duplicate. Foreign, ambiguous, or reused IDs are never killed.
+
+Legacy unfinished state under `state/ticket-flow` is intentionally not migrated. `/ticketflow tmux` refuses it with an actionable error.
+
+## Validation
 
 ```bash
 bun install
 bun run check
+pi -e .
 ```
 
-Tests use isolated state, deterministic clocks/IDs, fake tmux, authenticated native sockets, Git completion commits (including rename paths and recovery boundaries), injected append write/sync/close failures, widget width assertions, explicit sequential progression, audit/fix rounds, immutable-report/plan-forgery checks, and recovery ownership scenarios. No model credentials or paid calls are needed.
+For the real smoke test, start Pi inside tmux, run `/ticketflow tmux`, and complete a small disposable Git-backed ticket set.

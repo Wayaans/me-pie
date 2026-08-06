@@ -1,35 +1,32 @@
 import { Data } from "effect";
 
-export class ValidationError extends Data.TaggedError("ValidationError")<{
+export class TicketflowValidationError extends Data.TaggedError("TicketflowValidationError")<{
 	readonly message: string;
 	readonly path?: string;
 }> {}
 
-export class IllegalTransitionError extends Data.TaggedError("IllegalTransitionError")<{
-	readonly entity: "run" | "work-item";
-	readonly from: string;
-	readonly to: string;
-}> {}
-
-export class PersistenceError extends Data.TaggedError("PersistenceError")<{
+export class TicketflowPersistenceError extends Data.TaggedError("TicketflowPersistenceError")<{
 	readonly operation: string;
 	readonly path: string;
 	readonly cause: unknown;
 }> {}
 
-export class CorruptDataError extends Data.TaggedError("CorruptDataError")<{
-	readonly path: string;
+export class TicketflowTransitionError extends Data.TaggedError("TicketflowTransitionError")<{
+	readonly message: string;
+}> {}
+
+export class TicketflowTransportError extends Data.TaggedError("TicketflowTransportError")<{
 	readonly message: string;
 	readonly cause?: unknown;
 }> {}
 
-export class UnsupportedVersionError extends Data.TaggedError("UnsupportedVersionError")<{
-	readonly path: string;
-	readonly expected: number;
-	readonly actual: unknown;
+export class TicketflowBackendError extends Data.TaggedError("TicketflowBackendError")<{
+	readonly operation: string;
+	readonly message: string;
+	readonly cause?: unknown;
 }> {}
 
-export class LockContentionError extends Data.TaggedError("LockContentionError")<{
-	readonly path: string;
-	readonly owner?: unknown;
+export class TicketflowGitError extends Data.TaggedError("TicketflowGitError")<{
+	readonly message: string;
+	readonly cause?: unknown;
 }> {}
