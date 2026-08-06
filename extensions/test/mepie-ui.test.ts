@@ -126,6 +126,7 @@ test("dashboard refreshes model state after its session reset", async () => {
 	assert.equal(lines.length, 2);
 	assert.match(lines.join("\n"), /openai-codex\/gpt-test · medium/);
 	assert.match(lines[1] ?? "", /1%\/128k · \$0\.00 · — tok\/s · ◷ 5h 73%/);
+	assert.match(lines[1] ?? "", /No Git repository detected/);
 
 	for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
 });
