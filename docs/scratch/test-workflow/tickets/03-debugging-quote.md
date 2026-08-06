@@ -6,4 +6,4 @@
 
 **Status:** ready-for-agent
 
-- [ ] The `debugging` collection contains exactly one new `quote.md` file with exactly one non-empty Markdown blockquote and no other content except surrounding whitespace.
+- [x] The `debugging` collection contains exactly one new `quote.md` file with exactly one non-empty Markdown blockquote and no other content except surrounding whitespace.
