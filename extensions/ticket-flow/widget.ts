@@ -66,7 +66,7 @@ function workflowVisual(run: TicketflowRun, frame: number): WorkflowVisual {
 		return { icon: "⏸", label: "PAUSED", tone: "warning", animated: false };
 	}
 	if (run.phase === "failed") return { icon: "×", label: "FAILED", tone: "error", animated: false };
-	return { icon: spinner(frame), label: "RUNNING", tone: "accent", animated: true };
+	return { icon: "", label: "RUNNING", tone: "accent", animated: true };
 }
 
 function phaseVisual(phase: RunPhase): { readonly icon: string; readonly label: string; readonly tone: Tone } {
@@ -105,7 +105,7 @@ function assignmentStatus(run: TicketflowRun, frame: number, theme: Theme | unde
 	}
 	if (assignment.stage === "launching") return `${paint(theme, "accent", spinner(frame))} Launching Worker`;
 	if (assignment.stage === "ready") return `${paint(theme, "success", "●")} Worker ready · awaiting task`;
-	if (assignment.stage === "running") return `${paint(theme, "accent", spinner(frame))} Worker running · turn ${assignment.turn}`;
+	if (assignment.stage === "running") return `Worker running · turn ${assignment.turn}`;
 	if (assignment.stage === "settled") return `${paint(theme, "success", "✓")} Worker settled · turn ${assignment.turn}`;
 	return `${paint(theme, "warning", "!")} Worker interrupted · resume required`;
 }
@@ -150,7 +150,8 @@ export function renderTicketflowWidget(
 	const frame = options.frame ?? 0;
 	const theme = options.theme;
 	const workflow = workflowVisual(run, frame);
-	const compactStatus = `${paint(theme, workflow.tone, workflow.icon)} ${bold(theme, "TF")} ${paint(theme, workflow.tone, workflow.label)} · ${run.tickets.filter((ticket) => ticket.status === "completed").length}/${run.tickets.length}`;
+	const workflowIcon = workflow.icon ? `${paint(theme, workflow.tone, workflow.icon)} ` : "";
+	const compactStatus = `${workflowIcon}${bold(theme, "TF")} ${paint(theme, workflow.tone, workflow.label)} · ${run.tickets.filter((ticket) => ticket.status === "completed").length}/${run.tickets.length}`;
 	if (width < 24) return [fit(compactStatus, width)];
 
 	const innerWidth = width - 2;
@@ -164,7 +165,7 @@ export function renderTicketflowWidget(
 	const separator = `${border("├")}${border("─".repeat(innerWidth))}${border("┤")}`;
 	const lines: string[] = [
 		`${border("╭")}${border("─".repeat(innerWidth))}${border("╮")}`,
-		row(`${paint(theme, workflow.tone, workflow.icon)} ${bold(theme, "TICKET FLOW")}  ${paint(theme, workflow.tone, bold(theme, workflow.label))}`),
+		row(`${workflowIcon}${bold(theme, "TICKET FLOW")}  ${paint(theme, workflow.tone, bold(theme, workflow.label))}`),
 		separator,
 	];
 

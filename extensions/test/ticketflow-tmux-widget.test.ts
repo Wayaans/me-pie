@@ -123,7 +123,7 @@ function widgetRun(): TicketflowRun {
 	};
 }
 
-test("Ticket Flow widget is visual, animated, and never exceeds the terminal width", () => {
+test("Ticket Flow widget limits animation to active work and never exceeds the terminal width", () => {
 	const run = widgetRun();
 	for (let width = 0; width <= 120; width += 1) {
 		for (const line of renderTicketflowWidget(run, width)) assert.ok(visibleWidth(line) <= width, `width ${width}: ${JSON.stringify(line)}`);
@@ -134,8 +134,11 @@ test("Ticket Flow widget is visual, animated, and never exceeds the terminal wid
 	assert.match(firstFrame, /TICKET FLOW  RUNNING/);
 	assert.match(firstFrame, /◆ Implementation  ·  Ticket 1 of 2/);
 	assert.match(firstFrame, /Worker running · turn 1/);
+	assert.doesNotMatch(firstFrame, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] (?:TICKET FLOW|Worker running)/);
+	assert.match(firstFrame, /› ⠋ 1-界面/);
+	assert.match(nextFrame, /› ⠙ 1-界面/);
 	assert.match(firstFrame, /✓ 2-completed\.md/);
-	assert.notEqual(firstFrame, nextFrame, "the running indicator should advance between frames");
+	assert.notEqual(firstFrame, nextFrame, "the active ticket indicator should advance between frames");
 	assert.equal(footerStatus(run), "ticketflow · running · implementation 1/2");
 });
 
