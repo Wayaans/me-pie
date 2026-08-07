@@ -3,6 +3,8 @@ import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { renderTicketflowConfirmation } from "../ticket-flow/confirmation.ts";
 import {
 	assertTmuxSetupContext,
 	parseTicketflowCommand,
@@ -182,19 +184,42 @@ test("setup wizard asks for path attachments before the remaining fields and con
 		cwd: project,
 		model: { provider: "provider", id: "model" },
 		ui: {
-			custom: async () => { calls.push("custom:path attachment"); return attachments.shift(); },
+			custom: async () => {
+				if (attachments.length > 0) {
+					calls.push("custom:path attachment");
+					return attachments.shift();
+				}
+				calls.push("custom:ticketflow confirmation");
+				return true;
+			},
 			input: async (label: string) => { calls.push(`input:${label}`); return "provider/model"; },
 			editor: async (label: string, initial: string) => { calls.push(`editor:${label}`); return initial; },
 			select: async (label: string) => { calls.push(`select:${label}`); return "medium"; },
-			confirm: async (label: string, message: string) => { calls.push(`confirm:${label}:${message.includes("1-first.md")}`); return true; },
 		},
 	} as never;
 	const prepared = await runSetupWizard(ctx);
 	assert.ok(prepared);
 	assert.deepEqual(calls.map((call) => call.split(":").slice(0, 2).join(":")), [
-		"custom:path attachment", "custom:path attachment", "input:Model worker", "select:Thinking worker", "editor:Delegation prompt", "confirm:Start Ticket Flow?",
+		"custom:path attachment", "custom:path attachment", "input:Model worker", "select:Thinking worker", "editor:Delegation prompt", "custom:ticketflow confirmation",
 	]);
-	assert.match(calls.at(-1)!, /true$/);
 	assert.equal(prepared.tickets[0]!.name, "1-first.md");
 	assert.equal(await readFile(prepared.tickets[0]!.path, "utf8"), "- [ ] Do the work\n");
+});
+
+test("setup confirmation presents a bounded, informative launch summary", async () => {
+	const project = await temp("ticketflow-confirmation-");
+	const ticketsDirectory = path.join(project, "tickets");
+	await mkdir(ticketsDirectory);
+	await writeFile(path.join(ticketsDirectory, "1-complete.md"), "- [x] done\n");
+	await writeFile(path.join(ticketsDirectory, "2-build-a-very-long-feature-name.md"), "- [ ] first\n- [ ] second\n");
+	const prepared = await prepareSetup(setupInput(project, ticketsDirectory));
+
+	for (const width of [24, 48, 80, 120]) {
+		const lines = renderTicketflowConfirmation(prepared, width);
+		assert.ok(lines.some((line) => line.includes("TICKET FLOW")));
+		assert.ok(lines.some((line) => line.includes("Implement")));
+		assert.ok(lines.some((line) => line.includes("RUN SETTINGS")));
+		assert.ok(lines.some((line) => line.includes("Start Ticket Flow")));
+		for (const line of lines) assert.ok(visibleWidth(line) <= width, `width ${width}: ${JSON.stringify(line)}`);
+	}
 });
