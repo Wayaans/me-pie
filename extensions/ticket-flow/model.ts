@@ -20,12 +20,22 @@ export interface WorkerProfile {
 	readonly thinking: ThinkingLevel;
 }
 
+export interface SkippedTicket {
+	readonly order: number;
+	readonly name: string;
+	readonly path: string;
+	readonly requirements: readonly string[];
+	readonly reason: "already-complete";
+}
+
 export interface TicketflowSetup {
 	readonly ticketsDirectory: string;
 	readonly referencePaths: readonly string[];
 	readonly workerProfile: WorkerProfile;
 	readonly delegationTemplate: string;
 	readonly completionConvention: "all-markdown-checkboxes";
+	/** Optional for compatibility with runs created before completed-ticket filtering. */
+	readonly skippedTickets?: readonly SkippedTicket[];
 }
 
 export interface Ticket {

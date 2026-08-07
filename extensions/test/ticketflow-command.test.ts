@@ -79,6 +79,7 @@ test("setup orders natural numbered tickets and substitutes the exact supported 
 		[2, 3, "3-third.md"],
 	]);
 	assert.equal(prepared.setup.completionConvention, COMPLETION_CONVENTION);
+	assert.deepEqual(prepared.skippedTickets, []);
 	const first = prepared.tickets[0]!;
 	const canonicalReference = prepared.setup.referencePaths[0]!;
 	assert.equal(first.delegationPrompt, `${first.path}|1-first.md|1|3|${canonicalReference}`);
@@ -121,6 +122,31 @@ test("setup enforces the all-Markdown-checkbox completion convention", async () 
 	const noCheckboxProject = await temp("ticketflow-command-no-checkbox-");
 	const noCheckbox = await makeTicketDirectory(noCheckboxProject, ["1-empty.md"], "A prose ticket without a task list.\n");
 	await assert.rejects(prepareSetup(setupInput(noCheckboxProject, noCheckbox)), /no Markdown checkbox/);
+});
+
+test("setup excludes complete tickets and reindexes only runnable tickets", async () => {
+	const project = await temp("ticketflow-command-filter-");
+	const ticketsDirectory = path.join(project, "tickets");
+	await mkdir(ticketsDirectory);
+	await writeFile(path.join(ticketsDirectory, "1-complete.md"), "- [x] already done\n");
+	await writeFile(path.join(ticketsDirectory, "2-runnable.md"), "- [x] first part\n- [ ] remaining part\n");
+	await writeFile(path.join(ticketsDirectory, "3-complete.md"), "- [X] also done\n");
+	const prepared = await prepareSetup(setupInput(project, ticketsDirectory));
+
+	assert.deepEqual(prepared.tickets.map((ticket) => [ticket.index, ticket.order, ticket.name]), [
+		[0, 2, "2-runnable.md"],
+	]);
+	assert.match(prepared.tickets[0]!.delegationPrompt, /^1\/1 2-runnable\.md /);
+	assert.deepEqual(prepared.skippedTickets.map((ticket) => [ticket.order, ticket.name, ticket.reason]), [
+		[1, "1-complete.md", "already-complete"],
+		[3, "3-complete.md", "already-complete"],
+	]);
+	assert.deepEqual(prepared.setup.skippedTickets, prepared.skippedTickets);
+
+	await writeFile(path.join(ticketsDirectory, "2-runnable.md"), "- [x] first part\n- [x] remaining part\n");
+	const allComplete = await prepareSetup(setupInput(project, ticketsDirectory));
+	assert.deepEqual(allComplete.tickets, []);
+	assert.equal(allComplete.skippedTickets.length, 3);
 });
 
 test("setup path attachments normalize @ completion values and preserve ordinary paths", () => {

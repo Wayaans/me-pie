@@ -216,6 +216,7 @@ export class TicketflowCoordinator {
 			if (this.active && isTerminalPhase(this.active.run.phase)) await this.shutdownRuntime();
 			if (this.active) throw new Error(`Ticket Flow run ${this.active.run.id} is already active.`);
 			if (!input.orchestratorSessionId.trim()) throw new Error("Ticket Flow requires a persistent Main Pi session ID.");
+			if (input.tickets.length === 0) throw new Error("All discovered tickets are already complete; no Ticket Flow run is needed.");
 			await this.backend.validate(signal);
 			await assertNoLegacyRun(input.projectPath, this.agentDir);
 			const unfinished = await discoverRuns(input.projectPath, this.agentDir);
@@ -225,6 +226,12 @@ export class TicketflowCoordinator {
 			const lock = await acquireProjectLock(paths, id, input.orchestratorSessionId);
 			try {
 				const git = await gitPreflight(paths.projectPath, this.gitRunner, signal);
+				for (const ticket of input.tickets) {
+					if (await isTicketComplete(ticket.path)) throw new Error(`Ticket ${ticket.name} became complete during setup; rerun Ticket Flow to refresh the selection.`);
+				}
+				for (const ticket of input.setup.skippedTickets ?? []) {
+					if (!await isTicketComplete(ticket.path)) throw new Error(`Skipped ticket ${ticket.name} became incomplete during setup; rerun Ticket Flow to refresh the selection.`);
+				}
 				const timestamp = this.timestamp();
 				const run: TicketflowRun = {
 					version: TICKETFLOW_VERSION,
@@ -422,7 +429,7 @@ export class TicketflowCoordinator {
 			const round = Math.max(0, ...run.auditRounds.map((candidate) => candidate.round)) + 1;
 			const audit = buildAuditPrompt({
 				featureOrCommits: run.git.acceptedCommitIds.join(" "),
-				ticketsAndReferences: [run.setup.ticketsDirectory, ...run.setup.referencePaths].join(", "),
+				ticketsAndReferences: [...run.tickets.map((ticket) => ticket.path), ...run.setup.referencePaths].join(", "),
 			});
 			assignment = {
 				id: `audit-${round}-${this.newId()}`,

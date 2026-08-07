@@ -77,10 +77,17 @@ export async function runSetupWizard(ctx: ExtensionCommandContext): Promise<Prep
 		workerProfile,
 		delegationTemplate,
 	});
-	const ordered = prepared.tickets.map((ticket) => `${String(ticket.order).padStart(2, "0")}. ${ticket.name}\n   ${ticket.path}`).join("\n");
+	const formatTickets = (tickets: readonly { readonly order: number; readonly name: string; readonly path: string }[]) =>
+		tickets.map((ticket) => `${String(ticket.order).padStart(2, "0")}. ${ticket.name}\n   ${ticket.path}`).join("\n");
+	if (prepared.tickets.length === 0) {
+		ctx.ui.notify(`All ${prepared.skippedTickets.length} tickets are already complete. No Ticket Flow run was created.`, "info");
+		return undefined;
+	}
+	const runnable = formatTickets(prepared.tickets);
+	const skipped = prepared.skippedTickets.length > 0 ? formatTickets(prepared.skippedTickets) : "None";
 	const confirmed = await ctx.ui.confirm(
 		"Start Ticket Flow?",
-		`Ordered tickets:\n${ordered}\n\nCompletion: every Markdown checkbox in each ticket must be checked.\nWorker: ${workerProfile.model} · ${workerProfile.thinking}`,
+		`Tickets to implement (${prepared.tickets.length}):\n${runnable}\n\nSkipped as already complete (${prepared.skippedTickets.length}):\n${skipped}\n\nCompletion: every Markdown checkbox in each ticket must be checked.\nWorker: ${workerProfile.model} · ${workerProfile.thinking}`,
 	);
 	return confirmed ? prepared : undefined;
 }

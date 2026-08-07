@@ -1,7 +1,7 @@
 import { lstat, realpath, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { Ticket, TicketflowSetup, WorkerProfile } from "./model.ts";
+import type { SkippedTicket, Ticket, TicketflowSetup, WorkerProfile } from "./model.ts";
 import { exactModelParts, THINKING_LEVELS } from "./model.ts";
 
 export const DELEGATION_PLACEHOLDERS = ["ticketPath", "ticketName", "ticketIndex", "ticketCount", "referencePaths"] as const;
@@ -20,6 +20,7 @@ export interface SetupInput {
 export interface PreparedSetup {
 	readonly setup: TicketflowSetup;
 	readonly tickets: readonly Ticket[];
+	readonly skippedTickets: readonly SkippedTicket[];
 }
 
 export function sha256(value: string): string {
@@ -78,28 +79,40 @@ export async function prepareSetup(input: SetupInput): Promise<PreparedSetup> {
 		if (index > 0 && ordered[index - 1]!.order === current.order) throw new Error(`Duplicate ticket order ${current.order}: ${ordered[index - 1]!.name} and ${current.name}.`);
 		if (current.order !== index + 1) throw new Error(`Missing ticket order ${index + 1}; found ${current.order} (${current.name}).`);
 	}
-	const referenceText = referencePaths.join("\n");
-	const tickets: Ticket[] = [];
-	for (let index = 0; index < ordered.length; index += 1) {
-		const entry = ordered[index]!;
+	const candidates = [];
+	for (const entry of ordered) {
 		const ticketPath = await realpath(path.join(ticketsDirectory, entry.name));
 		const content = await readFile(ticketPath, "utf8");
 		CHECKBOX.lastIndex = 0;
 		const checkboxMatches = [...content.matchAll(CHECKBOX)];
 		if (!checkboxMatches.length) throw new Error(`Ticket ${entry.name} has no Markdown checkbox; v1 completion requires every checkbox to be checked.`);
+		candidates.push({
+			...entry,
+			path: ticketPath,
+			requirements: checkboxMatches.map((match) => match[2]!),
+			complete: checkboxMatches.every((match) => match[1]?.toLowerCase() === "x"),
+		});
+	}
+	const runnable = candidates.filter((candidate) => !candidate.complete);
+	const skippedTickets: SkippedTicket[] = candidates
+		.filter((candidate) => candidate.complete)
+		.map((candidate) => ({ order: candidate.order, name: candidate.name, path: candidate.path, requirements: candidate.requirements, reason: "already-complete" }));
+	const referenceText = referencePaths.join("\n");
+	const tickets: Ticket[] = runnable.map((candidate, index) => {
 		const prompt = substituteDelegationTemplate(delegationTemplate, {
-			ticketPath,
-			ticketName: entry.name,
+			ticketPath: candidate.path,
+			ticketName: candidate.name,
 			ticketIndex: String(index + 1),
-			ticketCount: String(ordered.length),
+			ticketCount: String(runnable.length),
 			referencePaths: referenceText,
 		});
-		if (Buffer.byteLength(prompt, "utf8") > 30 * 1024 || prompt.split("\n").length > 1_500) throw new Error(`Delegation prompt for ${entry.name} exceeds Ticket Flow transport bounds.`);
-		tickets.push({ index, order: entry.order, name: entry.name, path: ticketPath, delegationPrompt: prompt, requirements: checkboxMatches.map((match) => match[2]!), status: "queued", acceptedCommitIds: [] });
-	}
+		if (Buffer.byteLength(prompt, "utf8") > 30 * 1024 || prompt.split("\n").length > 1_500) throw new Error(`Delegation prompt for ${candidate.name} exceeds Ticket Flow transport bounds.`);
+		return { index, order: candidate.order, name: candidate.name, path: candidate.path, delegationPrompt: prompt, requirements: candidate.requirements, status: "queued", acceptedCommitIds: [] };
+	});
 	return {
-		setup: { ticketsDirectory, referencePaths, workerProfile: input.workerProfile, delegationTemplate, completionConvention: COMPLETION_CONVENTION },
+		setup: { ticketsDirectory, referencePaths, workerProfile: input.workerProfile, delegationTemplate, completionConvention: COMPLETION_CONVENTION, skippedTickets },
 		tickets,
+		skippedTickets,
 	};
 }
 

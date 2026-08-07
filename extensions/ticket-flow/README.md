@@ -12,7 +12,7 @@ This version is a breaking replacement for the former planning workflow. It has 
 - numbered Markdown ticket files (`01-name.md`, `02-name.md`, …)
 - at least one Markdown task-list checkbox in every ticket
 
-A ticket is complete only when every Markdown checkbox in that ticket is checked. Workers, not Main, own implementation commits and ticket marking.
+A ticket is complete only when every Markdown checkbox in that ticket is checked. Setup excludes tickets that are already complete, shows them separately in the confirmation, and reindexes the remaining runnable tickets. If every ticket is complete, no run is created. Workers, not Main, own implementation commits and ticket marking.
 
 ## Commands
 
@@ -45,7 +45,7 @@ Supported delegation placeholders are:
 {referencePaths}
 ```
 
-Ticket Flow replaces these placeholders only. The resulting task is sent to the Worker without any prefix or suffix. Setup rejects duplicate, missing, or ambiguous ticket numbers and displays the canonical order for confirmation before creating durable state.
+Ticket Flow replaces these placeholders only. The resulting task is sent to the Worker without any prefix or suffix. Setup rejects duplicate, missing, or ambiguous ticket numbers, excludes tickets whose Markdown checkboxes are all checked, and displays runnable and skipped tickets separately before creating durable state. `{ticketIndex}` and `{ticketCount}` describe only runnable tickets.
 
 ## Tool roles
 
@@ -91,7 +91,7 @@ Implementation and fix close gates require:
 - a clean worktree
 - for implementation, every checkbox in the canonical ticket checked
 
-Audit launch and close require a clean worktree, exact accepted HEAD, and an exact accepted commit set. Audit reports must repeat that set exactly, give one verdict for every canonical ticket checkbox requirement, and cite verified in-project `path:line` evidence. Audit tasks use the immutable prompt from the redesign contract, with only its two placeholders substituted. Repeated identical findings without a new accepted commit pause the run.
+Audit launch and close require a clean worktree, exact accepted HEAD, and an exact accepted commit set. Audit reports must repeat that set exactly, give one verdict for every runnable ticket checkbox requirement, and cite verified in-project `path:line` evidence. Audit tasks use the immutable prompt from the redesign contract, with only its two placeholders substituted. Repeated identical findings without a new accepted commit pause the run.
 
 ## Pause, abort, resume, and stop
 
