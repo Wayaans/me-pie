@@ -149,6 +149,25 @@ test("ask-me questionnaire never renders lines wider than the terminal", () => {
 	}
 });
 
+test("ask-me confirmation questions include a custom written answer option", () => {
+	const request = normalizeAskMeRequest({
+		questions: [{
+			id: "deploy",
+			type: "confirmation",
+			question: "Deploy now?",
+		}],
+	});
+	const component = new AskMeQuestionnaire(
+		request,
+		{ requestRender() {} } as never,
+		plainTheme as never,
+		{ matches: () => false } as never,
+		() => {},
+	);
+
+	assert.match(component.render(100).join("\n"), /Yes[\s\S]*No[\s\S]*Write another answer/);
+});
+
 test("ask-me recommendation shortcut fills without submitting and requires explicit confirmation", () => {
 	const request = normalizeAskMeRequest({
 		questions: [{
@@ -245,6 +264,42 @@ test("ask-me RPC always offers and accepts a custom selection answer", async () 
 		id: "database",
 		value: "SQLite",
 		label: "SQLite",
+		source: "typed",
+	}]);
+});
+
+test("ask-me RPC accepts a custom confirmation answer", async () => {
+	const tool = captureTool();
+	let displayedOptions: string[] = [];
+	const result = await tool.execute(
+		"tool-1",
+		{
+			questions: [{
+				id: "deploy",
+				type: "confirmation",
+				question: "Deploy now?",
+			}],
+		},
+		undefined,
+		undefined,
+		{
+			mode: "rpc",
+			hasUI: true,
+			ui: {
+				select: async (_title: string, options: string[]) => {
+					displayedOptions = options;
+					return options.find((option) => option.includes("Write another answer"));
+				},
+				input: async () => "Only after CI passes",
+				notify() {},
+			},
+		} as never,
+	) as { details: AskMeDetails };
+	assert.ok(displayedOptions.some((option) => option.includes("Write another answer")));
+	assert.deepEqual(result.details.answers, [{
+		id: "deploy",
+		value: "Only after CI passes",
+		label: "Only after CI passes",
 		source: "typed",
 	}]);
 });

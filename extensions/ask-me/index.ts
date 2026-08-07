@@ -99,8 +99,8 @@ async function askQuestionWithRpc(
 		const description = option.description ? ` — ${option.description}` : "";
 		return `${optionIndex + 1}. ${option.label}${description}`;
 	});
-	const customIndex = question.type === "selection" ? displays.length : -1;
-	if (customIndex >= 0) displays.push(`${displays.length + 1}. Write another answer`);
+	const customIndex = displays.length;
+	displays.push(`${displays.length + 1}. Write another answer`);
 	const skipIndex = question.required ? -1 : displays.length;
 	if (skipIndex >= 0) displays.push(`${displays.length + 1}. Skip this question`);
 
@@ -201,7 +201,7 @@ export default function askMe(pi: ExtensionAPI): void {
 		name: "ask_me",
 		label: "ask-me",
 		description:
-			"Interview the user with one or more free-form, single-selection, or yes/no questions. Every selection question includes an option to write a custom answer. Use whenever progress requires user input, clarification, a choice, or confirmation. Related questions should be asked in one call. The completed tool result prints every question and answer. Recommendations require an answer and a reason and are never accepted automatically.",
+			"Interview the user with one or more free-form, single-selection, or yes/no questions. Every question allows the user to write an answer, including selection and confirmation questions. Use whenever progress requires user input, clarification, a choice, or confirmation. Related questions should be asked in one call. The completed tool result prints every question and answer. Recommendations require an answer and a reason and are never accepted automatically.",
 		promptSnippet: "Ask the user interactive questions, selections, or confirmations",
 		promptGuidelines: [
 			"Use ask_me whenever progress requires user input, clarification, selection, interviewing, or confirmation instead of asking only in prose.",

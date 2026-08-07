@@ -99,14 +99,14 @@ export class AskMeQuestionnaire implements Focusable {
 	}
 
 	private displayOptions(question: AskMeQuestion): DisplayOption[] {
-		if (question.type === "confirmation") {
-			return [
-				{ value: "yes", label: "Yes" },
-				{ value: "no", label: "No" },
-			];
-		}
+		const options = question.type === "confirmation"
+			? [
+					{ value: "yes", label: "Yes" },
+					{ value: "no", label: "No" },
+				]
+			: question.options;
 		return [
-			...question.options,
+			...options,
 			{ value: "__other__", label: "Write another answer", custom: true },
 		];
 	}
