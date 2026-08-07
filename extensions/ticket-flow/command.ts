@@ -3,6 +3,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { confirmTicketflowSetup } from "./confirmation.ts";
 import type { ThinkingLevel, WorkerProfile } from "./model.ts";
 import { THINKING_LEVELS } from "./model.ts";
+import { selectWorkerModel } from "./model-picker.ts";
 import { editPathAttachments, normalizePathAttachment, normalizeReferenceAttachments } from "./path-attachments.ts";
 import { prepareSetup, type PreparedSetup } from "./tickets.ts";
 
@@ -41,10 +42,6 @@ export function assertTmuxSetupContext(ctx: Pick<ExtensionCommandContext, "mode"
 	if (!environment.TMUX?.trim()) throw new Error("/ticketflow tmux requires the current Pi client to be inside tmux.");
 }
 
-function defaultModel(ctx: ExtensionCommandContext): string {
-	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
-}
-
 export async function runSetupWizard(ctx: ExtensionCommandContext): Promise<PreparedSetup | undefined> {
 	const ticketsText = await editPathAttachments(ctx, {
 		title: "Tickets directory",
@@ -60,7 +57,7 @@ export async function runSetupWizard(ctx: ExtensionCommandContext): Promise<Prep
 		multiline: true,
 	});
 	if (referenceText === undefined) return undefined;
-	const model = await ctx.ui.input("Model worker", defaultModel(ctx) || "Exact provider/model");
+	const model = await selectWorkerModel(ctx);
 	if (model === undefined) return undefined;
 	const thinking = await ctx.ui.select("Thinking worker", [...THINKING_LEVELS]);
 	if (thinking === undefined) return undefined;
@@ -68,7 +65,7 @@ export async function runSetupWizard(ctx: ExtensionCommandContext): Promise<Prep
 	const delegationTemplate = await ctx.ui.editor("Delegation prompt", defaultTemplate);
 	if (delegationTemplate === undefined) return undefined;
 	const workerProfile: WorkerProfile = {
-		model: model.trim() || defaultModel(ctx),
+		model,
 		thinking: thinking as ThinkingLevel,
 	};
 	const prepared = await prepareSetup({

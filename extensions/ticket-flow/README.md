@@ -31,7 +31,7 @@ A ticket is complete only when every Markdown checkbox in that ticket is checked
 
 - Tickets directory, with `@` path autocomplete
 - optional reference file paths, one per line, with `@` path autocomplete
-- exact Worker `provider/model`
+- searchable Worker model selection from authenticated, session-scoped `provider/model` identifiers
 - explicit Worker thinking level
 - immutable delegation prompt template
 

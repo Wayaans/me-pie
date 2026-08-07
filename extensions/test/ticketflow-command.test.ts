@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { renderTicketflowConfirmation } from "../ticket-flow/confirmation.ts";
+import { buildWorkerModelOptions, filterWorkerModelOptions } from "../ticket-flow/model-picker.ts";
 import {
 	assertTmuxSetupContext,
 	parseTicketflowCommand,
@@ -173,26 +174,40 @@ test("setup path autocomplete falls back to directory browsing when fd is unavai
 	assert.deepEqual(fileSuggestions?.items.map((item) => item.value), ["@reference.md"]);
 });
 
+test("Worker model picker scopes, sorts, and fuzzily filters exact model references", () => {
+	const model = (provider: string, id: string, name = id) => ({ provider, id, name }) as never;
+	const current = model("openai", "gpt-5");
+	const sonnet = model("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5");
+	const excluded = model("google", "gemini-pro", "Gemini Pro");
+	const options = buildWorkerModelOptions({
+		availableModels: [sonnet, excluded, current, sonnet],
+		scopedModels: [{ model: current }, { model: sonnet }],
+		currentModel: current,
+	});
+	assert.deepEqual(options.map((option) => option.value), ["openai/gpt-5", "anthropic/claude-sonnet-4-5"]);
+	assert.deepEqual(filterWorkerModelOptions(options, "sonnet").map((option) => option.value), ["anthropic/claude-sonnet-4-5"]);
+	assert.deepEqual(filterWorkerModelOptions(options, "anthropic 4.5").map((option) => option.value), ["anthropic/claude-sonnet-4-5"]);
+});
+
 test("setup wizard asks for path attachments before the remaining fields and confirms the prepared order", async () => {
 	const project = await temp("ticketflow-command-wizard-");
 	const ticketsDirectory = await makeTicketDirectory(project, ["1-first.md"]);
 	const reference = path.join(project, "reference.md");
 	await writeFile(reference, "reference\n");
 	const calls: string[] = [];
-	const attachments = [`@${ticketsDirectory}`, `@${reference}`];
+	const customResults: unknown[] = [`@${ticketsDirectory}`, `@${reference}`, "provider/model", true];
+	const availableModel = { provider: "provider", id: "model", name: "Model" } as never;
 	const ctx = {
 		cwd: project,
-		model: { provider: "provider", id: "model" },
+		model: availableModel,
+		modelRegistry: { getAvailable: () => [availableModel] },
+		scopedModels: [],
 		ui: {
 			custom: async () => {
-				if (attachments.length > 0) {
-					calls.push("custom:path attachment");
-					return attachments.shift();
-				}
-				calls.push("custom:ticketflow confirmation");
-				return true;
+				const labels = ["custom:path attachment", "custom:path attachment", "custom:model worker", "custom:ticketflow confirmation"];
+				calls.push(labels[calls.filter((call) => call.startsWith("custom:")).length]!);
+				return customResults.shift();
 			},
-			input: async (label: string) => { calls.push(`input:${label}`); return "provider/model"; },
 			editor: async (label: string, initial: string) => { calls.push(`editor:${label}`); return initial; },
 			select: async (label: string) => { calls.push(`select:${label}`); return "medium"; },
 		},
@@ -200,7 +215,7 @@ test("setup wizard asks for path attachments before the remaining fields and con
 	const prepared = await runSetupWizard(ctx);
 	assert.ok(prepared);
 	assert.deepEqual(calls.map((call) => call.split(":").slice(0, 2).join(":")), [
-		"custom:path attachment", "custom:path attachment", "input:Model worker", "select:Thinking worker", "editor:Delegation prompt", "custom:ticketflow confirmation",
+		"custom:path attachment", "custom:path attachment", "custom:model worker", "select:Thinking worker", "editor:Delegation prompt", "custom:ticketflow confirmation",
 	]);
 	assert.equal(prepared.tickets[0]!.name, "1-first.md");
 	assert.equal(await readFile(prepared.tickets[0]!.path, "utf8"), "- [ ] Do the work\n");
