@@ -6,7 +6,6 @@ Mepie is a [Pi](https://pi.dev) package for distributing extensions, skills, pro
 
 - [Bun](https://bun.sh)
 - Pi
-- tmux for the `ticket-flow` extension (`/ticketflow`)
 - Node.js 22.19 or newer when running Pi through Node.js
 
 ## Setup
@@ -55,7 +54,6 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `localize` — translate and refine prompts into English before submission.
 - `mepie-ui` — add a theme-aware PI header and model, context, cost, and Git dashboard.
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
-- `ticket-flow` — execute numbered tickets strictly sequentially through verified persistent Pi Workers, then audit and fix until clean. Start with `/ticketflow tmux`; see [`extensions/ticket-flow/README.md`](extensions/ticket-flow/README.md).
 
 ## Add an extension
 
