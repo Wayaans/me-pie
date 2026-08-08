@@ -51,3 +51,25 @@ _Avoid_: Abort
 **Completion convention**:
 A Ticket is complete only when it contains at least one Markdown task-list checkbox and every such checkbox is checked.
 _Avoid_: Completion strategy
+
+## Terminal Environment language
+
+**Environment**:
+The active terminal multiplexer that owns addressable terminal targets.
+_Avoid_: Backend when discussing user-visible terminal behavior
+
+**Target**:
+One addressable terminal object, such as a tmux session, window, or pane.
+_Avoid_: Worker, terminal when the exact addressable object matters
+
+**Agent Run**:
+One coding-agent process launched in a Target.
+_Avoid_: Worker, Assignment
+
+**Delivery**:
+One literal prompt or command successfully sent to a Target.
+_Avoid_: Message when referring to terminal input
+
+**Send Signal**:
+A sequenced notification created after a successful Delivery and observed by workspace wait.
+_Avoid_: Completion signal, because it does not prove an Agent Run finished
