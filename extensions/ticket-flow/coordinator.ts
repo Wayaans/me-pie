@@ -10,6 +10,7 @@ import type {
 	OperationCheckpoint,
 	ReportReference,
 	StoredReport,
+	Ticket,
 	TicketflowRun,
 	WorkerIdentity,
 	WorkerReport,
@@ -56,7 +57,14 @@ import {
 	verifyWorker,
 } from "./reducer.ts";
 import { AUDIT_PROMPT_TEMPLATE, buildAuditPrompt, buildFixPrompt, findingsHash, validateAuditReport, verifyAuditEvidence } from "./audit.ts";
-import { isTicketComplete, sha256 } from "./tickets.ts";
+import {
+	assertDelegationPromptBounds,
+	buildDelegationPrompt,
+	cwdRelativePath,
+	isTicketComplete,
+	sha256,
+	validateDelegationTemplate,
+} from "./tickets.ts";
 import { PermanentTransportEventError, TransportServer, type TransportIdentity, type TransportReportEvent, type TransportSettledEvent } from "./transport.ts";
 
 export interface CoordinatorOptions {
@@ -397,6 +405,31 @@ export class TicketflowCoordinator {
 		});
 	}
 
+	private delegationPrompt(run: TicketflowRun, ticket: Ticket, template = run.setup.delegationTemplate): string {
+		const prompt = buildDelegationPrompt(template, {
+			ticketPath: cwdRelativePath(run.projectPath, ticket.path),
+			ticketName: ticket.name,
+			ticketIndex: String(ticket.index + 1),
+			ticketCount: String(run.tickets.length),
+			referencePaths: run.setup.referencePaths.map((referencePath) => cwdRelativePath(run.projectPath, referencePath)).join("\n"),
+		});
+		assertDelegationPromptBounds(prompt, ticket.name);
+		return prompt;
+	}
+
+	updateDelegationTemplate(template: string): Effect.Effect<TicketflowRun, Error> {
+		return this.operation(async () => {
+			const validated = validateDelegationTemplate(template);
+			return this.mutate((run) => {
+				if (isTerminalPhase(run.phase)) throw new Error(`Ticket Flow is ${run.phase}.`);
+				const tickets = run.tickets.map((ticket) => ticket.status === "queued"
+					? { ...ticket, delegationPrompt: this.delegationPrompt(run, ticket, validated) }
+					: ticket);
+				return patched(run, { setup: { ...run.setup, delegationTemplate: validated }, tickets }, this.timestamp());
+			});
+		});
+	}
+
 	private async createAssignment(run: TicketflowRun): Promise<{ readonly run: TicketflowRun; readonly assignment: Assignment }> {
 		const timestamp = this.timestamp();
 		const attemptBaseCommit = await assertAttemptReady(run.projectPath, run.git, this.gitRunner);
@@ -404,19 +437,20 @@ export class TicketflowCoordinator {
 		if (run.phase === "implementation") {
 			const ticket = run.tickets[run.currentTicket];
 			if (!ticket) throw new Error("No queued implementation ticket remains.");
+			const prompt = this.delegationPrompt(run, ticket);
 			const substitutions = {
-				"{ticketPath}": ticket.path,
+				"{ticketPath}": cwdRelativePath(run.projectPath, ticket.path),
 				"{ticketName}": ticket.name,
 				"{ticketIndex}": String(ticket.index + 1),
 				"{ticketCount}": String(run.tickets.length),
-				"{referencePaths}": run.setup.referencePaths.join("\n"),
+				"{referencePaths}": run.setup.referencePaths.map((referencePath) => cwdRelativePath(run.projectPath, referencePath)).join("\n"),
 			};
 			assignment = {
 				id: `implementation-${ticket.order}-${this.newId()}`,
 				kind: "implementation",
 				title: ticket.name,
-				prompt: ticket.delegationPrompt,
-				promptHash: sha256(ticket.delegationPrompt),
+				prompt,
+				promptHash: sha256(prompt),
 				promptSubstitutions: substitutions,
 				ticketIndex: ticket.index,
 				attemptBaseCommit,

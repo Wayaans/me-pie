@@ -159,6 +159,32 @@ test("coordinator deterministically delegates exact task, persists report/settle
 	await Effect.runPromise(coordinator.shutdown());
 });
 
+test("updating the delegation template preserves the active assignment and changes the next implementation delegation", async () => {
+	const project = await repository();
+	await writeFile(path.join(project, "tickets", "2-follow-up.md"), "# Follow-up\n\n- [ ] Implement the follow-up\n");
+	await git(project, "add", ".");
+	await git(project, "commit", "-m", "add follow-up ticket");
+	const agentDir = await temp("ticketflow-coordinator-prompt-agent-");
+	const prepared = await prepareSetup({
+		projectPath: project, ticketsDirectory: "tickets", referencePaths: [], workerProfile: profile,
+		delegationTemplate: "Original {ticketName} at {ticketPath}",
+	});
+	const backend = new FakeWorkerBackend(prepared.tickets[0]!.path);
+	let sequence = 0;
+	const coordinator = new TicketflowCoordinator({ backend, agentDir, newId: () => `prompt-id-${++sequence}` });
+	await Effect.runPromise(coordinator.createRun({ projectPath: project, orchestratorSessionId: "main-session", setup: prepared.setup, tickets: prepared.tickets }));
+	const active = await Effect.runPromise(coordinator.delegate());
+	const originalTask = active.initialTask;
+
+	const updated = await Effect.runPromise(coordinator.updateDelegationTemplate("Updated {ticketName} at {ticketPath}"));
+	assert.equal(updated.assignment?.prompt, originalTask);
+	assert.match(updated.tickets[1]!.delegationPrompt, /^Updated 2-follow-up\.md at tickets\/2-follow-up\.md/);
+	assert.match(updated.tickets[1]!.delegationPrompt, /Call ticketflow_report with status=blocked/);
+	assert.equal((await Effect.runPromise(coordinator.resumeWorker(active.workerId))).initialTask, originalTask);
+	await Effect.runPromise(coordinator.stop());
+	await Effect.runPromise(coordinator.shutdown());
+});
+
 test("audit findings always create a fixer and a fresh audit before clean completion", async () => {
 	const project = await repository();
 	const agentDir = await temp("ticketflow-coordinator-fix-agent-");

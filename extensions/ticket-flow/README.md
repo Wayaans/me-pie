@@ -23,6 +23,7 @@ A ticket is complete only when every Markdown checkbox in that ticket is checked
 /ticketflow status
 /ticketflow pause
 /ticketflow resume
+/ticketflow prompt      # edit future implementation delegation prompts
 /ticketflow stop
 /ticketflow cancel      # confirmed stop alias
 ```
@@ -33,7 +34,7 @@ A ticket is complete only when every Markdown checkbox in that ticket is checked
 - optional reference file paths, one per line, with `@` path autocomplete
 - searchable Worker model selection from authenticated, session-scoped `provider/model` identifiers
 - explicit Worker thinking level
-- immutable delegation prompt template
+- delegation prompt template
 
 Supported delegation placeholders are:
 
@@ -45,7 +46,11 @@ Supported delegation placeholders are:
 {referencePaths}
 ```
 
-Ticket Flow replaces these placeholders only. The resulting task is sent to the Worker without any prefix or suffix. Setup rejects duplicate, missing, or ambiguous ticket numbers, excludes tickets whose Markdown checkboxes are all checked, and displays runnable and skipped tickets separately before creating durable state. `{ticketIndex}` and `{ticketCount}` describe only runnable tickets.
+Ticket Flow replaces these placeholders only. Ticket and reference placeholders use paths relative to the Worker's CWD, not absolute paths. Ticket Flow then appends a workflow instruction that identifies the Worker role and requires blocked user-confirmation questions to be reported to Main through `ticketflow_report`; AFK Workers must not ask the unavailable user directly. The complete resulting task is sent byte-for-byte.
+
+During a run, `/ticketflow prompt` opens the current custom template for editing. It durably regenerates queued implementation prompts, so the next implementation delegation uses the update. It never changes an active Assignment, and it does not alter strict audit or fix prompts.
+
+Setup rejects duplicate, missing, or ambiguous ticket numbers, excludes tickets whose Markdown checkboxes are all checked, and displays runnable and skipped tickets separately before creating durable state. `{ticketIndex}` and `{ticketCount}` describe only runnable tickets.
 
 ## Tool roles
 

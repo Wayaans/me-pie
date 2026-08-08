@@ -6,6 +6,9 @@ import { exactModelParts, THINKING_LEVELS } from "./model.ts";
 
 export const DELEGATION_PLACEHOLDERS = ["ticketPath", "ticketName", "ticketIndex", "ticketCount", "referencePaths"] as const;
 export const COMPLETION_CONVENTION = "all-markdown-checkboxes" as const;
+export const WORKFLOW_DELEGATION_PROMPT = `Ticket and reference paths in this task are relative to CWD.
+
+This run comes from a Ticket Flow workflow, and you are its Worker. If the ticket or specification is blocked and requires user confirmation, do not ask the user directly. Call ticketflow_report with status=blocked and include your questions for Main. This is an AFK implementation run, so the user is unavailable.`;
 const CHECKBOX = /^\s*[-*+]\s+\[([ xX])\]\s+(\S.*)$/gm;
 const CONTROL = /[\0\r\n]/;
 
@@ -32,6 +35,19 @@ function assertSafeText(value: string, field: string, preserveBytes = false): st
 	if (!normalized) throw new Error(`${field} must be non-empty.`);
 	if (value.includes("\0") || (!preserveBytes && CONTROL.test(value))) throw new Error(`${field} contains control characters.`);
 	return preserveBytes ? value : normalized;
+}
+
+export function validateDelegationTemplate(template: string): string {
+	const validated = assertSafeText(template, "Delegation prompt", true);
+	// Validate placeholders before a run is created or its durable template changes.
+	substituteDelegationTemplate(validated, {
+		ticketPath: "ticket.md",
+		ticketName: "ticket.md",
+		ticketIndex: "1",
+		ticketCount: "1",
+		referencePaths: "reference.md",
+	});
+	return validated;
 }
 
 async function canonicalExisting(input: string, projectPath: string, expected: "file" | "directory"): Promise<string> {
@@ -61,13 +77,30 @@ export function substituteDelegationTemplate(
 	return template.replace(/\{(ticketPath|ticketName|ticketIndex|ticketCount|referencePaths)\}/g, (_marker, name: keyof typeof values) => values[name]);
 }
 
+export function buildDelegationPrompt(
+	template: string,
+	values: Readonly<Record<(typeof DELEGATION_PLACEHOLDERS)[number], string>>,
+): string {
+	return `${substituteDelegationTemplate(template, values)}\n\n${WORKFLOW_DELEGATION_PROMPT}`;
+}
+
+export function cwdRelativePath(projectPath: string, targetPath: string): string {
+	return path.relative(projectPath, targetPath) || ".";
+}
+
+export function assertDelegationPromptBounds(prompt: string, ticketName: string): void {
+	if (Buffer.byteLength(prompt, "utf8") > 30 * 1024 || prompt.split("\n").length > 1_500) {
+		throw new Error(`Delegation prompt for ${ticketName} exceeds Ticket Flow transport bounds.`);
+	}
+}
+
 export async function prepareSetup(input: SetupInput): Promise<PreparedSetup> {
 	exactModelParts(input.workerProfile.model);
 	if (!THINKING_LEVELS.includes(input.workerProfile.thinking)) throw new Error("Worker thinking level must be explicit and supported.");
 	const projectPath = await realpath(input.projectPath);
 	const ticketsDirectory = await canonicalExisting(assertSafeText(input.ticketsDirectory, "Tickets directory"), projectPath, "directory");
 	const referencePaths = await Promise.all(input.referencePaths.map((candidate) => canonicalExisting(assertSafeText(candidate, "Reference path"), projectPath, "file")));
-	const delegationTemplate = assertSafeText(input.delegationTemplate, "Delegation prompt", true);
+	const delegationTemplate = validateDelegationTemplate(input.delegationTemplate);
 	const names = (await readdir(ticketsDirectory, { withFileTypes: true }))
 		.filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
 		.map((entry) => entry.name);
@@ -97,16 +130,16 @@ export async function prepareSetup(input: SetupInput): Promise<PreparedSetup> {
 	const skippedTickets: SkippedTicket[] = candidates
 		.filter((candidate) => candidate.complete)
 		.map((candidate) => ({ order: candidate.order, name: candidate.name, path: candidate.path, requirements: candidate.requirements, reason: "already-complete" }));
-	const referenceText = referencePaths.join("\n");
+	const referenceText = referencePaths.map((referencePath) => cwdRelativePath(projectPath, referencePath)).join("\n");
 	const tickets: Ticket[] = runnable.map((candidate, index) => {
-		const prompt = substituteDelegationTemplate(delegationTemplate, {
-			ticketPath: candidate.path,
+		const prompt = buildDelegationPrompt(delegationTemplate, {
+			ticketPath: cwdRelativePath(projectPath, candidate.path),
 			ticketName: candidate.name,
 			ticketIndex: String(index + 1),
 			ticketCount: String(runnable.length),
 			referencePaths: referenceText,
 		});
-		if (Buffer.byteLength(prompt, "utf8") > 30 * 1024 || prompt.split("\n").length > 1_500) throw new Error(`Delegation prompt for ${candidate.name} exceeds Ticket Flow transport bounds.`);
+		assertDelegationPromptBounds(prompt, candidate.name);
 		return { index, order: candidate.order, name: candidate.name, path: candidate.path, delegationPrompt: prompt, requirements: candidate.requirements, status: "queued", acceptedCommitIds: [] };
 	});
 	return {

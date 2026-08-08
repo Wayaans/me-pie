@@ -9,7 +9,7 @@ import { prepareSetup, type PreparedSetup } from "./tickets.ts";
 
 export type TicketflowCommand =
 	| { readonly action: "tmux" | "herdr" | "cmux" }
-	| { readonly action: "status" | "pause" | "resume" | "stop" | "cancel" };
+	| { readonly action: "status" | "pause" | "resume" | "prompt" | "stop" | "cancel" };
 
 const COMPLETIONS: readonly AutocompleteItem[] = [
 	{ value: "tmux", label: "tmux", description: "Configure a sequential tmux Ticket Flow run" },
@@ -18,6 +18,7 @@ const COMPLETIONS: readonly AutocompleteItem[] = [
 	{ value: "status", label: "status", description: "Show the current durable run" },
 	{ value: "pause", label: "pause", description: "Pause after the current worker turn" },
 	{ value: "resume", label: "resume", description: "Resume progression and reopen a persisted worker if needed" },
+	{ value: "prompt", label: "prompt", description: "Edit the delegation prompt for future implementation assignments" },
 	{ value: "stop", label: "stop", description: "Confirm and terminally stop the run" },
 	{ value: "cancel", label: "cancel", description: "Alias for confirmed stop" },
 ];
@@ -31,9 +32,9 @@ export function ticketflowArgumentCompletions(prefix: string): AutocompleteItem[
 
 export function parseTicketflowCommand(args: string): TicketflowCommand {
 	const input = args.trim();
-	if (!input) throw new Error("Usage: /ticketflow tmux|herdr|cmux|status|pause|resume|stop|cancel");
-	if (/\s/.test(input)) throw new Error("/ticketflow subcommands do not accept inline arguments; tmux setup uses a native Pi form.");
-	if (["tmux", "herdr", "cmux", "status", "pause", "resume", "stop", "cancel"].includes(input)) return { action: input as TicketflowCommand["action"] };
+	if (!input) throw new Error("Usage: /ticketflow tmux|herdr|cmux|status|pause|resume|prompt|stop|cancel");
+	if (/\s/.test(input)) throw new Error("/ticketflow subcommands do not accept inline arguments; setup and prompt editing use native Pi forms.");
+	if (["tmux", "herdr", "cmux", "status", "pause", "resume", "prompt", "stop", "cancel"].includes(input)) return { action: input as TicketflowCommand["action"] };
 	throw new Error(`Unsupported Ticket Flow command: ${input}.`);
 }
 

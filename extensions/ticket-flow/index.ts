@@ -380,6 +380,17 @@ export default function ticketflow(pi: ExtensionAPI, options: TicketflowExtensio
 					if (ctx.hasUI) ctx.ui.notify("Ticket Flow resumed.", "info");
 					return;
 				}
+				if (command.action === "prompt") {
+					const run = await attach(ctx);
+					if (!ctx.hasUI) throw new Error("Editing the Ticket Flow delegation prompt requires an interactive client.");
+					const template = await ctx.ui.editor("Delegation prompt for future tickets", run.setup.delegationTemplate);
+					if (template === undefined) return;
+					const updated = await runEffect(coordinator.updateDelegationTemplate(template), ctx.signal);
+					showWidget(ctx, updated);
+					const queued = updated.tickets.filter((ticket) => ticket.status === "queued").length;
+					ctx.ui.notify(`Delegation prompt updated for ${queued} future implementation ${queued === 1 ? "assignment" : "assignments"}.`, "info");
+					return;
+				}
 				if (command.action === "stop" || command.action === "cancel") {
 					const run = await attach(ctx);
 					if (!ctx.hasUI) throw new Error("Stopping Ticket Flow requires interactive confirmation.");

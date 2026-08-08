@@ -49,14 +49,14 @@ function setupInput(projectPath: string, ticketsDirectory: string, template = "{
 }
 
 test("Ticket Flow command parsing is strict and completions are subcommand-only", () => {
-	for (const action of ["tmux", "herdr", "cmux", "status", "pause", "resume", "stop", "cancel"] as const) {
+	for (const action of ["tmux", "herdr", "cmux", "status", "pause", "resume", "prompt", "stop", "cancel"] as const) {
 		assert.deepEqual(parseTicketflowCommand(action), { action });
 	}
 	assert.throws(() => parseTicketflowCommand("tmux extra"), /do not accept inline arguments/);
 	assert.throws(() => parseTicketflowCommand("unknown"), /Unsupported Ticket Flow command/);
 	assert.throws(() => parseTicketflowCommand(""), /Usage/);
 	assert.deepEqual(ticketflowArgumentCompletions("t")?.map((item) => item.value), ["tmux"]);
-	assert.deepEqual(ticketflowArgumentCompletions("" )?.map((item) => item.value), ["tmux", "herdr", "cmux", "status", "pause", "resume", "stop", "cancel"]);
+	assert.deepEqual(ticketflowArgumentCompletions("" )?.map((item) => item.value), ["tmux", "herdr", "cmux", "status", "pause", "resume", "prompt", "stop", "cancel"]);
 	assert.deepEqual(ticketflowArgumentCompletions("tmux ")?.map((item) => item.value), ["tmux"]);
 });
 
@@ -84,13 +84,15 @@ test("setup orders natural numbered tickets and substitutes the exact supported 
 	assert.equal(prepared.setup.completionConvention, COMPLETION_CONVENTION);
 	assert.deepEqual(prepared.skippedTickets, []);
 	const first = prepared.tickets[0]!;
-	const canonicalReference = prepared.setup.referencePaths[0]!;
-	assert.equal(first.delegationPrompt, `${first.path}|1-first.md|1|3|${canonicalReference}`);
+	assert.match(first.delegationPrompt, /^tickets\/1-first\.md\|1-first\.md\|1\|3\|reference\.md\n\n/);
+	assert.match(first.delegationPrompt, /paths in this task are relative to CWD/);
+	assert.match(first.delegationPrompt, /Call ticketflow_report with status=blocked/);
+	assert.doesNotMatch(first.delegationPrompt, new RegExp(project.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	assert.equal(first.status, "queued");
 	assert.ok(first.path.startsWith(prepared.setup.ticketsDirectory));
 	const byteExact = await prepareSetup(setupInput(project, ticketsDirectory, "  {ticketName}\n"));
 	assert.equal(byteExact.setup.delegationTemplate, "  {ticketName}\n");
-	assert.equal(byteExact.tickets[0]!.delegationPrompt, "  1-first.md\n");
+	assert.match(byteExact.tickets[0]!.delegationPrompt, /^  1-first\.md\n\n\nTicket and reference paths/);
 	assert.throws(
 		() => substituteDelegationTemplate("{ticketPath} {unsupported}", {
 			ticketPath: "/tickets/1.md", ticketName: "1.md", ticketIndex: "1", ticketCount: "1", referencePaths: "",
