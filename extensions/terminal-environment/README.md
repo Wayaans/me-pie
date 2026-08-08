@@ -30,13 +30,13 @@ With no target, run creates a detached window and starts Pi. Supported coding ag
 }
 ```
 
-A supplied target must be an idle shell unless `replace` is explicitly true. A window created by the same `run` action is safe to replace automatically. Agent launches use owner-only temporary scripts and argument arrays; they do not evaluate user-authored shell command strings.
+A supplied target must be an idle shell unless `replace` is explicitly true. A window created by the same `run` action is safe to replace automatically. Agent launches use owner-only temporary scripts and managed argument arrays.
 
-Codex and Claude initial prompts use an end-of-options delimiter, and OpenCode uses its explicit prompt option. Pi's CLI has no equivalent delimiter, so an initial Pi prompt beginning with `-` or `@` is rejected; start Pi first and deliver that prompt with `workspace send`.
+Run never supplies an initial prompt or arbitrary CLI arguments. It starts a fresh interactive coding agent only. Deliver the task afterward with `workspace send`.
 
 ### Send
 
-Send pastes literal text into the resolved pane, optionally presses Enter, then advances the pane's send-signal sequence.
+Send requests tmux bracketed paste so supported destination editors receive multiline Markdown as one paste. It presses Enter exactly once when `submit` is true, then writes a signal to the destination pane's inbox. The signal records the current pane as its source.
 
 ```json
 {
@@ -44,35 +44,52 @@ Send pastes literal text into the resolved pane, optionally presses Enter, then 
   "send": {
     "targetId": "%13",
     "input": "prompt",
-    "text": "# Task\n\nReview the authentication module."
+    "text": "# Task\n\nReview the authentication module. When done, report with workspace send to %5."
   }
 }
 ```
 
-`prompt` and `command` describe the input's intent. Both are delivered literally; the process running in the pane decides how to interpret the text.
+`prompt` and `command` describe the input's intent. Both are delivered literally; the process running in the pane decides how to interpret the text. The result identifies the source and destination. Its `sequence` is the destination inbox sequence. Its `replyAfterSequence` is the source inbox baseline: use it when the source pane waits for a reply.
 
 ### Wait
 
-Wait observes successful `workspace` sends targeting the resolved pane.
+Wait listens on the resolved recipient target's inbox for the next successful `workspace` send delivered there. The signal identifies its source pane. For a controller/worker handshake, the controller sends a task to the worker, the worker sends its report back to the controller, and the controller waits on its own pane ID.
 
 ```json
 {
   "action": "wait",
   "wait": {
-    "targetId": "%13",
+    "targetId": "%5",
     "afterSequence": 4,
     "timeoutMs": 120000
   }
 }
 ```
 
-If `afterSequence` is omitted, wait uses the sequence present when the action starts and waits for the next send. It also returns when the timeout expires or the target disappears. Wait does not detect coding-agent turn completion.
+Use the task send result's `replyAfterSequence` as `afterSequence`. This prevents a fast worker report from being missed between send and wait. If `afterSequence` is omitted, wait uses the current inbox sequence and waits for the next signal. Wait ends only when a signal reaches that inbox or the timeout expires. After a timeout, call wait again with the returned `sequence`.
+
+The worker must be told to deliver its final report with `workspace send` to the controller pane. The worker should not call `workspace wait` to receive its task: the task is normal terminal input. A received signal is the worker's cooperative report; it does not independently inspect coding-agent process state.
+
+### Close
+
+Close terminates the exact native tmux pane or window: `%` IDs close panes and `@` IDs close windows. Session (`$`) IDs are rejected. Prefer the worker pane ID returned by spawn or run so the operation has the smallest scope.
+
+```json
+{
+  "action": "close",
+  "close": {
+    "targetId": "%13"
+  }
+}
+```
+
+Close resolves the target immediately before issuing the corresponding tmux `kill-*` command and returns its pre-close metadata snapshot. It rejects the calling pane and its containing window, preventing the controller from terminating itself. Missing targets and tmux failures are reported as tool errors. Close workers explicitly after their reports and any verification are complete; wait does not close them automatically.
 
 ## TUI presentation
 
-The `workspace` tool uses compact action and result rows. Expanded results show tmux target metadata; send results preview Markdown; pending waits show elapsed time and clearly identify the event as a workspace send signal. Narrow terminals keep only the action, primary pane ID, and status.
+The `workspace` tool uses compact action and result rows. Expanded results show tmux target metadata; send results preview Markdown and show the race-safe reply baseline; pending waits show the recipient inbox and elapsed time, while successful waits show the source-to-recipient route. Narrow terminals keep only the action, primary pane ID, and status.
 
-Renderer text strips terminal control characters from requests, target metadata, previews, and errors before display. Launch `extraArgs` and executable paths remain hidden.
+Renderer text strips terminal control characters from requests, target metadata, previews, and errors before display. Executable paths remain hidden.
 
 ## Activation
 

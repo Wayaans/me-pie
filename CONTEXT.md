@@ -71,5 +71,5 @@ One literal prompt or command successfully sent to a Target.
 _Avoid_: Message when referring to terminal input
 
 **Send Signal**:
-A sequenced notification created after a successful Delivery and observed by workspace wait.
-_Avoid_: Completion signal, because it does not prove an Agent Run finished
+A sequenced notification written to the destination Target's inbox after a successful Delivery and attributed to the source Target. Workspace wait listens on the requested recipient Target's inbox and reports the source of the next signal. In the report protocol, the Agent Run emits this signal only after finishing its task and delivering its report to the controller pane.
+_Avoid_: Independently verified completion, because the signal records the Agent Run's report rather than inspecting process state

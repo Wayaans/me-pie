@@ -4,7 +4,9 @@ import { Effect, Exit } from "effect";
 import { buildAgentInvocation } from "./agents.ts";
 import { environmentError, errorMessage, TerminalEnvironmentError } from "./errors.ts";
 import { makeLauncher, removeLauncher } from "./launcher.ts";
+import { closeTargetKindFromId } from "./model.ts";
 import type {
+	CloseRequest,
 	RunRequest,
 	SendRequest,
 	SpawnRequest,
@@ -19,6 +21,7 @@ import { SignalStore } from "./signals.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
 const DEFAULT_WAIT_POLL_MS = 100;
+const AGENT_STARTUP_GRACE_MS = 2_000;
 
 export interface WorkspaceOptions {
 	readonly environment?: NodeJS.ProcessEnv;
@@ -50,6 +53,7 @@ export class Workspace {
 			case "run": return this.run(request.request, defaultCwd);
 			case "send": return this.send(request.request);
 			case "wait": return this.wait(request.request);
+			case "close": return this.close(request.request);
 		}
 	}
 
@@ -74,7 +78,7 @@ export class Workspace {
 			});
 			const executable = self.options.agentExecutables?.[invocation.agent]
 				?? (yield* findExecutable(invocation.executableName, self.environment));
-			return yield* Effect.acquireUseRelease(
+			const result = yield* Effect.acquireUseRelease(
 				makeLauncher(executable, invocation.args),
 				(launcherPath) => {
 					const spawnedTarget = request.targetId === undefined;
@@ -94,6 +98,8 @@ export class Workspace {
 				},
 				(launcherPath, exit) => Exit.isSuccess(exit) ? Effect.void : removeLauncher(launcherPath),
 			);
+			yield* Effect.sleep(AGENT_STARTUP_GRACE_MS);
+			return result;
 		});
 	}
 
@@ -101,25 +107,40 @@ export class Workspace {
 		const self = this;
 		return Effect.gen(function* () {
 			const target = yield* self.adapter.resolve(request.targetId);
+			const sourcePaneId = self.adapter.currentTarget.paneId;
+			const replyAfterSequence = yield* self.signalStore.currentSequence(sourcePaneId);
 			yield* self.adapter.send(target, request.text, request.submit ?? true);
-			const sequence = yield* self.signalStore.signal(target.paneId);
+			const sequence = yield* self.signalStore.signal(target.paneId, sourcePaneId);
 			return {
 				action: "send",
 				target,
+				sourcePaneId,
 				deliveryId: crypto.randomUUID(),
 				sequence,
+				replyAfterSequence,
 				bytes: Buffer.byteLength(request.text, "utf8"),
 				input: request.input,
 			} as const;
 		});
 	}
 
+	private close(request: CloseRequest): Effect.Effect<WorkspaceResult, TerminalEnvironmentError> {
+		if (!/^[%@][0-9]+$/.test(request.targetId)) {
+			return Effect.fail(environmentError("close terminal target", `Close requires a pane or window ID: ${request.targetId}`));
+		}
+		return this.adapter.close(request.targetId).pipe(Effect.map((target) => ({
+			action: "close" as const,
+			kind: closeTargetKindFromId(request.targetId),
+			target,
+		})));
+	}
+
 	private wait(request: WaitRequest): Effect.Effect<WorkspaceResult, TerminalEnvironmentError> {
 		const self = this;
 		return Effect.gen(function* () {
 			const target = yield* self.adapter.resolve(request.targetId);
-			const current = yield* self.signalStore.currentSequence(target.paneId);
-			const baseline = request.afterSequence ?? current;
+			const current = yield* self.signalStore.currentSignal(target.paneId);
+			const baseline = request.afterSequence ?? current.sequence;
 			const startedAt = self.now();
 			const deadline = startedAt + (request.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
 			return yield* self.waitLoop(target, baseline, startedAt, deadline);
@@ -134,20 +155,22 @@ export class Workspace {
 	): Effect.Effect<WaitResult, TerminalEnvironmentError> {
 		const self = this;
 		return Effect.gen(function* () {
-			const sequence = yield* self.signalStore.currentSequence(target.paneId);
+			const poll = yield* self.signalStore.poll(target.paneId, baseline);
 			const elapsedMs = Math.max(0, self.now() - startedAt);
-			if (sequence > baseline) return { action: "wait", target, reason: "signaled", sequence, elapsedMs };
-			const inspected = yield* self.adapter.resolve(target.paneId).pipe(
-				Effect.map((resolved) => ({ present: true as const, resolved })),
-				Effect.catch((cause) => isMissingTarget(cause)
-					? Effect.succeed({ present: false as const })
-					: Effect.fail(cause)),
-			);
-			if (!inspected.present || inspected.resolved.dead) {
-				return { action: "wait", target, reason: "target-exited", sequence, elapsedMs };
+			if (poll.signal !== undefined) {
+				return {
+					action: "wait",
+					target,
+					reason: "signaled",
+					sourcePaneId: poll.signal.sourcePaneId,
+					sequence: poll.signal.sequence,
+					elapsedMs,
+				};
 			}
 			const remainingMs = deadline - self.now();
-			if (remainingMs <= 0) return { action: "wait", target, reason: "timeout", sequence, elapsedMs };
+			if (remainingMs <= 0) {
+				return { action: "wait", target, reason: "timeout", sequence: poll.currentSequence, elapsedMs };
+			}
 			yield* Effect.sleep(Math.min(self.waitPollMs, remainingMs));
 			return yield* self.waitLoop(target, baseline, startedAt, deadline);
 		});
@@ -166,9 +189,4 @@ function resolveCwd(candidate: string | undefined, defaultCwd: string): Effect.E
 		},
 		catch: (cause) => environmentError("resolve working directory", errorMessage(cause), cause),
 	});
-}
-
-function isMissingTarget(cause: TerminalEnvironmentError): boolean {
-	return cause.operation === "resolve tmux target"
-		&& /can't find (?:pane|window|session)|no server running|no current client/i.test(cause.message);
 }

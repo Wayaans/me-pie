@@ -56,6 +56,7 @@ class FakeTmuxRunner implements CommandRunner {
 	readonly calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
 	loadedText: string | undefined;
 	resolved = target();
+	readonly resolvedTargets = new Map<string, TerminalTarget>();
 	failCommand: string | undefined;
 
 	async run(executable: string, args: readonly string[], _options?: CommandOptions): Promise<CommandResult> {
@@ -63,9 +64,13 @@ class FakeTmuxRunner implements CommandRunner {
 		const commandIndex = args[0] === "-S" ? 2 : 0;
 		const command = args[commandIndex];
 		if (command === this.failCommand) return { stdout: "", stderr: `${command} failed`, code: 1 };
-		if (command === "display-message") return { stdout: record(this.resolved), stderr: "", code: 0 };
+		if (command === "display-message") {
+			const targetIndex = args.indexOf("-t");
+			const targetId = targetIndex < 0 ? undefined : args[targetIndex + 1];
+			return { stdout: record(targetId ? (this.resolvedTargets.get(targetId) ?? this.resolved) : this.resolved), stderr: "", code: 0 };
+		}
 		if (command === "new-window") {
-			return { stdout: record(target({ windowId: "@2", windowName: "worker", paneId: "%2" })), stderr: "", code: 0 };
+			return { stdout: record(target({ windowId: "@2", windowName: "agent", paneId: "%2" })), stderr: "", code: 0 };
 		}
 		if (command === "split-window") {
 			return { stdout: record(target({ paneId: "%3" })), stderr: "", code: 0 };
@@ -84,28 +89,42 @@ class FakeTerminalAdapter implements TerminalAdapter {
 	readonly environment = "tmux" as const;
 	readonly socketPath = socketPath;
 	readonly instanceId = `${socketPath}:4822`;
-	readonly currentTarget = target();
+	readonly currentTarget: TerminalTarget;
 	alive = true;
 	dead = false;
 	launchFails = false;
+	launchedAt: number | undefined;
+	lastLauncherPath: string | undefined;
 	lastReplace: boolean | undefined;
 	closedWindows = 0;
+	readonly closedTargetIds: string[] = [];
 	readonly sent: string[] = [];
+
+	constructor(currentTarget: TerminalTarget = target()) {
+		this.currentTarget = currentTarget;
+	}
 
 	spawn(_request: SpawnRequest, _defaultCwd: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
 		return Effect.succeed(this.currentTarget);
 	}
-	resolve(_targetId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
-		return this.alive
-			? Effect.succeed({ ...this.currentTarget, dead: this.dead })
-			: Effect.fail(environmentError("resolve tmux target", "can't find pane: %1"));
+	resolve(targetId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
+		if (!this.alive) return Effect.fail(environmentError("resolve tmux target", `can't find target: ${targetId}`));
+		const identity = targetId.startsWith("$") ? { sessionId: targetId }
+			: targetId.startsWith("@") ? { windowId: targetId }
+				: { paneId: targetId };
+		return Effect.succeed({ ...this.currentTarget, ...identity, dead: this.dead });
 	}
-	launch(_target: TerminalTarget, _launcherPath: string, _cwd: string, replace: boolean, _ownedByOperation: boolean): Effect.Effect<void, TerminalEnvironmentError> {
+	launch(_target: TerminalTarget, launcherPath: string, _cwd: string, replace: boolean, _ownedByOperation: boolean): Effect.Effect<void, TerminalEnvironmentError> {
+		this.launchedAt = Date.now();
+		this.lastLauncherPath = launcherPath;
 		this.lastReplace = replace;
 		return this.launchFails ? Effect.fail(environmentError("launch coding agent", "launch failed")) : Effect.void;
 	}
 	closeSpawnedWindow(_target: TerminalTarget): Effect.Effect<void, TerminalEnvironmentError> {
 		return Effect.sync(() => { this.closedWindows += 1; });
+	}
+	close(targetId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
+		return this.resolve(targetId).pipe(Effect.tap(() => Effect.sync(() => { this.closedTargetIds.push(targetId); })));
 	}
 	send(_target: TerminalTarget, text: string, _submit: boolean): Effect.Effect<void, TerminalEnvironmentError> {
 		return Effect.sync(() => { this.sent.push(text); });
@@ -114,29 +133,39 @@ class FakeTerminalAdapter implements TerminalAdapter {
 
 test("workspace parameters require exactly one payload matching the action", () => {
 	assert.deepEqual(normalizeWorkspaceParameters({ action: "spawn", spawn: {} }), { action: "spawn", request: {} });
+	assert.deepEqual(normalizeWorkspaceParameters({ action: "close", close: { targetId: "%2" } }), {
+		action: "close",
+		request: { targetId: "%2" },
+	});
+	assert.throws(
+		() => normalizeWorkspaceParameters({ action: "close", close: { targetId: "$2" } } as never),
+		/close payload is invalid/,
+	);
 	assert.throws(
 		() => normalizeWorkspaceParameters({ action: "spawn", run: {} }),
 		/requires exactly one matching spawn payload/,
 	);
 });
 
-test("coding-agent adapters map model and thinking without shell command strings", () => {
-	assert.deepEqual(buildAgentInvocation({ agent: "pi", model: "openai/gpt", thinking: "high", prompt: "do it" }).args,
-		["--model", "openai/gpt", "--thinking", "high", "do it"]);
+test("coding-agent adapters start fresh agents with only managed model and thinking options", () => {
+	assert.deepEqual(buildAgentInvocation({}), { agent: "pi", executableName: "pi", args: [] });
+	assert.deepEqual(buildAgentInvocation({ agent: "pi", model: "openai/gpt", thinking: "high" }).args,
+		["--model", "openai/gpt", "--thinking", "high"]);
 	assert.deepEqual(buildAgentInvocation({ agent: "codex", thinking: "xhigh" }).args,
 		["-c", "model_reasoning_effort=\"xhigh\""]);
 	assert.deepEqual(buildAgentInvocation({ agent: "claude", thinking: "max" }).args,
 		["--effort", "max"]);
-	assert.deepEqual(buildAgentInvocation({ agent: "opencode", thinking: "minimal", prompt: "review" }).args,
-		["--variant", "minimal", "--prompt", "review"]);
-	assert.deepEqual(buildAgentInvocation({ agent: "claude", prompt: "--dangerously-skip-permissions" }).args,
-		["--", "--dangerously-skip-permissions"]);
-	assert.throws(() => buildAgentInvocation({ agent: "pi", prompt: "--version" }), /cannot safely accept/);
-	assert.throws(() => buildAgentInvocation({ agent: "pi", prompt: "@\/etc\/passwd" }), /cannot safely accept/);
+	assert.deepEqual(buildAgentInvocation({ agent: "opencode", thinking: "minimal" }).args,
+		["--variant", "minimal"]);
 	assert.throws(() => buildAgentInvocation({ agent: "claude", thinking: "minimal" }), /does not support/);
-	assert.throws(() => buildAgentInvocation({ agent: "codex", extraArgs: ["--model", "other"] }), /cannot override/);
-	assert.throws(() => buildAgentInvocation({ agent: "codex", extraArgs: ["-c", "model=other"] }), /cannot override/);
-	assert.throws(() => buildAgentInvocation({ agent: "codex", extraArgs: ["-mother"] }), /cannot override/);
+	assert.throws(
+		() => normalizeWorkspaceParameters({ action: "run", run: { prompt: "do it" } } as never),
+		/run payload is invalid/,
+	);
+	assert.throws(
+		() => normalizeWorkspaceParameters({ action: "run", run: { extraArgs: ["do it"] } } as never),
+		/run payload is invalid/,
+	);
 });
 
 test("tmux detection, spawning, and literal multiline delivery use the current server", async () => {
@@ -158,8 +187,13 @@ test("tmux detection, spawning, and literal multiline delivery use the current s
 	const markdown = "# Task\n\nUse `$HOME` literally; don't interpolate.";
 	await Effect.runPromise(adapter.send(target(), markdown, true));
 	assert.equal(runner.loadedText, markdown);
-	assert.ok(runner.calls.some((call) => call.args.includes("paste-buffer") && call.args.includes("%1")));
-	assert.ok(runner.calls.some((call) => call.args.includes("send-keys") && call.args.at(-1) === "Enter"));
+	const paste = runner.calls.find((call) => call.args.includes("paste-buffer") && call.args.includes("%1"));
+	assert.ok(paste?.args.includes("-p"), "multiline input must use tmux bracketed paste");
+	assert.equal(runner.calls.filter((call) => call.args.includes("send-keys") && call.args.at(-1) === "Enter").length, 1);
+
+	await Effect.runPromise(adapter.send(target(), "draft", false));
+	assert.equal(runner.calls.filter((call) => call.args.includes("send-keys") && call.args.at(-1) === "Enter").length, 1,
+		"paste-only delivery must not submit another prompt");
 	assert.ok(runner.calls.filter((call) => call.args[0] === "-S").every((call) => call.args[1] === socketPath));
 });
 
@@ -190,39 +224,146 @@ test("tmux launch rejects a busy pane unless replacement is explicit", async () 
 	assert.ok(runner.calls.some((call) => call.args.includes("respawn-pane") && call.args.includes("-k")));
 });
 
-test("signal store serializes concurrent send sequences", async () => {
+test("tmux close uses exact target kinds and protects the calling hierarchy", async () => {
+	const runner = new FakeTmuxRunner();
+	runner.resolvedTargets.set("%2", target({ paneId: "%2", windowId: "@2", windowName: "worker" }));
+	runner.resolvedTargets.set("@2", target({ paneId: "%2", windowId: "@2", windowName: "worker" }));
+	const adapter = await Effect.runPromise(TmuxAdapter.detect({
+		environment: { TMUX: `${socketPath},1,0`, PATH: "/bin" },
+		runner,
+		tmuxExecutable: "/fake/tmux",
+	}));
+	assert.ok(adapter);
+
+	assert.equal((await Effect.runPromise(adapter.close("%2"))).paneId, "%2");
+	assert.equal((await Effect.runPromise(adapter.close("@2"))).windowId, "@2");
+	for (const [command, targetId] of [["kill-pane", "%2"], ["kill-window", "@2"]] as const) {
+		assert.ok(runner.calls.some((call) => call.args.includes(command) && call.args.includes(targetId)));
+	}
+
+	await assert.rejects(Effect.runPromise(adapter.close("%1")), /contains the calling pane %1/);
+	await assert.rejects(Effect.runPromise(adapter.close("@1")), /contains the calling pane %1/);
+	await assert.rejects(Effect.runPromise(adapter.close("$2")), /requires a pane or window ID/);
+	assert.ok(runner.calls.every((call) => !call.args.includes("kill-session")));
+});
+
+test("workspace close reports the closed target kind and snapshot", async () => {
+	const adapter = new FakeTerminalAdapter(target({ paneId: "%1" }));
+	const workspace = new Workspace(adapter);
+	const result = await Effect.runPromise(workspace.execute({
+		action: "close",
+		request: { targetId: "%2" },
+	}, process.cwd()));
+	assert.deepEqual(adapter.closedTargetIds, ["%2"]);
+	assert.equal(result.action, "close");
+	if (result.action === "close") {
+		assert.equal(result.kind, "pane");
+		assert.equal(result.target.paneId, "%2");
+	}
+	await assert.rejects(
+		Effect.runPromise(workspace.execute({ action: "close", request: { targetId: "$2" } }, process.cwd())),
+		/requires a pane or window ID/,
+	);
+	assert.deepEqual(adapter.closedTargetIds, ["%2"]);
+});
+
+test("signal store serializes concurrent inbox signals and preserves source order", async () => {
 	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
 	const store = new SignalStore(`${socketPath}:4822`, { rootDirectory: directory });
 	try {
 		const sequences = await Effect.runPromise(Effect.all(
-			Array.from({ length: 20 }, () => store.signal("%1")),
+			Array.from({ length: 20 }, () => store.signal("%1", "%2")),
 			{ concurrency: "unbounded" },
 		));
 		assert.deepEqual([...sequences].sort((left, right) => left - right), Array.from({ length: 20 }, (_, index) => index + 1));
 		assert.equal(await Effect.runPromise(store.currentSequence("%1")), 20);
+		assert.deepEqual(await Effect.runPromise(store.currentSignal("%1")), {
+			sequence: 20,
+			sourcePaneId: "%2",
+		});
+		assert.equal(await Effect.runPromise(store.signal("%1", "%3")), 21);
+		assert.deepEqual(await Effect.runPromise(store.poll("%1", 19)), {
+			currentSequence: 21,
+			signal: { sequence: 20, sourcePaneId: "%2" },
+		});
+		assert.deepEqual(await Effect.runPromise(store.poll("%1", 20)), {
+			currentSequence: 21,
+			signal: { sequence: 21, sourcePaneId: "%3" },
+		});
+		assert.equal(await Effect.runPromise(store.currentSequence("%2")), 0);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
 
-test("workspace wait returns when a successful send advances the target sequence", async () => {
+test("workspace wait observes only sends delivered to the selected inbox and reports their source", async () => {
 	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
-	const adapter = new FakeTerminalAdapter();
-	const workspace = new Workspace(adapter, { signalStoreRoot: directory, waitPollMs: 5 });
+	const main = new Workspace(new FakeTerminalAdapter(target({ paneId: "%1" })), { signalStoreRoot: directory, waitPollMs: 5 });
+	const workerAdapter = new FakeTerminalAdapter(target({ paneId: "%2" }));
+	const worker = new Workspace(workerAdapter, { signalStoreRoot: directory, waitPollMs: 5 });
 	try {
-		const waiting = Effect.runPromise(workspace.execute({ action: "wait", request: { targetId: "%1", timeoutMs: 1_000 } }, process.cwd()));
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		const sent = await Effect.runPromise(workspace.execute({ action: "send", request: { targetId: "%1", input: "prompt", text: "hello" } }, process.cwd()));
+		const taskDelivery = await Effect.runPromise(main.execute({
+			action: "send",
+			request: { targetId: "%2", input: "prompt", text: "scan" },
+		}, process.cwd()));
+		assert.equal(taskDelivery.action, "send");
+		if (taskDelivery.action !== "send") return;
+		assert.equal(taskDelivery.sourcePaneId, "%1");
+		assert.equal(taskDelivery.replyAfterSequence, 0);
+
+		const waiting = Effect.runPromise(main.execute({
+			action: "wait",
+			request: { targetId: "%1", afterSequence: taskDelivery.replyAfterSequence, timeoutMs: 150 },
+		}, process.cwd()));
+
+		await Effect.runPromise(worker.execute({
+			action: "send",
+			request: { targetId: "%3", input: "prompt", text: "not for main" },
+		}, process.cwd()));
+		const unrelatedDelivery = await Promise.race([
+			waiting.then(() => "settled" as const),
+			new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 20)),
+		]);
+		assert.equal(unrelatedDelivery, "pending", "a send to another pane must not wake the main pane");
+
+		await Effect.runPromise(worker.execute({
+			action: "send",
+			request: { targetId: "%1", input: "prompt", text: "scan complete" },
+		}, process.cwd()));
 		const waited = await waiting;
-		assert.equal(sent.action, "send");
 		assert.equal(waited.action, "wait");
-		if (sent.action === "send" && waited.action === "wait") {
+		if (waited.action === "wait") {
 			assert.equal(waited.reason, "signaled");
-			assert.equal(waited.sequence, sent.sequence);
+			if (waited.reason === "signaled") assert.equal(waited.sourcePaneId, "%2");
+			assert.equal(waited.target.paneId, "%1");
+			assert.equal(waited.sequence, 1);
 		}
-		assert.deepEqual(adapter.sent, ["hello"]);
+
+		const nextTask = await Effect.runPromise(main.execute({
+			action: "send",
+			request: { targetId: "%2", input: "prompt", text: "scan again" },
+		}, process.cwd()));
+		assert.equal(nextTask.action, "send");
+		if (nextTask.action === "send") assert.equal(nextTask.replyAfterSequence, 1);
+		assert.deepEqual(workerAdapter.sent, ["not for main", "scan complete"]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("workspace run waits two seconds after launching before it completes", async () => {
+	const adapter = new FakeTerminalAdapter();
+	const workspace = new Workspace(adapter, { agentExecutables: { pi: process.execPath } });
+	try {
+		const result = await Effect.runPromise(workspace.execute({
+			action: "run",
+			request: { targetId: "%2" },
+		}, process.cwd()));
+		assert.equal(result.action, "run");
+		assert.ok(adapter.launchedAt !== undefined);
+		assert.ok(Date.now() - adapter.launchedAt >= 1_900, "run must allow the coding-agent CLI time to initialize");
+	} finally {
+		if (adapter.lastLauncherPath) await rm(adapter.lastLauncherPath, { force: true });
 	}
 });
 
@@ -246,36 +387,29 @@ test("failed runs roll back windows spawned by that invocation", async () => {
 	}
 });
 
-test("workspace wait has finite timeout and notices dead or vanished targets", async () => {
+test("workspace wait ends only for an inbox signal or its finite timeout", async () => {
 	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
 	const adapter = new FakeTerminalAdapter();
-	const workspace = new Workspace(adapter, { signalStoreRoot: directory, waitPollMs: 5 });
 	try {
 		const strictTimeoutWorkspace = new Workspace(adapter, { signalStoreRoot: directory, waitPollMs: 100 });
 		const timeoutStarted = Date.now();
 		const timeout = await Effect.runPromise(strictTimeoutWorkspace.execute({ action: "wait", request: { targetId: "%1", timeoutMs: 5 } }, process.cwd()));
 		assert.equal(timeout.action, "wait");
-		if (timeout.action === "wait") assert.equal(timeout.reason, "timeout");
+		if (timeout.action === "wait") {
+			assert.equal(timeout.reason, "timeout");
+			assert.equal(timeout.target.paneId, "%1");
+		}
 		assert.ok(Date.now() - timeoutStarted < 75, "wait should not sleep for the full poll interval after its deadline");
 
-		adapter.dead = true;
-		const alreadyDead = await Effect.runPromise(workspace.execute({ action: "wait", request: { targetId: "%1", timeoutMs: 1 } }, process.cwd()));
-		assert.equal(alreadyDead.action, "wait");
-		if (alreadyDead.action === "wait") assert.equal(alreadyDead.reason, "target-exited");
-		adapter.dead = false;
-
-		const deadWait = Effect.runPromise(workspace.execute({ action: "wait", request: { targetId: "%1", timeoutMs: 1_000 } }, process.cwd()));
-		setTimeout(() => { adapter.dead = true; }, 10);
-		const dead = await deadWait;
-		assert.equal(dead.action, "wait");
-		if (dead.action === "wait") assert.equal(dead.reason, "target-exited");
-
-		adapter.dead = false;
-		const vanishedWait = Effect.runPromise(workspace.execute({ action: "wait", request: { targetId: "%1", timeoutMs: 1_000 } }, process.cwd()));
-		setTimeout(() => { adapter.alive = false; }, 10);
-		const vanished = await vanishedWait;
-		assert.equal(vanished.action, "wait");
-		if (vanished.action === "wait") assert.equal(vanished.reason, "target-exited");
+		const workspace = new Workspace(adapter, { signalStoreRoot: directory, waitPollMs: 5 });
+		const workerExitDoesNotComplete = Effect.runPromise(workspace.execute({
+			action: "wait",
+			request: { targetId: "%1", timeoutMs: 30 },
+		}, process.cwd()));
+		setTimeout(() => { adapter.dead = true; }, 5);
+		const afterWorkerExit = await workerExitDoesNotComplete;
+		assert.equal(afterWorkerExit.action, "wait");
+		if (afterWorkerExit.action === "wait") assert.equal(afterWorkerExit.reason, "timeout");
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -285,6 +419,8 @@ test("the extension registers workspace only after validated tmux detection", as
 	type SessionStart = (event: unknown, ctx: { readonly cwd: string; readonly hasUI: boolean }) => Promise<void>;
 	interface RegisteredTool {
 		readonly name: string;
+		readonly description: string;
+		readonly promptGuidelines?: readonly string[];
 		readonly renderCall?: unknown;
 		readonly renderResult?: unknown;
 	}
@@ -312,6 +448,12 @@ test("the extension registers workspace only after validated tmux detection", as
 	});
 	await inside.start();
 	assert.deepEqual(inside.tools.map((tool) => tool.name), ["workspace"]);
+	assert.match(inside.tools[0]!.description, /fresh Pi agent with no initial prompt/);
+	assert.match(inside.tools[0]!.description, /Wait listens on the target inbox/);
+	assert.match(inside.tools[0]!.description, /sessions cannot be closed/);
+	assert.ok(inside.tools[0]!.promptGuidelines?.some((guideline) => /worker should not call workspace wait/.test(guideline)));
+	assert.ok(inside.tools[0]!.promptGuidelines?.some((guideline) => /wait with targetId %1/.test(guideline)));
+	assert.ok(inside.tools[0]!.promptGuidelines?.some((guideline) => /wait on %1 times out.*wait again/.test(guideline)));
 	assert.equal(typeof inside.tools[0]?.renderCall, "function");
 	assert.equal(typeof inside.tools[0]?.renderResult, "function");
 });

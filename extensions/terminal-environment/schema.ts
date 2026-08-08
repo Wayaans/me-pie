@@ -19,10 +19,22 @@ const TargetId = Type.String({
 	pattern: "^[%@$][0-9]+$",
 	description: "Native tmux target ID: $session, @window, or %pane.",
 });
+const WaitTargetId = Type.String({
+	minLength: 2,
+	maxLength: 64,
+	pattern: "^[%@$][0-9]+$",
+	description: "Recipient tmux target whose inbox should be observed. Use the current pane ID to wait for worker reports.",
+});
+const CloseTargetId = Type.String({
+	minLength: 2,
+	maxLength: 64,
+	pattern: "^[%@][0-9]+$",
+	description: "Native tmux pane (%pane) or window (@window) ID.",
+});
 const Cwd = Type.String({ minLength: 1, maxLength: 4_096 });
 
 export const SpawnParametersSchema = StrictObject({
-	kind: Type.Optional(StringEnum(TARGET_KINDS, { default: "window" })),
+	kind: Type.Optional(StringEnum(TARGET_KINDS, { default: "window", description: "Target kind. Defaults to window." })),
 	targetId: Type.Optional(TargetId),
 	cwd: Type.Optional(Cwd),
 	title: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
@@ -36,8 +48,6 @@ export const RunParametersSchema = StrictObject({
 	model: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
 	thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
 	cwd: Type.Optional(Cwd),
-	prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 48 * 1_024 })),
-	extraArgs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4_096 }), { maxItems: 64 })),
 	replace: Type.Optional(Type.Boolean({ default: false })),
 });
 
@@ -49,9 +59,16 @@ export const SendParametersSchema = StrictObject({
 });
 
 export const WaitParametersSchema = StrictObject({
-	targetId: TargetId,
-	afterSequence: Type.Optional(Type.Integer({ minimum: 0 })),
+	targetId: WaitTargetId,
+	afterSequence: Type.Optional(Type.Integer({
+		minimum: 0,
+		description: "Ignore inbox signals through this sequence. Use replyAfterSequence returned by the task send.",
+	})),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 * 60_000, default: 120_000 })),
+});
+
+export const CloseParametersSchema = StrictObject({
+	targetId: CloseTargetId,
 });
 
 export const WorkspaceParametersSchema = StrictObject({
@@ -60,6 +77,7 @@ export const WorkspaceParametersSchema = StrictObject({
 	run: Type.Optional(RunParametersSchema),
 	send: Type.Optional(SendParametersSchema),
 	wait: Type.Optional(WaitParametersSchema),
+	close: Type.Optional(CloseParametersSchema),
 });
 
 export type WorkspaceParameters = Static<typeof WorkspaceParametersSchema>;
@@ -69,6 +87,7 @@ const payloadSchemas = {
 	run: RunParametersSchema,
 	send: SendParametersSchema,
 	wait: WaitParametersSchema,
+	close: CloseParametersSchema,
 } as const;
 
 export function normalizeWorkspaceParameters(params: WorkspaceParameters): WorkspaceRequest {
@@ -85,5 +104,6 @@ export function normalizeWorkspaceParameters(params: WorkspaceParameters): Works
 		case "run": return { action: "run", request: params.run! };
 		case "send": return { action: "send", request: params.send! };
 		case "wait": return { action: "wait", request: params.wait! };
+		case "close": return { action: "close", request: params.close! };
 	}
 }

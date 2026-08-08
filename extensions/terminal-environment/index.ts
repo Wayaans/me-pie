@@ -16,12 +16,11 @@ function resultText(result: WorkspaceResult): string {
 	switch (result.action) {
 		case "spawn": return `Spawned tmux ${result.target.paneId} in ${result.target.windowId} (${result.target.sessionId}).`;
 		case "run": return `${result.spawnedTarget ? "Spawned" : "Started"} ${result.agent} in ${result.target.paneId}.`;
-		case "send": return `Delivered ${result.input} to ${result.target.paneId}; signal sequence ${result.sequence}.`;
+		case "send": return `Delivered ${result.input} from ${result.sourcePaneId} to ${result.target.paneId}; recipient sequence ${result.sequence}. To wait on ${result.sourcePaneId} for a reply from ${result.target.paneId}, use afterSequence ${result.replyAfterSequence}.`;
 		case "wait": return result.reason === "signaled"
-			? `Target ${result.target.paneId} was signaled at sequence ${result.sequence}.`
-			: result.reason === "timeout"
-				? `Wait for ${result.target.paneId} timed out at sequence ${result.sequence}.`
-				: `Target ${result.target.paneId} exited while waiting.`;
+			? `Received a workspace send on ${result.target.paneId} from ${result.sourcePaneId} at sequence ${result.sequence}.`
+			: `No workspace send reached ${result.target.paneId} before timeout. Call workspace wait again with afterSequence ${result.sequence}.`;
+		case "close": return `Closed tmux ${result.kind} ${result.kind === "window" ? result.target.windowId : result.target.paneId}.`;
 	}
 }
 
@@ -45,14 +44,20 @@ export default function terminalEnvironment(
 			const adapter = await Effect.runPromise(TmuxAdapter.detect(options), { signal: sessionAbort.signal });
 			if (!adapter) return;
 			workspace = new Workspace(adapter, options);
+			const currentPaneId = adapter.currentTarget.paneId;
 			pi.registerTool({
 				name: "workspace",
 				label: "Workspace",
-				description: "Control the active terminal environment. Actions: spawn a tmux session/window/pane; run Pi, Codex, Claude, or OpenCode; send literal Markdown prompts or commands; or wait for a later successful workspace send signal. Defaults: spawn creates a detached window in the current tmux session; run without a target spawns a window and starts Pi. Wait observes send signals, not coding-agent completion.",
-				promptSnippet: "Spawn terminal targets, launch coding agents, send terminal input, or wait for workspace send signals",
+				description: `Control the active terminal environment from ${currentPaneId}. Actions: spawn a tmux session/window/pane; close a tmux pane/window; run Pi, Codex, Claude, or OpenCode; send literal Markdown prompts or commands; or wait for an inbox signal. Defaults: spawn creates a detached tmux window; run without a target creates a window and starts a fresh Pi agent with no initial prompt. Send delivers input and signals the destination inbox from ${currentPaneId}. Wait listens on the target inbox; use ${currentPaneId} to wait for worker reports sent back to this agent. Close rejects the calling pane and its containing window; sessions cannot be closed.`,
+				promptSnippet: "Spawn terminal targets, close tmux panes or windows, launch fresh coding agents, deliver terminal input, or wait on a target inbox for worker signals",
 				promptGuidelines: [
 					"Use workspace only for terminal-environment coordination; prefer pane IDs returned by workspace over window or session IDs.",
-					"Treat workspace wait as send-event synchronization, not proof that a coding agent completed its turn.",
+					"Use workspace run only to start a fresh coding agent; deliver its task afterward with workspace send.",
+					`When delegating through workspace from ${currentPaneId}, tell the worker to report completion with workspace send targeting ${currentPaneId}; the worker should not call workspace wait for its task.`,
+					`After delivering a task, call workspace wait with targetId ${currentPaneId} and the send result's replyAfterSequence; the wait result identifies which worker sent the signal.`,
+					`If workspace wait on ${currentPaneId} times out, call workspace wait again with the returned sequence.`,
+					"Treat a workspace wait signal as the worker's cooperative report, not independently verified coding-agent completion.",
+					"Use workspace close with a worker's pane ID after its work and any verification are complete; do not close the calling pane or its window.",
 				],
 				parameters: WorkspaceParametersSchema,
 				async execute(_toolCallId, params, signal, onUpdate, executionContext) {

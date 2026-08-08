@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Effect, Exit } from "effect";
 import { environmentError, errorMessage, type TerminalEnvironmentError } from "./errors.ts";
-import type { SpawnRequest, TerminalAdapter, TerminalTarget } from "./model.ts";
+import { closeTargetKindFromId, type SpawnRequest, type TerminalAdapter, type TerminalTarget } from "./model.ts";
 import { findExecutable, nodeCommandRunner, runCommand, type CommandResult, type CommandRunner } from "./process.ts";
 
 const FIELD_SEPARATOR = "\u001f";
@@ -165,6 +165,27 @@ export class TmuxAdapter implements TerminalAdapter {
 		});
 	}
 
+	close(targetId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
+		if (!/^[%@][0-9]+$/.test(targetId)) {
+			return Effect.fail(environmentError("close tmux target", `Close requires a pane or window ID: ${targetId}`));
+		}
+		const self = this;
+		return Effect.gen(function* () {
+			const caller = yield* self.resolve(self.currentTarget.paneId);
+			const target = yield* self.resolve(targetId);
+			const kind = closeTargetKindFromId(targetId);
+			const protectedTarget = kind === "window"
+				? target.windowId === caller.windowId
+				: target.paneId === caller.paneId;
+			if (protectedTarget) {
+				return yield* environmentError("close tmux target", `Refusing to close ${targetId} because it contains the calling pane ${caller.paneId}.`);
+			}
+			const command = kind === "window" ? "kill-window" : "kill-pane";
+			yield* self.command([command, "-t", targetId], "close tmux target");
+			return target;
+		});
+	}
+
 	send(target: TerminalTarget, text: string, submit: boolean): Effect.Effect<void, TerminalEnvironmentError> {
 		const self = this;
 		return Effect.gen(function* () {
@@ -184,7 +205,7 @@ export class TmuxAdapter implements TerminalAdapter {
 			});
 			const delivery = Effect.gen(function* () {
 				yield* self.command(["load-buffer", "-b", bufferName, inputPath], "load terminal input");
-				yield* self.command(["paste-buffer", "-d", "-b", bufferName, "-t", verified.paneId], "paste terminal input");
+				yield* self.command(["paste-buffer", "-p", "-d", "-b", bufferName, "-t", verified.paneId], "paste terminal input");
 				if (submit) yield* self.command(["send-keys", "-t", verified.paneId, "Enter"], "submit terminal input");
 			});
 			return yield* delivery.pipe(Effect.ensuring(Effect.promise(async () => {

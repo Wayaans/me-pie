@@ -8,6 +8,7 @@ import { environmentError, errorMessage, type TerminalEnvironmentError } from ".
 const LOCK_RETRY_MS = 20;
 const LOCK_TIMEOUT_MS = 2_000;
 const STALE_LOCK_MS = 10_000;
+const MAX_RETAINED_SIGNALS = 1_024;
 
 interface LockOwner {
 	readonly pid: number;
@@ -32,6 +33,26 @@ export interface SignalStoreOptions {
 	readonly rootDirectory?: string;
 }
 
+export interface SignalSnapshot {
+	readonly sequence: number;
+	readonly sourcePaneId?: string;
+}
+
+export interface SignalEvent {
+	readonly sequence: number;
+	readonly sourcePaneId: string;
+}
+
+export interface SignalPoll {
+	readonly currentSequence: number;
+	readonly signal?: SignalEvent;
+}
+
+interface SignalState {
+	readonly sequence: number;
+	readonly signals: readonly SignalEvent[];
+}
+
 export class SignalStore {
 	private readonly directory: string;
 
@@ -41,17 +62,38 @@ export class SignalStore {
 		this.directory = path.join(root, serverId);
 	}
 
-	currentSequence(paneId: string): Effect.Effect<number, TerminalEnvironmentError> {
-		return this.operation("read workspace signal", (signal) => this.readSequence(paneId, signal));
+	currentSignal(recipientPaneId: string): Effect.Effect<SignalSnapshot, TerminalEnvironmentError> {
+		return this.operation("read workspace inbox signal", async (signal) => {
+			const state = await this.readState(recipientPaneId, signal);
+			return state.signals.at(-1) ?? { sequence: 0 };
+		});
 	}
 
-	signal(paneId: string): Effect.Effect<number, TerminalEnvironmentError> {
-		return this.operation("write workspace signal", async (signal) => {
+	currentSequence(recipientPaneId: string): Effect.Effect<number, TerminalEnvironmentError> {
+		return this.currentSignal(recipientPaneId).pipe(Effect.map((current) => current.sequence));
+	}
+
+	poll(recipientPaneId: string, afterSequence: number): Effect.Effect<SignalPoll, TerminalEnvironmentError> {
+		return this.operation("poll workspace inbox signal", async (signal) => {
+			const state = await this.readState(recipientPaneId, signal);
+			const nextSignal = state.signals.find((event) => event.sequence > afterSequence);
+			return {
+				currentSequence: state.sequence,
+				...(nextSignal === undefined ? {} : { signal: nextSignal }),
+			};
+		});
+	}
+
+	signal(recipientPaneId: string, sourcePaneId: string): Effect.Effect<number, TerminalEnvironmentError> {
+		return this.operation("write workspace inbox signal", async (signal) => {
 			await this.ensureDirectory();
-			const release = await this.acquireLock(paneId, signal);
+			this.paneKey(sourcePaneId, "source");
+			const release = await this.acquireLock(recipientPaneId, signal);
 			try {
-				const next = await this.readSequence(paneId, signal) + 1;
-				await this.writeSequence(paneId, next, signal);
+				const current = await this.readState(recipientPaneId, signal);
+				const next = current.sequence + 1;
+				const signals = [...current.signals, { sequence: next, sourcePaneId }].slice(-MAX_RETAINED_SIGNALS);
+				await this.writeState(recipientPaneId, { sequence: next, signals }, signal);
 				return next;
 			} finally {
 				await release();
@@ -66,8 +108,8 @@ export class SignalStore {
 		});
 	}
 
-	private key(paneId: string): string {
-		if (!/^%[0-9]+$/.test(paneId)) throw environmentError("workspace signal", `Invalid pane ID: ${paneId}`);
+	private paneKey(paneId: string, role: "recipient" | "source"): string {
+		if (!/^%[0-9]+$/.test(paneId)) throw environmentError("workspace signal", `Invalid ${role} pane ID: ${paneId}`);
 		return paneId.slice(1);
 	}
 
@@ -76,33 +118,49 @@ export class SignalStore {
 		await chmod(this.directory, 0o700);
 	}
 
-	private sequencePath(paneId: string): string {
-		return path.join(this.directory, `${this.key(paneId)}.json`);
+	private signalPath(recipientPaneId: string): string {
+		return path.join(this.directory, `to-${this.paneKey(recipientPaneId, "recipient")}.json`);
 	}
 
-	private lockPath(paneId: string): string {
-		return path.join(this.directory, `${this.key(paneId)}.lock`);
+	private lockPath(recipientPaneId: string): string {
+		return path.join(this.directory, `to-${this.paneKey(recipientPaneId, "recipient")}.lock`);
 	}
 
-	private async readSequence(paneId: string, signal: AbortSignal): Promise<number> {
+	private async readState(recipientPaneId: string, signal: AbortSignal): Promise<SignalState> {
 		signal.throwIfAborted();
 		await this.ensureDirectory();
 		try {
-			const parsed = JSON.parse(await readFile(this.sequencePath(paneId), "utf8")) as { readonly sequence?: unknown };
-			if (!Number.isSafeInteger(parsed.sequence) || (parsed.sequence as number) < 0) throw new Error("Signal sequence file is malformed.");
-			return parsed.sequence as number;
+			const parsed = JSON.parse(await readFile(this.signalPath(recipientPaneId), "utf8")) as {
+				readonly sequence?: unknown;
+				readonly signals?: unknown;
+			};
+			if (!Number.isSafeInteger(parsed.sequence) || (parsed.sequence as number) < 1
+				|| !Array.isArray(parsed.signals) || parsed.signals.length < 1
+				|| parsed.signals.length > MAX_RETAINED_SIGNALS) {
+				throw new Error("Signal inbox file is malformed.");
+			}
+			const signals = parsed.signals as Array<{ readonly sequence?: unknown; readonly sourcePaneId?: unknown }>;
+			if (signals.some((event, index) => !Number.isSafeInteger(event.sequence)
+				|| (event.sequence as number) < 1
+				|| (index > 0 && (event.sequence as number) <= (signals[index - 1]!.sequence as number))
+				|| typeof event.sourcePaneId !== "string"
+				|| !/^%[0-9]+$/.test(event.sourcePaneId))
+				|| signals.at(-1)!.sequence !== parsed.sequence) {
+				throw new Error("Signal inbox file is malformed.");
+			}
+			return { sequence: parsed.sequence as number, signals: signals as SignalEvent[] };
 		} catch (cause) {
-			if ((cause as NodeJS.ErrnoException).code === "ENOENT") return 0;
+			if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { sequence: 0, signals: [] };
 			throw cause;
 		}
 	}
 
-	private async writeSequence(paneId: string, sequence: number, signal: AbortSignal): Promise<void> {
+	private async writeState(recipientPaneId: string, state: SignalState, signal: AbortSignal): Promise<void> {
 		signal.throwIfAborted();
-		const destination = this.sequencePath(paneId);
+		const destination = this.signalPath(recipientPaneId);
 		const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
 		try {
-			await writeFile(temporary, `${JSON.stringify({ sequence })}\n`, { encoding: "utf8", mode: 0o600, flag: "wx", signal });
+			await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx", signal });
 			await chmod(temporary, 0o600);
 			await rename(temporary, destination);
 		} finally {
@@ -110,8 +168,8 @@ export class SignalStore {
 		}
 	}
 
-	private async acquireLock(paneId: string, signal: AbortSignal): Promise<() => Promise<void>> {
-		const lock = this.lockPath(paneId);
+	private async acquireLock(recipientPaneId: string, signal: AbortSignal): Promise<() => Promise<void>> {
+		const lock = this.lockPath(recipientPaneId);
 		const ownerPath = path.join(lock, "owner.json");
 		const deadline = Date.now() + LOCK_TIMEOUT_MS;
 		for (;;) {

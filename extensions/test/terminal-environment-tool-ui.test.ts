@@ -64,15 +64,15 @@ test("workspace call rows distinguish actions, targets, agents, and send intent 
 	for (const agent of ["pi", "codex", "claude", "opencode"] as const) {
 		const output = rendered(renderWorkspaceCall({
 			action: "run",
-			run: { targetId: "%13", agent, model: `${agent}-latest`, thinking: "high", extraArgs: ["SECRET-NOISE"] },
+			run: { targetId: "%13", agent, model: `${agent}-latest`, thinking: "high" },
 		}, plainTheme as never));
 		assert.match(output, new RegExp(agent, "i"));
 		assert.match(output, /%13/);
 		assert.match(output, /high/);
-		assert.doesNotMatch(output, /SECRET-NOISE|extraArgs/);
 	}
 	assert.match(rendered(renderWorkspaceCall({ action: "send", send: { targetId: "%13", input: "command", text: "pwd", submit: false } }, plainTheme as never)), /Command · %13 · paste only/);
-	assert.match(rendered(renderWorkspaceCall({ action: "wait", wait: { targetId: "%13", afterSequence: 4 } }, plainTheme as never)), /Send signal · %13 · after 4/);
+	assert.match(rendered(renderWorkspaceCall({ action: "wait", wait: { targetId: "%13", afterSequence: 4 } }, plainTheme as never)), /Inbox · %13 · after 4/);
+	assert.match(rendered(renderWorkspaceCall({ action: "close", close: { targetId: "%13" } }, plainTheme as never)), /Close · Pane · %13/);
 });
 
 test("spawn results stay compact until expanded", () => {
@@ -93,7 +93,7 @@ test("run results distinguish created and existing targets and show only selecte
 	for (const agent of ["pi", "codex", "claude", "opencode"] as const) {
 		const args: WorkspaceParameters = {
 			action: "run",
-			run: { agent, model: `${agent}-latest`, thinking: "medium", extraArgs: ["SECRET-NOISE"] },
+			run: { agent, model: `${agent}-latest`, thinking: "medium" },
 		};
 		const created = resultOutput(args, {
 			action: "run",
@@ -105,7 +105,7 @@ test("run results distinguish created and existing targets and show only selecte
 		assert.match(created, new RegExp(`✓ ${agent[0]!.toUpperCase()}${agent.slice(1)} launched`));
 		assert.match(created, /new target/);
 		assert.match(created, new RegExp(`model ${agent}-latest · thinking medium`));
-		assert.doesNotMatch(created, /SECRET-NOISE|\/usr\/local\/bin/);
+		assert.doesNotMatch(created, /\/usr\/local\/bin/);
 	}
 
 	const existing = resultOutput({ action: "run", run: { targetId: "%13", agent: "codex" } }, {
@@ -114,55 +114,77 @@ test("run results distinguish created and existing targets and show only selecte
 	assert.match(existing, /existing target/);
 });
 
+test("close results identify the exact target kind and preserve the pre-close snapshot", () => {
+	for (const [kind, targetId] of [["pane", "%13"], ["window", "@7"]] as const) {
+		const args: WorkspaceParameters = { action: "close", close: { targetId } };
+		const details: WorkspaceResult = { action: "close", kind, target };
+		const collapsed = resultOutput(args, details, { expanded: false, isPartial: false });
+		assert.match(collapsed, new RegExp(`✓ ${kind[0]!.toUpperCase()}${kind.slice(1)} closed`));
+		assert.match(collapsed, /%13 · @7\/api · \$2\/dev/);
+		assert.doesNotMatch(collapsed, /before close/);
+
+		const expanded = resultOutput(args, details, { expanded: true, isPartial: false });
+		assert.ok(expanded.includes(`closed ${targetId}`));
+		assert.match(expanded, /command zsh before close/);
+	}
+});
+
 test("send results render Markdown previews, submission mode, and delivery sequence", () => {
 	const markdown = "# Review auth\n\n- Keep **tests** green\n- Check `session.ts`";
 	const promptArgs: WorkspaceParameters = { action: "send", send: { targetId: "%13", input: "prompt", text: markdown } };
 	const promptResult: WorkspaceResult = {
-		action: "send", target, deliveryId: "delivery-42", sequence: 42, bytes: 61, input: "prompt",
+		action: "send", target, sourcePaneId: "%5", deliveryId: "delivery-42", sequence: 42,
+		replyAfterSequence: 7, bytes: 61, input: "prompt",
 	};
 	const collapsed = resultOutput(promptArgs, promptResult, { expanded: false, isPartial: false });
-	assert.match(collapsed, /✓ Prompt sent · %13 · sequence 42 · 61 B/);
+	assert.match(collapsed, /✓ Prompt sent · %5 → %13 · recipient sequence 42 · 61 B/);
 	assert.match(collapsed, /# Review auth/);
 	assert.doesNotMatch(collapsed, /Keep tests green/);
 
 	const expanded = resultOutput(promptArgs, promptResult, { expanded: true, isPartial: false });
 	assert.match(expanded, /Review auth/);
 	assert.match(expanded, /Keep tests green/);
+	assert.match(expanded, /wait on %5 for reply from %13 after sequence 7/);
 	assert.match(expanded, /delivery delivery-42/);
 
 	const pasted = resultOutput(
 		{ action: "send", send: { targetId: "%13", input: "command", text: "bun test", submit: false } },
-		{ action: "send", target, deliveryId: "delivery-43", sequence: 43, bytes: 8, input: "command" },
+		{ action: "send", target, sourcePaneId: "%5", deliveryId: "delivery-43", sequence: 43, replyAfterSequence: 8, bytes: 8, input: "command" },
 		{ expanded: false, isPartial: false },
 	);
-	assert.match(pasted, /✓ Command pasted · %13 · sequence 43/);
+	assert.match(pasted, /✓ Command pasted · %5 → %13 · recipient sequence 43/);
 });
 
-test("wait rendering covers progress, send signals, timeout, target exit, and cancellation", () => {
+test("wait rendering covers inbox progress, source attribution, timeout, and cancellation", () => {
 	const args: WorkspaceParameters = { action: "wait", wait: { targetId: "%13", afterSequence: 42, timeoutMs: 120_000 } };
 	const pending = resultOutput(args, {
 		workspaceUi: { action: "wait", elapsedMs: 12_400, frame: 2 },
 	}, { expanded: true, isPartial: true });
-	assert.match(pending, /Waiting for send signal · %13 · 12\.4s/);
-	assert.match(pending, /workspace send events only; agent status unknown/);
-	assert.doesNotMatch(pending, /agent completion/);
+	assert.match(pending, /Waiting for inbox signal · %13 · 12\.4s/);
+	assert.match(pending, /selected target inbox/);
+	assert.match(pending, /After a timeout, call workspace wait again/);
 
-	const cases = [
-		["signaled", "✓ Send signal received"],
-		["timeout", "! No send signal before timeout"],
-		["target-exited", "✕ Target exited while waiting"],
-	] as const;
-	for (const [reason, expected] of cases) {
-		const output = resultOutput(args, {
-			action: "wait",
-			target: { ...target, dead: reason === "target-exited" },
-			reason,
-			sequence: reason === "signaled" ? 43 : 42,
-			elapsedMs: reason === "timeout" ? 120_000 : 3_400,
-		}, { expanded: true, isPartial: false });
-		assert.match(output, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-		assert.match(output, /workspace send events only; agent status unknown/);
-	}
+	const signaled = resultOutput(args, {
+		action: "wait",
+		target,
+		reason: "signaled",
+		sourcePaneId: "%5",
+		sequence: 43,
+		elapsedMs: 3_400,
+	}, { expanded: true, isPartial: false });
+	assert.match(signaled, /✓ Inbox signal received · %5 → %13 · sequence 43/);
+	assert.match(signaled, /signal reports its source pane/);
+	assert.doesNotMatch(signaled, /After a timeout/);
+
+	const timeout = resultOutput(args, {
+		action: "wait",
+		target,
+		reason: "timeout",
+		sequence: 42,
+		elapsedMs: 120_000,
+	}, { expanded: true, isPartial: false });
+	assert.match(timeout, /! No inbox signal before timeout · inbox %13 · sequence 42/);
+	assert.match(timeout, /After a timeout, call workspace wait again/);
 
 	const cancelled = resultOutput(args, undefined, { expanded: false, isPartial: false }, true, "Operation aborted by user");
 	assert.match(cancelled, /✕ Wait cancelled · Operation aborted by user/);

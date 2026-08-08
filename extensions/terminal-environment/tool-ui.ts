@@ -5,13 +5,14 @@ import {
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, type Component } from "@earendil-works/pi-tui";
-import type { TerminalTarget, WorkspaceResult } from "./model.ts";
+import { closeTargetKindFromId, type TerminalTarget, type WorkspaceResult } from "./model.ts";
 import type { WorkspaceParameters } from "./schema.ts";
 
 const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 const PROGRESS_INTERVAL_MS = 160;
 const NARROW_WIDTH = 32;
-const WAIT_BOUNDARY = "Synchronization: workspace send events only; agent status unknown.";
+const WAIT_BOUNDARY = "Wait listens on the selected target inbox; the signal reports its source pane.";
+const WAIT_TIMEOUT_GUIDANCE = "After a timeout, call workspace wait again with the returned sequence.";
 
 export interface WorkspaceProgressDetails {
 	readonly workspaceUi: {
@@ -48,7 +49,7 @@ export async function runWithWorkspaceWaitProgress<A>(
 	const publish = (): void => {
 		const elapsedMs = Date.now() - startedAt;
 		onUpdate?.({
-			content: [{ type: "text", text: `Waiting for workspace send signal · ${formatElapsed(elapsedMs)}` }],
+			content: [{ type: "text", text: `Waiting for a workspace inbox signal · ${formatElapsed(elapsedMs)}` }],
 			details: { workspaceUi: { action: "wait", elapsedMs, frame } },
 		});
 		frame = (frame + 1) % SPINNER_FRAMES.length;
@@ -140,9 +141,9 @@ function createPartialView(args: WorkspaceParameters, details: WorkspaceToolDeta
 	return {
 		icon: frame,
 		tone: "accent",
-		status: "Waiting for send signal",
+		status: "Waiting for inbox signal",
 		meta: `${sanitizeInline(args.wait?.targetId ?? "?")} · ${formatElapsed(progress?.elapsedMs ?? 0)}`,
-		details: [WAIT_BOUNDARY],
+		details: [WAIT_BOUNDARY, WAIT_TIMEOUT_GUIDANCE],
 	};
 }
 
@@ -152,6 +153,7 @@ function createFinalView(result: WorkspaceResult, args: WorkspaceParameters): Wo
 		case "run": return createRunView(result, args);
 		case "send": return createSendView(result, args);
 		case "wait": return createWaitView(result);
+		case "close": return createCloseView(result);
 	}
 }
 
@@ -190,23 +192,47 @@ function createSendView(result: Extract<WorkspaceResult, { action: "send" }>, ar
 		icon: "✓",
 		tone: "success",
 		status: `${titleCase(result.input)} ${send?.submit === false ? "pasted" : "sent"}`,
-		meta: `${sanitizeInline(result.target.paneId)} · sequence ${result.sequence} · ${result.bytes} B`,
-		details: [...targetDetails(result.target), `delivery ${sanitizeInline(result.deliveryId)}`],
+		meta: `${sanitizeInline(result.sourcePaneId)} → ${sanitizeInline(result.target.paneId)} · recipient sequence ${result.sequence} · ${result.bytes} B`,
+		details: [
+			...targetDetails(result.target),
+			`wait on ${sanitizeInline(result.sourcePaneId)} for reply from ${sanitizeInline(result.target.paneId)} after sequence ${result.replyAfterSequence}`,
+			`delivery ${sanitizeInline(result.deliveryId)}`,
+		],
 		...(firstLine ? { preview: firstLine } : {}),
 		...(source ? { markdown: source } : {}),
 	};
 }
 
+function createCloseView(result: Extract<WorkspaceResult, { action: "close" }>): WorkspaceView {
+	return {
+		icon: "✓",
+		tone: "success",
+		status: `${titleCase(result.kind)} closed`,
+		meta: targetHierarchy(result.target),
+		details: [
+			`closed ${sanitizeInline(closedTargetId(result))}`,
+			...targetDetails(result.target).slice(0, 3),
+			`command ${sanitizeInline(result.target.currentCommand)} before close`,
+		],
+	};
+}
+
 function createWaitView(result: Extract<WorkspaceResult, { action: "wait" }>): WorkspaceView {
-	const meta = `${sanitizeInline(result.target.paneId)} · sequence ${result.sequence} · ${formatElapsed(result.elapsedMs)}`;
+	const route = result.reason === "signaled"
+		? `${sanitizeInline(result.sourcePaneId)} → ${sanitizeInline(result.target.paneId)}`
+		: `inbox ${sanitizeInline(result.target.paneId)}`;
+	const meta = `${route} · sequence ${result.sequence} · ${formatElapsed(result.elapsedMs)}`;
 	const details = [...targetDetails(result.target), WAIT_BOUNDARY];
 	if (result.reason === "signaled") {
-		return { icon: "✓", tone: "success", status: "Send signal received", meta, details };
+		return { icon: "✓", tone: "success", status: "Inbox signal received", meta, details };
 	}
-	if (result.reason === "timeout") {
-		return { icon: "!", tone: "warning", status: "No send signal before timeout", meta, details };
-	}
-	return { icon: "✕", tone: "error", status: "Target exited while waiting", meta, details };
+	return {
+		icon: "!",
+		tone: "warning",
+		status: "No inbox signal before timeout",
+		meta,
+		details: [...details, WAIT_TIMEOUT_GUIDANCE],
+	};
 }
 
 function formatCallMeta(args: WorkspaceParameters): string[] {
@@ -238,11 +264,15 @@ function formatCallMeta(args: WorkspaceParameters): string[] {
 			args.send?.submit === false ? "paste only" : "submit",
 		];
 		case "wait": return compact([
-			"Send signal",
+			"Inbox",
 			sanitizeInline(args.wait?.targetId ?? "?"),
 			args.wait?.afterSequence === undefined ? undefined : `after ${args.wait.afterSequence}`,
 			args.wait?.timeoutMs === undefined ? undefined : `timeout ${formatElapsed(args.wait.timeoutMs)}`,
 		]);
+		case "close": return [
+			titleCase(closeTargetKindFromId(args.close?.targetId ?? "")),
+			sanitizeInline(args.close?.targetId ?? "?"),
+		];
 	}
 }
 
@@ -251,7 +281,8 @@ function formatNarrowCall(args: WorkspaceParameters): string {
 		case "spawn": return `Workspace · Spawn ${args.spawn?.kind ?? "window"}`;
 		case "run": return `Workspace · Run ${titleCase(args.run?.agent ?? "pi")} → ${sanitizeInline(args.run?.targetId ?? "new")}`;
 		case "send": return `Workspace · Send ${args.send?.input ?? "input"} → ${sanitizeInline(args.send?.targetId ?? "?")}`;
-		case "wait": return `Workspace · Wait signal ← ${sanitizeInline(args.wait?.targetId ?? "?")}`;
+		case "wait": return `Workspace · Wait inbox ${sanitizeInline(args.wait?.targetId ?? "?")}`;
+		case "close": return `Workspace · Close ${sanitizeInline(args.close?.targetId ?? "?")}`;
 	}
 }
 
@@ -263,8 +294,11 @@ function formatNarrowResultMeta(result: WorkspaceToolResult, context: WorkspaceR
 	switch (result.details.action) {
 		case "spawn": return sanitizeInline(result.details.target.paneId);
 		case "run": return sanitizeInline(result.details.target.paneId);
-		case "send": return `${sanitizeInline(result.details.target.paneId)} · seq ${result.details.sequence}`;
-		case "wait": return `${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`;
+		case "send": return `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · seq ${result.details.sequence}`;
+		case "wait": return result.details.reason === "signaled"
+			? `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`
+			: `${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`;
+		case "close": return sanitizeInline(closedTargetId(result.details));
 	}
 }
 
@@ -306,11 +340,14 @@ function isWorkspaceResult(details: WorkspaceToolDetails): details is WorkspaceR
 		case "spawn": return true;
 		case "run": return typeof candidate.agent === "string" &&
 			typeof candidate.executable === "string" && typeof candidate.spawnedTarget === "boolean";
-		case "send": return typeof candidate.deliveryId === "string" &&
-			Number.isInteger(candidate.sequence) && Number.isInteger(candidate.bytes) &&
+		case "send": return typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId) &&
+			typeof candidate.deliveryId === "string" && Number.isInteger(candidate.sequence) &&
+			Number.isInteger(candidate.replyAfterSequence) && Number.isInteger(candidate.bytes) &&
 			(candidate.input === "prompt" || candidate.input === "command");
-		case "wait": return (candidate.reason === "signaled" || candidate.reason === "timeout" || candidate.reason === "target-exited") &&
+		case "wait": return (candidate.reason === "signaled" || candidate.reason === "timeout") &&
+			(candidate.reason !== "signaled" || (typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId))) &&
 			Number.isInteger(candidate.sequence) && typeof candidate.elapsedMs === "number" && Number.isFinite(candidate.elapsedMs);
+		case "close": return candidate.kind === "window" || candidate.kind === "pane";
 		default: return false;
 	}
 }
@@ -331,6 +368,7 @@ function targetId(args: WorkspaceParameters): string | undefined {
 		case "run": return args.run?.targetId ? sanitizeInline(args.run.targetId) : undefined;
 		case "send": return args.send?.targetId ? sanitizeInline(args.send.targetId) : undefined;
 		case "wait": return args.wait?.targetId ? sanitizeInline(args.wait.targetId) : undefined;
+		case "close": return args.close?.targetId ? sanitizeInline(args.close.targetId) : undefined;
 	}
 }
 
@@ -364,6 +402,10 @@ function sanitizeMultiline(value: string): string {
 
 function sanitizeInline(value: string): string {
 	return sanitizeMultiline(value).replaceAll("\n", " ↵ ");
+}
+
+function closedTargetId(result: Extract<WorkspaceResult, { action: "close" }>): string {
+	return result.kind === "window" ? result.target.windowId : result.target.paneId;
 }
 
 function titleCase(value: string): string {
