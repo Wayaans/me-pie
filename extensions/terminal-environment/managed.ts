@@ -219,6 +219,18 @@ export function snapshotFromWork(
 }
 
 /** Validate a branch-local snapshot without treating it as runtime authority. */
+export function latestManagedSnapshots(entries: readonly unknown[]): readonly ManagedSessionSnapshot[] {
+	const latest = new Map<string, ManagedSessionSnapshot>();
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object") continue;
+		const candidate = entry as { readonly type?: unknown; readonly customType?: unknown; readonly data?: unknown };
+		if (candidate.type !== "custom" || candidate.customType !== MANAGED_SNAPSHOT_TYPE) continue;
+		const snapshot = validateManagedSnapshot(candidate.data);
+		if (snapshot) latest.set(snapshot.runId, snapshot);
+	}
+	return [...latest.values()];
+}
+
 export function validateManagedSnapshot(value: unknown): ManagedSessionSnapshot | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const candidate = value as Partial<ManagedSessionSnapshot>;
@@ -227,7 +239,8 @@ export function validateManagedSnapshot(value: unknown): ManagedSessionSnapshot 
 	if (candidate.version !== 1 || typeof candidate.runId !== "string" || !isUuid(candidate.runId)
 		|| (candidate.readiness !== "verified" && candidate.readiness !== "process_started" && candidate.readiness !== "unverified")
 		|| (candidate.workId !== undefined && (typeof candidate.workId !== "string" || !isUuid(candidate.workId)))
-		|| (candidate.workState !== undefined && candidate.workState !== "active" && candidate.workState !== "finished")
+		|| (candidate.workState !== undefined && candidate.workState !== "active" && candidate.workState !== "finished"
+			&& candidate.workState !== "interrupted" && candidate.workState !== "rejected" && candidate.workState !== "lost")
 		|| (candidate.resultReceived !== undefined && typeof candidate.resultReceived !== "boolean")
 		|| (candidate.workFinished !== undefined && typeof candidate.workFinished !== "boolean")
 		|| (candidate.outcome !== undefined && candidate.outcome !== "completed" && candidate.outcome !== "blocked" && candidate.outcome !== "failed")
@@ -239,7 +252,7 @@ export function validateManagedSnapshot(value: unknown): ManagedSessionSnapshot 
 	if (!hasWork && (candidate.workState !== undefined || candidate.resultReceived !== undefined || candidate.workFinished !== undefined || candidate.outcome !== undefined)) return undefined;
 	if (hasWork && (candidate.workState === undefined || candidate.resultReceived === undefined || candidate.workFinished === undefined)) return undefined;
 	if (candidate.workState === "finished" && candidate.workFinished !== true) return undefined;
-	if (candidate.workState === "active" && candidate.workFinished === true) return undefined;
+	if (candidate.workState !== "finished" && candidate.workFinished === true) return undefined;
 	if (candidate.resultReceived === true && candidate.outcome === undefined) return undefined;
 	if (candidate.resultReceived === false && candidate.outcome !== undefined) return undefined;
 	return candidate as ManagedSessionSnapshot;

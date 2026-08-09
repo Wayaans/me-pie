@@ -120,9 +120,9 @@ export class Workspace {
 			if (!run || run.agent !== "pi" || run.tokenHash !== context.tokenHash) {
 				return yield* environmentError("initialize managed Pi worker", "Private launch context does not match the coordination ledger.");
 			}
-			const verified = yield* this.resolveManagedTarget(context.runId, current.paneId);
+			const verified = yield* this.resolveWorkerTarget(context);
 			if (verified.dead || !sameTargetIdentity(context.target, targetIdentity(this.adapter.instanceId, verified))) {
-				yield* this.markLostIfPresent(context.runId);
+				yield* this.markLostByWorker(context, "Managed launch target is dead, stale, or reused.");
 				return yield* environmentError("initialize managed Pi worker", "Managed launch target is dead, stale, or reused.");
 			}
 			const activeWork = yield* this.coordination.getActiveWork(context.runId);
@@ -174,18 +174,17 @@ export class Workspace {
 		if (!envelope) return Effect.succeed({ kind: "unmanaged" });
 		if (!context || context.agent !== "pi") return Effect.fail(environmentError("route managed task input", "Managed task input reached an unverified Pi process."));
 		return Effect.gen(function* (this: Workspace) {
-			const current = this.adapter.currentTarget;
-			const verified = yield* this.resolveManagedTarget(context.runId, current.paneId);
+			const verified = yield* this.resolveWorkerTarget(context);
 			const identity = targetIdentity(this.adapter.instanceId, verified);
 			if (context.instanceId !== this.adapter.instanceId || verified.dead || !sameTargetIdentity(context.target, identity)) {
-				yield* this.markLostIfPresent(context.runId);
+				yield* this.markLostByWorker(context, "Managed task input source is dead, stale, or reused.");
 				return { kind: "rejected" } as const;
 			}
 			const run = yield* this.coordination.getRun(context.runId);
 			const work = yield* this.coordination.getWork(context.runId, envelope.workId);
 			if (!run || run.tokenHash !== context.tokenHash || !sameTargetRuntime(run.target, verified)
 				|| !run.verifiedWorkFinished || run.state !== "busy" || !work || work.state !== "active") {
-				if (run && !sameTargetRuntime(run.target, verified)) yield* this.markLostIfPresent(context.runId);
+				if (run && !sameTargetRuntime(run.target, verified)) yield* this.markLostByWorker(context, "Managed worker runtime diagnostics changed.");
 				return { kind: "rejected" } as const;
 			}
 			if (hashManagedPrompt(envelope.text) !== work.promptHash) {
@@ -233,16 +232,15 @@ export class Workspace {
 			return Effect.succeed(false);
 		}
 		return Effect.gen(function* (this: Workspace) {
-			const current = this.adapter.currentTarget;
-			const verified = yield* this.resolveManagedTarget(context.runId, current.paneId);
+			const verified = yield* this.resolveWorkerTarget(context);
 			if (context.instanceId !== this.adapter.instanceId || verified.dead || !sameTargetIdentity(context.target, targetIdentity(this.adapter.instanceId, verified))) {
-				yield* this.markLostIfPresent(context.runId);
+				yield* this.markLostByWorker(context, "Managed worker target was lost before Work Finished.");
 				this.boundManagedWorkId = undefined;
 				return false;
 			}
 			const run = yield* this.coordination.getRun(context.runId);
 			if (!run || run.tokenHash !== context.tokenHash || !sameTargetRuntime(run.target, verified) || run.state !== "busy") {
-				if (run && !sameTargetRuntime(run.target, verified)) yield* this.markLostIfPresent(context.runId);
+				if (run && !sameTargetRuntime(run.target, verified)) yield* this.markLostByWorker(context, "Managed worker runtime diagnostics changed before Work Finished.");
 				this.boundManagedWorkId = undefined;
 				return false;
 			}
@@ -257,22 +255,69 @@ export class Workspace {
 		}.bind(this));
 	}
 
-	private resolveManagedTarget(runId: string, paneId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
-		return this.adapter.resolve(paneId).pipe(Effect.catch((cause) =>
-			this.markLostIfPresent(runId).pipe(Effect.flatMap(() => Effect.fail(cause)))));
-	}
-
-	private markLostIfPresent(runId: string): Effect.Effect<void, never> {
-		return this.coordination.markLost(runId).pipe(Effect.catch(() => Effect.void));
-	}
-
-	managedSnapshot(): Effect.Effect<ManagedSessionSnapshot | undefined, TerminalEnvironmentError> {
-		const context = this.managedContext;
-		if (!context) return Effect.succeed(undefined);
+	private authenticateManagedWorker(context: ManagedLaunchContext): Effect.Effect<ManagedRunRecord, TerminalEnvironmentError> {
+		const currentIdentity = targetIdentity(this.adapter.instanceId, this.adapter.currentTarget);
 		return Effect.gen(function* (this: Workspace) {
 			const run = yield* this.coordination.getRun(context.runId);
-			if (!run || run.tokenHash !== context.tokenHash) return undefined;
-			const work = yield* this.coordination.getWork(context.runId);
+			if (!run || context.instanceId !== this.adapter.instanceId || run.tokenHash !== context.tokenHash
+				|| run.controllerPaneId !== context.controllerPaneId
+				|| !sameTargetIdentity(run.targetIdentity, context.target)
+				|| !sameTargetIdentity(context.target, currentIdentity)) {
+				return yield* environmentError("authenticate managed Pi worker", "Private launch context does not match the coordination ledger and current tmux target.");
+			}
+			return run;
+		}.bind(this));
+	}
+
+	private resolveWorkerTarget(context: ManagedLaunchContext): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
+		return Effect.gen(function* (this: Workspace) {
+			yield* this.authenticateManagedWorker(context);
+			return yield* this.adapter.resolve(context.target.paneId).pipe(Effect.catch((cause) =>
+				this.markLostByWorker(context, "The authenticated worker target could not be resolved.").pipe(
+					Effect.flatMap(() => Effect.fail(cause)),
+				)));
+		}.bind(this));
+	}
+
+	private markLostByWorker(context: ManagedLaunchContext, reason: string): Effect.Effect<void, never> {
+		return this.coordination.markLostByWorker({
+			runId: context.runId,
+			token: context.token,
+			worker: context.target,
+			reason,
+		}).pipe(Effect.catch(() => Effect.void));
+	}
+
+	private resolveControllerTarget(runId: string, paneId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
+		return this.adapter.resolve(paneId).pipe(Effect.catch((cause) =>
+			this.markLostByController(runId, "The controller-owned Agent Run target could not be resolved.").pipe(
+				Effect.flatMap(() => Effect.fail(cause)),
+			)));
+	}
+
+	private markLostByController(runId: string, reason: string): Effect.Effect<void, never> {
+		return this.coordination.markLostByController({
+			runId,
+			controllerPaneId: this.adapter.currentTarget.paneId,
+			controllerTarget: targetIdentity(this.adapter.instanceId, this.adapter.currentTarget),
+			reason,
+		}).pipe(Effect.catch(() => Effect.void));
+	}
+
+	managedSnapshot(runId?: string): Effect.Effect<ManagedSessionSnapshot | undefined, TerminalEnvironmentError> {
+		const context = this.managedContext;
+		const selectedRunId = runId ?? context?.runId;
+		if (!selectedRunId) return Effect.succeed(undefined);
+		return Effect.gen(function* (this: Workspace) {
+			const run = yield* this.coordination.getRun(selectedRunId);
+			if (!run) return undefined;
+			if (context) {
+				if (run.runId !== context.runId || run.tokenHash !== context.tokenHash) return undefined;
+			} else {
+				const controller = targetIdentity(this.adapter.instanceId, this.adapter.currentTarget);
+				if (run.controllerPaneId !== controller.paneId || !sameTargetIdentity(run.controllerTargetIdentity, controller)) return undefined;
+			}
+			const work = yield* this.coordination.getWork(selectedRunId);
 			return snapshotFromWork({
 				runId: run.runId,
 				readiness: run.readiness === "starting" ? "unverified" : run.readiness,
@@ -282,6 +327,37 @@ export class Workspace {
 				...(run.sessionFile === undefined ? {} : { sessionFile: run.sessionFile }),
 			}, work);
 		}.bind(this));
+	}
+
+	/** Reconcile only runs named by validated snapshots on the active session branch. */
+	reconcileSession(snapshots: readonly ManagedSessionSnapshot[]): Effect.Effect<void, TerminalEnvironmentError> {
+		if (this.managedContext) return Effect.void;
+		const self = this;
+		return Effect.gen(function* () {
+			const controllerTarget = self.adapter.currentTarget;
+			const controllerIdentity = targetIdentity(self.adapter.instanceId, controllerTarget);
+			const owned = yield* self.coordination.listRunsForController(controllerTarget.paneId, controllerIdentity);
+			const branchRunIds = new Set(snapshots.map((snapshot) => snapshot.runId));
+			for (const run of owned) {
+				if (run.state === "closed" || run.state === "lost") continue;
+				if (!branchRunIds.has(run.runId)) {
+					yield* self.markLostByController(run.runId, "Agent Run is not owned by the active session branch.");
+					continue;
+				}
+				if (run.state === "starting" && !run.processStarted) {
+					yield* self.markLostByController(run.runId, "Abandoned Agent Run launch was recovered on session startup.");
+					continue;
+				}
+				const resolved = yield* Effect.exit(self.adapter.resolve(run.target.paneId));
+				if (Exit.isFailure(resolved) || resolved.value.dead
+					|| !sameTargetIdentity(run.targetIdentity, targetIdentity(self.adapter.instanceId, resolved.value))
+					|| !sameTargetRuntime(run.target, resolved.value)) {
+					yield* self.markLostByController(run.runId, "Agent Run target was missing, dead, stale, or reused during session recovery.");
+					continue;
+				}
+				if (run.state === "closing") yield* self.coordination.restoreClosing(run.runId);
+			}
+		});
 	}
 
 	private spawn(request: SpawnRequest, defaultCwd: string): Effect.Effect<WorkspaceResult, TerminalEnvironmentError> {
@@ -296,10 +372,8 @@ export class Workspace {
 	private run(request: RunRequest, defaultCwd: string): Effect.Effect<WorkspaceResult, TerminalEnvironmentError> {
 		const self = this;
 		let createdTarget: TerminalTarget | undefined;
-		let launchedTarget: TerminalTarget | undefined;
 		let runId: string | undefined;
 		let launcherPath: string | undefined;
-		let launchCompleted = false;
 		// Keep acquired resources and their cleanup handles atomic with cancellation.
 		// Restore interruption only before acquisition or after cleanup state is captured.
 		const operation = Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
@@ -347,9 +421,7 @@ export class Workspace {
 			});
 			launcherPath = yield* makeLauncher(executable, launchArgs, managedLaunchEnvironment(launchContext));
 			yield* self.adapter.launch(target, launcherPath, cwd, spawnedTarget || (request.replace ?? false), spawnedTarget);
-			launchCompleted = true;
-			launchedTarget = target;
-			launchedTarget = yield* restore(self.waitForProcessTarget(target.paneId));
+			const launchedTarget = yield* restore(self.waitForProcessTarget(target.paneId));
 			if (launchedTarget.dead || !sameTargetIdentity(targetIdentity(self.adapter.instanceId, launchedTarget), targetIdentity(self.adapter.instanceId, target))) {
 				return yield* environmentError("run coding agent", "Managed launch target changed or exited before process start was recorded.");
 			}
@@ -384,17 +456,11 @@ export class Workspace {
 		}));
 		return operation.pipe(Effect.onExit((exit) => {
 			if (Exit.isSuccess(exit)) return Effect.void;
-			const markLost = runId === undefined ? Effect.void : self.coordination.markLost(runId).pipe(Effect.ignore);
+			const markLost = runId === undefined ? Effect.void : self.markLostByController(runId, "Agent Run launch failed or was cancelled.");
 			const remove = launcherPath === undefined ? Effect.void : removeLauncher(launcherPath).pipe(Effect.ignore);
-			const close = createdTarget !== undefined
-				? self.adapter.closeSpawnedWindow(createdTarget).pipe(Effect.ignore)
-				: launchCompleted && launchedTarget !== undefined
-					? Effect.gen(function* () {
-						const current = yield* self.adapter.resolve(launchedTarget!.paneId);
-						if (!sameTargetIdentity(targetIdentity(self.adapter.instanceId, current), targetIdentity(self.adapter.instanceId, launchedTarget!))) return;
-						yield* self.adapter.close(current.paneId, current);
-					}).pipe(Effect.ignore)
-					: Effect.void;
+			// Rollback owns only targets spawned by this run operation. A caller-supplied
+			// pane remains open even when launch readiness is cancelled or fails.
+			const close = createdTarget === undefined ? Effect.void : self.adapter.closeSpawnedWindow(createdTarget).pipe(Effect.ignore);
 			return markLost.pipe(Effect.flatMap(() => remove), Effect.flatMap(() => close));
 		}));
 	}
@@ -438,15 +504,28 @@ export class Workspace {
 			if ("runId" in request || "workId" in request || "outcome" in request || "kind" in request) return yield* environmentError("send raw input", "Managed-only send fields require an explicit managed kind.");
 			const target = yield* self.adapter.resolve(request.targetId);
 			const sourcePaneId = self.adapter.currentTarget.paneId;
+			const deliveryId = crypto.randomUUID();
 			const replyAfterSequence = yield* self.signalStore.currentSequence(sourcePaneId);
-			yield* self.adapter.send(target, request.text, request.submit ?? true);
-			const sequence = yield* self.signalStore.signal(target.paneId, sourcePaneId);
+			let transportAttempted = false;
+			const committed = yield* Effect.acquireUseRelease(
+				self.signalStore.reserve(target.paneId, sourcePaneId, deliveryId),
+				() => Effect.gen(function* () {
+					yield* Effect.sync(() => { transportAttempted = true; });
+					yield* self.adapter.send(target, request.text, request.submit ?? true);
+					return yield* self.signalStore.commit(target.paneId, deliveryId);
+				}),
+				(_, exit) => Exit.isSuccess(exit) || !transportAttempted
+					? Effect.void
+					: self.signalStore.markUncertain(target.paneId, deliveryId).pipe(Effect.ignore),
+			).pipe(Effect.mapError((cause) => transportAttempted
+				? environmentError("send raw input", `delivery_uncertain: delivery ${deliveryId} may have reached ${target.paneId}; do not retry it as a new delivery. ${cause.message}`, cause)
+				: cause));
 			return {
 				action: "send",
 				target,
 				sourcePaneId,
-				deliveryId: crypto.randomUUID(),
-				sequence,
+				deliveryId,
+				sequence: committed.sequence,
 				replyAfterSequence,
 				bytes: Buffer.byteLength(request.text, "utf8"),
 				input: request.input,
@@ -469,10 +548,10 @@ export class Workspace {
 				return yield* environmentError("send managed task", `Run ${request.runId} is not a verified Pi Agent Run and cannot accept managed tasks.`);
 			}
 			if (run.controllerPaneId !== sourcePaneId || !sameTargetIdentity(run.controllerTargetIdentity, sourceIdentity)) return yield* environmentError("send managed task", `Run ${request.runId} belongs to another controller target.`);
-			const target = yield* self.resolveManagedTarget(request.runId, run.target.paneId);
+			const target = yield* self.resolveControllerTarget(request.runId, run.target.paneId);
 			const resolvedIdentity = targetIdentity(self.adapter.instanceId, target);
 			if (target.dead || !sameTargetIdentity(run.targetIdentity, resolvedIdentity) || !sameTargetRuntime(run.target, target)) {
-				yield* self.markLostIfPresent(request.runId);
+				yield* self.markLostByController(request.runId, "Managed task target is dead, stale, or reused.");
 				return yield* environmentError("send managed task", target.dead
 					? `Agent Run ${request.runId} target has exited.`
 					: `Run ${request.runId} target identity or runtime diagnostics are stale or was reused.`);
@@ -501,7 +580,7 @@ export class Workspace {
 				(reservedWork, exit) => {
 					if (Exit.isSuccess(exit)) return Effect.void;
 					return deliveryAttempted
-						? self.coordination.markLost(request.runId).pipe(Effect.ignore)
+						? self.markLostByController(request.runId, "Managed task transport outcome is uncertain.")
 						: self.coordination.cancelWork(request.runId, reservedWork.workId).pipe(Effect.ignore);
 				},
 			);
@@ -528,16 +607,15 @@ export class Workspace {
 			const workId = self.boundManagedWorkId;
 			if (!context || context.agent !== "pi") return yield* environmentError("send managed result", "Only a verified Pi launch context may send a managed result.");
 			if (workId === undefined) return yield* environmentError("send managed result", "No managed Work Cycle is bound to the current Pi turn.");
-			const current = self.adapter.currentTarget;
-			const target = yield* self.resolveManagedTarget(context.runId, current.paneId);
+			const target = yield* self.resolveWorkerTarget(context);
 			const identity = targetIdentity(self.adapter.instanceId, target);
 			if (context.instanceId !== self.adapter.instanceId || target.dead || !sameTargetIdentity(context.target, identity)) {
-				yield* self.markLostIfPresent(context.runId);
+				yield* self.markLostByWorker(context, "Managed result source is dead, stale, or reused.");
 				return yield* environmentError("send managed result", "Managed result source is not the verified launch target.");
 			}
 			const run = yield* self.coordination.getRun(context.runId);
 			if (!run || run.tokenHash !== context.tokenHash || !sameTargetRuntime(run.target, target) || !run.verifiedWorkFinished || run.state !== "busy") {
-				if (run && !sameTargetRuntime(run.target, target)) yield* self.markLostIfPresent(context.runId);
+				if (run && !sameTargetRuntime(run.target, target)) yield* self.markLostByWorker(context, "Managed result source runtime diagnostics changed.");
 				return yield* environmentError("send managed result", "Managed result launch context is not verified for an active Work Cycle.");
 			}
 			const bounded = boundManagedText(_request.text);
@@ -600,14 +678,14 @@ export class Workspace {
 			if (!run) return yield* environmentError("close managed Agent Run", `Unknown Agent Run: ${request.runId}`);
 			if (run.state === "closed" || run.state === "lost" || run.state === "closing") return yield* environmentError("close managed Agent Run", `Run ${request.runId} is ${run.state}; refusing to close its possibly reused target.`);
 			if (run.controllerPaneId !== sourcePaneId || !sameTargetIdentity(run.controllerTargetIdentity, sourceIdentity)) return yield* environmentError("close managed Agent Run", `Run ${request.runId} belongs to another controller target.`);
-			const target = yield* self.resolveManagedTarget(request.runId, run.target.paneId);
+			const target = yield* self.resolveControllerTarget(request.runId, run.target.paneId);
 			const resolvedIdentity = targetIdentity(self.adapter.instanceId, target);
 			if (!sameTargetIdentity(run.targetIdentity, resolvedIdentity) || !sameTargetRuntime(run.target, target)) {
-				yield* self.markLostIfPresent(request.runId);
+				yield* self.markLostByController(request.runId, "Managed close target is stale or reused.");
 				return yield* environmentError("close managed Agent Run", `Run ${request.runId} target identity or runtime diagnostics are stale or was reused; it was marked lost.`);
 			}
 			if (target.dead) {
-				yield* self.markLostIfPresent(request.runId);
+				yield* self.markLostByController(request.runId, "Managed close target has exited.");
 				return yield* environmentError("close managed Agent Run", `Agent Run ${request.runId} target has exited; it was marked lost.`);
 			}
 			const closeInput = { runId: request.runId, controllerPaneId: sourcePaneId, controllerTarget: sourceIdentity, target: resolvedIdentity } as const;
@@ -617,9 +695,9 @@ export class Workspace {
 			const closeReserved = Effect.acquireUseRelease(
 				self.coordination.markClosing(closeInput),
 				() => Effect.gen(function* () {
-					const finalTarget = yield* self.resolveManagedTarget(request.runId, run.target.paneId);
+					const finalTarget = yield* self.resolveControllerTarget(request.runId, run.target.paneId);
 					if (finalTarget.dead || !sameTargetIdentity(resolvedIdentity, targetIdentity(self.adapter.instanceId, finalTarget)) || !sameTargetRuntime(target, finalTarget)) {
-						yield* self.markLostIfPresent(request.runId);
+						yield* self.markLostByController(request.runId, "Managed target changed before close.");
 						return yield* environmentError("close managed Agent Run", `Agent Run ${request.runId} target changed before close; no pane was closed.`);
 					}
 					yield* Effect.sync(() => { closeAttempted = true; });
@@ -630,7 +708,7 @@ export class Workspace {
 				(_, exit) => {
 					if (Exit.isSuccess(exit)) return Effect.void;
 					return closeAttempted
-						? self.markLostIfPresent(request.runId)
+						? self.markLostByController(request.runId, "Managed close outcome is uncertain.")
 						: self.coordination.restoreClosing(request.runId).pipe(Effect.ignore);
 				},
 			);
@@ -671,17 +749,13 @@ export class Workspace {
 			const run = yield* self.coordination.getRun(request.runId);
 			if (!run) return yield* environmentError("wait for managed Work Cycle", `Unknown Agent Run: ${request.runId}`);
 			if (run.controllerPaneId !== sourcePaneId || !sameTargetIdentity(run.controllerTargetIdentity, sourceIdentity)) return yield* environmentError("wait for managed Work Cycle", `Run ${request.runId} belongs to another controller target.`);
-			const target = yield* self.resolveManagedTarget(request.runId, run.target.paneId);
+			const target = yield* self.resolveControllerTarget(request.runId, run.target.paneId);
 			const resolvedIdentity = targetIdentity(self.adapter.instanceId, target);
-			if (!sameTargetIdentity(run.targetIdentity, resolvedIdentity) || !sameTargetRuntime(run.target, target)) {
-				yield* self.markLostIfPresent(request.runId);
-				return yield* environmentError("wait for managed Work Cycle", `Run ${request.runId} target identity or runtime diagnostics are stale or was reused; it was marked lost.`);
+			if (!sameTargetIdentity(run.targetIdentity, resolvedIdentity) || !sameTargetRuntime(run.target, target) || target.dead) {
+				yield* self.markLostByController(request.runId, "Managed wait target is dead, stale, or reused.");
+			} else {
+				yield* self.coordination.assertController(request.runId, sourcePaneId, sourceIdentity, resolvedIdentity);
 			}
-			if (target.dead) {
-				yield* self.markLostIfPresent(request.runId);
-				return yield* environmentError("wait for managed Work Cycle", `Agent Run ${request.runId} target has exited.`);
-			}
-			yield* self.coordination.assertController(request.runId, sourcePaneId, sourceIdentity, resolvedIdentity);
 			const work = yield* self.coordination.getWork(request.runId, request.workId);
 			if (!work) return yield* environmentError("wait for managed Work Cycle", `Run ${request.runId} has no Work Cycle.`);
 			// Managed waits are ledger-only; raw inbox corruption or unrelated signals cannot wake or block them.
@@ -709,6 +783,7 @@ export class Workspace {
 					reason: "signaled",
 					sourcePaneId: poll.signal.sourcePaneId,
 					sequence: poll.signal.sequence,
+					...(poll.signal.deliveryId === undefined ? {} : { deliveryId: poll.signal.deliveryId }),
 					elapsedMs,
 				} as const;
 			}
@@ -729,62 +804,62 @@ export class Workspace {
 	): Effect.Effect<WaitResult, TerminalEnvironmentError> {
 		const self = this;
 		return Effect.gen(function* () {
-			const currentTarget = yield* self.resolveManagedTarget(runId, target.paneId);
-			const currentIdentity = targetIdentity(self.adapter.instanceId, currentTarget);
 			const run = yield* self.coordination.getRun(runId);
-			if (!run || !sameTargetIdentity(run.targetIdentity, currentIdentity) || currentTarget.dead || !sameTargetRuntime(run.target, currentTarget)) {
-				yield* self.markLostIfPresent(runId);
-				return yield* environmentError("wait for managed Work Cycle", `Agent Run ${runId} target is stale, reused, or dead.`);
-			}
-			const work = yield* self.coordination.getWork(runId, workId);
+			if (!run) return yield* environmentError("wait for managed Work Cycle", `Unknown Agent Run: ${runId}`);
+			let work = yield* self.coordination.getWork(runId, workId);
 			if (!work) return yield* environmentError("wait for managed Work Cycle", `Unknown Work Cycle: ${workId}`);
 			const elapsedMs = Math.max(0, self.now() - startedAt);
-			if (work.workFinishedAt !== undefined && work.resultReceivedAt === undefined) {
+			if (work.state === "interrupted" || work.state === "rejected" || work.state === "lost") {
 				return {
 					action: "wait",
 					mode: "managed",
-					reason: "protocol_failure",
-					target: currentTarget,
+					reason: "interrupted",
+					target: run.target,
 					runId,
 					workId,
-					text: work.protocolFailure ?? "Work Finished was observed, but the Pi worker did not send Result Received for this Work Cycle.",
-					protocolFailure: true,
-					resultReceived: false,
-					workFinished: true,
+					terminalState: work.state,
+					...(work.text === undefined && work.terminalReason === undefined ? {} : {
+						text: work.text === undefined ? work.terminalReason! : `${work.terminalReason ?? "Work Cycle interrupted."}\n\nResult Received before interruption:\n${work.text}`,
+					}),
+					...(work.outcome === undefined ? {} : { outcome: work.outcome }),
+					metadata: managedMetadata(work, run),
+					resultReceived: work.resultReceivedAt !== undefined,
+					workFinished: false,
 					sequence,
 					elapsedMs,
+				} as const;
+			}
+			if (work.workFinishedAt !== undefined && work.resultReceivedAt === undefined) {
+				return {
+					action: "wait", mode: "managed", reason: "protocol_failure", target: run.target, runId, workId,
+					text: work.protocolFailure ?? "Work Finished was observed, but the Pi worker did not send Result Received for this Work Cycle.",
+					protocolFailure: true, resultReceived: false, workFinished: true, sequence, elapsedMs,
 				} as const;
 			}
 			if (work.resultReceivedAt !== undefined && work.workFinishedAt !== undefined && work.outcome !== undefined && work.text !== undefined) {
 				return {
-					action: "wait",
-					mode: "managed",
-					reason: "work_finished",
-					target: currentTarget,
-					runId,
-					workId,
-					outcome: work.outcome,
-					text: work.text,
-					metadata: managedMetadata(work, run),
-					resultReceived: true,
-					workFinished: true,
-					sequence,
-					elapsedMs,
+					action: "wait", mode: "managed", reason: "work_finished", target: run.target, runId, workId,
+					outcome: work.outcome, text: work.text, metadata: managedMetadata(work, run),
+					resultReceived: true, workFinished: true, sequence, elapsedMs,
 				} as const;
+			}
+			const resolved = yield* Effect.exit(self.adapter.resolve(target.paneId));
+			if (Exit.isFailure(resolved)) {
+				yield* self.markLostByController(runId, "Agent Run target could not be resolved while waiting.");
+				return yield* self.waitManagedLoop(target, sequence, runId, workId, startedAt, deadline);
+			}
+			const currentTarget = resolved.value;
+			const currentIdentity = targetIdentity(self.adapter.instanceId, currentTarget);
+			if (!sameTargetIdentity(run.targetIdentity, currentIdentity) || currentTarget.dead || !sameTargetRuntime(run.target, currentTarget)) {
+				yield* self.markLostByController(runId, "Agent Run target became dead, stale, or reused while waiting.");
+				work = yield* self.coordination.getWork(runId, workId);
+				return yield* self.waitManagedLoop(target, sequence, runId, workId, startedAt, deadline);
 			}
 			const remainingMs = deadline - self.now();
 			if (remainingMs <= 0) {
 				return {
-					action: "wait",
-					mode: "managed",
-					reason: "timeout",
-					target: currentTarget,
-					runId,
-					workId,
-					resultReceived: work.resultReceivedAt !== undefined,
-					workFinished: work.workFinishedAt !== undefined,
-					sequence,
-					elapsedMs,
+					action: "wait", mode: "managed", reason: "timeout", target: currentTarget, runId, workId,
+					resultReceived: work.resultReceivedAt !== undefined, workFinished: false, sequence, elapsedMs,
 				} as const;
 			}
 			yield* Effect.sleep(Math.min(self.waitPollMs, remainingMs));

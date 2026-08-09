@@ -284,6 +284,17 @@ function createWaitView(result: Extract<WorkspaceResult, { action: "wait" }>): W
 				...(text ? { markdown: text } : {}),
 			};
 		}
+		if (result.reason === "interrupted") {
+			return {
+				icon: "!",
+				tone: "warning",
+				status: `Work Cycle ${titleCase(result.terminalState ?? "interrupted")}`,
+				meta: `${meta} · Result Received ${result.resultReceived ? "yes" : "no"} · Work Finished no`,
+				details: [...targetDetails(result.target), "Verified Work Finished was not observed; any received result remains preserved.", ...managedMetadataDetails(result.metadata)],
+				...(firstLine ? { preview: firstLine } : {}),
+				...(text ? { markdown: text } : {}),
+			};
+		}
 		return {
 			icon: "!",
 			tone: "warning",
@@ -410,7 +421,7 @@ function formatNarrowResultMeta(result: WorkspaceToolResult, context: WorkspaceR
 				? `run ${sanitizeInline(result.details.runId)} · ${sanitizeInline(result.details.outcome)}`
 				: `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · seq ${result.details.sequence}`;
 		case "wait": return "mode" in result.details && result.details.mode === "managed"
-			? `run ${sanitizeInline(result.details.runId)} · work ${sanitizeInline(result.details.workId)} · ${result.details.reason === "work_finished" ? "finished" : result.details.reason === "protocol_failure" ? "protocol failure" : "timeout"}`
+			? `run ${sanitizeInline(result.details.runId)} · work ${sanitizeInline(result.details.workId)} · ${result.details.reason === "work_finished" ? "finished" : result.details.reason === "protocol_failure" ? "protocol failure" : result.details.reason === "interrupted" ? "interrupted" : "timeout"}`
 			: result.details.reason === "signaled"
 				? `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`
 				: `${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`;
@@ -470,9 +481,10 @@ function isWorkspaceResult(details: WorkspaceToolDetails): details is WorkspaceR
 				(candidate.input === "prompt" || candidate.input === "command");
 		}
 		case "wait": {
-			if (candidate.mode === "managed") return (candidate.reason === "work_finished" || candidate.reason === "protocol_failure" || candidate.reason === "timeout") &&
+			if (candidate.mode === "managed") return (candidate.reason === "work_finished" || candidate.reason === "protocol_failure" || candidate.reason === "interrupted" || candidate.reason === "timeout") &&
 				typeof candidate.runId === "string" && UUID_PATTERN.test(candidate.runId) && typeof candidate.workId === "string" && UUID_PATTERN.test(candidate.workId) && typeof candidate.resultReceived === "boolean" &&
 				typeof candidate.workFinished === "boolean" && (candidate.reason !== "protocol_failure" || (candidate.protocolFailure === true && candidate.resultReceived === false && candidate.workFinished === true)) &&
+				(candidate.reason !== "interrupted" || ((candidate.terminalState === "interrupted" || candidate.terminalState === "rejected" || candidate.terminalState === "lost") && candidate.workFinished === false)) &&
 				Number.isInteger(candidate.sequence) && typeof candidate.elapsedMs === "number" && Number.isFinite(candidate.elapsedMs);
 			return (candidate.reason === "signaled" || candidate.reason === "timeout") &&
 				(candidate.reason !== "signaled" || (typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId))) &&

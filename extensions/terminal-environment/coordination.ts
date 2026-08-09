@@ -31,7 +31,11 @@ interface LockOwner {
 }
 
 export type ManagedRunState = "starting" | "idle" | "busy" | "closing" | "closed" | "lost";
-export type ManagedWorkState = "active" | "finished";
+/**
+ * Work Finished is a worker-settled fact.  Other terminal states deliberately
+ * do not carry workFinishedAt: they describe why settlement did not happen.
+ */
+export type ManagedWorkState = "active" | "finished" | "interrupted" | "rejected" | "lost";
 
 export interface ManagedRunRecord {
 	readonly runId: string;
@@ -72,8 +76,13 @@ export interface ManagedWorkRecord {
 	readonly outcome?: WorkOutcome;
 	readonly text?: string;
 	readonly resultReceivedAt?: number;
+	/** Set only when the worker reports the settled Work Finished fact. */
 	readonly workFinishedAt?: number;
+	/** Set only for a settled work cycle that has no received result. */
 	readonly protocolFailure?: string;
+	/** Terminal reason and timestamp for interruption, rejection, or loss. */
+	readonly terminalAt?: number;
+	readonly terminalReason?: string;
 	readonly effectiveModel?: AgentModelMetadata;
 	readonly effectiveThinking?: ThinkingLevel;
 	readonly sessionId?: string;
@@ -136,6 +145,24 @@ export interface FinishInput {
 	readonly workId: string;
 	readonly token: string;
 	readonly worker: TargetIdentity;
+	readonly now?: number;
+}
+
+/** Controller-authenticated transition for an unavailable Agent Run target. */
+export interface ControllerLossInput {
+	readonly runId: string;
+	readonly controllerPaneId: string;
+	readonly controllerTarget: TargetIdentity;
+	readonly reason?: string;
+	readonly now?: number;
+}
+
+/** Worker-authenticated transition for an unavailable Agent Run target. */
+export interface WorkerLossInput {
+	readonly runId: string;
+	readonly token: string;
+	readonly worker: TargetIdentity;
+	readonly reason?: string;
 	readonly now?: number;
 }
 
@@ -314,9 +341,10 @@ export class CoordinationLedger {
 			this.requireToken(run, input.token);
 			if (!sameTargetIdentity(run.targetIdentity, input.worker)) throw new Error("Managed readiness revocation source target is stale or was reused.");
 			if (run.state === "closed" || run.state === "lost") return { state, value: undefined };
-			const failure = boundManagedText(reason).text;
+			const terminalReason = boundedReason(reason);
+			const terminalAt = input.now ?? now;
 			const works = state.works.map((work) => work.runId === input.runId && work.state === "active"
-				? { ...work, state: "finished" as const, workFinishedAt: input.now ?? now, protocolFailure: failure }
+				? { ...work, state: "interrupted" as const, terminalAt, terminalReason }
 				: work);
 			const next: ManagedRunRecord = {
 				...run,
@@ -330,6 +358,11 @@ export class CoordinationLedger {
 
 	getRun(runId: string): Effect.Effect<ManagedRunRecord | undefined, TerminalEnvironmentError> {
 		return this.read("read managed Agent Run", (state) => state.runs.find((run) => run.runId === runId));
+	}
+
+	listRunsForController(controllerPaneId: string, controllerTarget: TargetIdentity): Effect.Effect<readonly ManagedRunRecord[], TerminalEnvironmentError> {
+		return this.read("list controller Agent Runs", (state) => state.runs.filter((run) =>
+			run.controllerPaneId === controllerPaneId && sameTargetIdentity(run.controllerTargetIdentity, controllerTarget)));
 	}
 
 	findOpenRunForTarget(target: TargetIdentity, includeWindow: boolean): Effect.Effect<ManagedRunRecord | undefined, TerminalEnvironmentError> {
@@ -367,6 +400,7 @@ export class CoordinationLedger {
 				throw new Error(`Run ${input.runId} is not a verified Pi Agent Run and cannot accept managed tasks.`);
 			}
 			if (!run.processStarted || run.state !== "idle") throw new Error(`Run ${input.runId} is not idle for a Work Cycle.`);
+			if (input.workerPaneId !== run.target.paneId) throw new Error(`Run ${input.runId} worker pane does not match its owned target.`);
 			if (input.targetSnapshot !== undefined && (!validTarget(input.targetSnapshot) || !sameTargetIdentity(run.targetIdentity, targetIdentity(this.instanceId, input.targetSnapshot)) || !sameTargetRuntime(run.target, input.targetSnapshot))) throw new Error(`Run ${input.runId} target diagnostics changed before Work Cycle reservation.`);
 			if (boundManagedText(input.text).truncated) throw new Error("Managed task text exceeds its bounded payload limit.");
 			const active = state.works.find((work) => work.runId === input.runId && work.state === "active");
@@ -412,8 +446,12 @@ export class CoordinationLedger {
 			this.requireToken(run, input.token);
 			const work = this.findExactWork(state, input.runId, input.workId);
 			if (!work || work.state !== "active") throw new Error(`Work Cycle ${input.workId} is not active for Agent Run ${input.runId}.`);
-			const failure = boundManagedText(reason).text;
-			const next: ManagedWorkRecord = { ...work, state: "finished", workFinishedAt: input.now ?? now, protocolFailure: failure };
+			const next: ManagedWorkRecord = {
+				...work,
+				state: "rejected",
+				terminalAt: input.now ?? now,
+				terminalReason: boundedReason(reason),
+			};
 			return {
 				state: { ...replaceRun(state, { ...run, state: "idle" }), works: replaceWork(state, next) },
 				value: next,
@@ -436,11 +474,11 @@ export class CoordinationLedger {
 				if (work.outcome !== input.outcome || work.text !== bounded.text) throw new Error(`Work Cycle ${work.workId} already has a different result.`);
 				return { state, value: work };
 			}
-			const resultDeliveryId = crypto.randomUUID();
+			if (work.state !== "active") throw new Error(`Work Cycle ${work.workId} is no longer accepting a result.`);
 			if (work.protocolFailure !== undefined) throw new Error(`Work Cycle ${work.workId} ended with a protocol failure.`);
+			const resultDeliveryId = crypto.randomUUID();
 			const next: ManagedWorkRecord = {
 				...work,
-				state: work.workFinishedAt === undefined ? "active" : "finished",
 				resultDeliveryId,
 				outcome: input.outcome,
 				text: bounded.text,
@@ -463,7 +501,16 @@ export class CoordinationLedger {
 			if (newerActive) throw new Error(`Work Cycle ${input.workId} is stale; Work Cycle ${newerActive.workId} is active.`);
 			if (work.workerPaneId !== input.worker.paneId) throw new Error(`Work Cycle ${work.workId} belongs to another worker pane.`);
 			if (work.workFinishedAt !== undefined) return { state, value: work };
-			const next: ManagedWorkRecord = { ...work, state: "finished", workFinishedAt: input.now ?? now };
+			if (work.state !== "active") throw new Error(`Work Cycle ${work.workId} is no longer active.`);
+			const finishedAt = input.now ?? now;
+			const next: ManagedWorkRecord = {
+				...work,
+				state: "finished",
+				workFinishedAt: finishedAt,
+				...(work.resultReceivedAt === undefined
+					? { protocolFailure: "Work Finished was observed, but the Pi worker did not send Result Received for this Work Cycle." }
+					: {}),
+			};
 			const nextRun: ManagedRunRecord = { ...run, state: "idle" };
 			return { state: { ...replaceRun(state, nextRun), works: replaceWork(state, next) }, value: next };
 		});
@@ -479,16 +526,32 @@ export class CoordinationLedger {
 		return this.read("read active managed Work Cycle", (state) => state.works.find((work) => work.runId === runId && work.state === "active"));
 	}
 
-	markLost(runId: string, now = Date.now()): Effect.Effect<void, TerminalEnvironmentError> {
-		return this.mutate("mark stale Agent Run lost", (state) => {
-			const run = this.requireRun(state, runId);
+	/**
+	 * Compatibility entry point with authentication intentionally required. A
+	 * bare run UUID is not evidence that the caller owns the run or its worker.
+	 */
+	markLost(input: ControllerLossInput | WorkerLossInput): Effect.Effect<void, TerminalEnvironmentError> {
+		if (typeof input !== "object" || input === null) {
+			return Effect.fail(environmentError("mark stale Agent Run lost", "Authenticated controller or worker loss evidence is required."));
+		}
+		return "controllerPaneId" in input ? this.markLostByController(input) : this.markLostByWorker(input);
+	}
+
+	markLostByController(input: ControllerLossInput): Effect.Effect<void, TerminalEnvironmentError> {
+		return this.mutate("mark stale Agent Run lost by controller", (state, now) => {
+			const run = this.requireRun(state, input.runId);
+			this.requireController(run, input.controllerPaneId, input.controllerTarget);
 			if (run.state === "closed" || run.state === "lost") return { state, value: undefined };
-			const { closingAt: _closingAt, ...withoutClosing } = run;
-			const next: ManagedRunRecord = { ...withoutClosing, state: "lost", readiness: "unverified", verifiedWorkFinished: false, lostAt: now };
-			const works = state.works.map((work) => work.runId === runId && work.state === "active"
-				? { ...work, state: "finished" as const, workFinishedAt: now, protocolFailure: "Agent Run target was lost before the Work Cycle completed." }
-				: work);
-			return { state: { ...replaceRun(state, next), works }, value: undefined };
+			return { state: this.transitionRunLost(state, run, input.now ?? now, input.reason), value: undefined };
+		});
+	}
+
+	markLostByWorker(input: WorkerLossInput): Effect.Effect<void, TerminalEnvironmentError> {
+		return this.mutate("mark stale Agent Run lost by worker", (state, now) => {
+			const run = this.requireRun(state, input.runId);
+			this.requireWorkerLossEvidence(run, input.token, input.worker);
+			if (run.state === "closed" || run.state === "lost") return { state, value: undefined };
+			return { state: this.transitionRunLost(state, run, input.now ?? now, input.reason), value: undefined };
 		});
 	}
 
@@ -551,6 +614,27 @@ export class CoordinationLedger {
 		if (!isLaunchToken(token) || hashLaunchToken(token) !== run.tokenHash) throw new Error("Managed launch token is invalid.");
 	}
 
+	private requireController(run: ManagedRunRecord, controllerPaneId: string, controllerTarget: TargetIdentity): void {
+		if (run.controllerPaneId !== controllerPaneId || !sameTargetIdentity(run.controllerTargetIdentity, controllerTarget)) {
+			throw new Error(`Run ${run.runId} belongs to another controller target.`);
+		}
+	}
+
+	private requireWorkerLossEvidence(run: ManagedRunRecord, token: string, worker: TargetIdentity): void {
+		this.requireToken(run, token);
+		if (!sameTargetIdentity(run.targetIdentity, worker)) throw new Error("Managed loss source target is stale or was reused.");
+	}
+
+	private transitionRunLost(state: LedgerState, run: ManagedRunRecord, now: number, reason?: string): LedgerState {
+		const { closingAt: _closingAt, ...withoutClosing } = run;
+		const terminalReason = boundedReason(reason ?? "Agent Run target was lost before the Work Cycle completed.");
+		const next: ManagedRunRecord = { ...withoutClosing, state: "lost", readiness: "unverified", verifiedWorkFinished: false, lostAt: now };
+		const works = state.works.map((work) => work.runId === run.runId && work.state === "active"
+			? { ...work, state: "lost" as const, terminalAt: now, terminalReason }
+			: work);
+		return { ...replaceRun(state, next), works };
+	}
+
 	private requireManagedWorkerRun(run: ManagedRunRecord, worker: TargetIdentity, fact: string): void {
 		if (run.state === "closed" || run.state === "lost" || run.state === "closing") throw new Error(`Run ${run.runId} is no longer accepting ${fact}.`);
 		if (run.agent !== "pi" || run.readiness !== "verified" || !run.verifiedWorkFinished) throw new Error(`Run ${run.runId} is not a verified Pi Agent Run.`);
@@ -576,6 +660,9 @@ export class CoordinationLedger {
 					const current = await this.readState(signal);
 					const changed = change(current, Date.now());
 					const pruned = pruneState(changed.state);
+					// Validate the entire post-transition graph, not just the record that
+					// the operation happened to touch, before replacing the ledger.
+					assertValidLedgerState(pruned, this.instanceId);
 					if (pruned !== current) await this.writeState(pruned, signal);
 					return changed.value;
 				} finally {
@@ -602,36 +689,9 @@ export class CoordinationLedger {
 		try {
 			const content = await readFile(this.statePath(), "utf8");
 			if (Buffer.byteLength(content, "utf8") > MAX_LEDGER_BYTES) throw new Error("Coordination ledger exceeds its size limit.");
-			const parsed = JSON.parse(content) as Partial<LedgerState>;
-			if (parsed.version !== 1 || parsed.instanceId !== this.instanceId || !Array.isArray(parsed.runs) || !Array.isArray(parsed.works)
-				|| parsed.runs.length > MAX_RUNS || parsed.works.length > MAX_WORKS) {
-				throw new Error("Coordination ledger is malformed.");
-			}
-			const runs = parsed.runs as ManagedRunRecord[];
-			const works = parsed.works as ManagedWorkRecord[];
-			if (runs.some((run) => !validRunRecord(run) || run.targetIdentity.instanceId !== this.instanceId
-				|| run.controllerTargetIdentity.instanceId !== this.instanceId
-				|| run.controllerTargetIdentity.paneId !== run.controllerPaneId
-				|| run.targetIdentity.sessionId !== run.target.sessionId
-				|| run.targetIdentity.windowId !== run.target.windowId
-				|| run.targetIdentity.paneId !== run.target.paneId)
-				|| works.some((work) => !validWorkRecord(work))
-				|| works.some((work) => {
-					const run = runs.find((candidate) => candidate.runId === work.runId);
-					return !run || run.controllerPaneId !== work.controllerPaneId || !sameTargetIdentity(run.controllerTargetIdentity, work.controllerTargetIdentity) || run.target.paneId !== work.workerPaneId;
-				})
-				|| runs.some((run) => run.state === "closed" || run.state === "lost" || run.state === "closing"
-					? works.some((work) => work.runId === run.runId && work.state === "active")
-					: false)
-				|| runs.some((run) => (run.state === "closed" && run.closedAt === undefined) || (run.state === "lost" && run.lostAt === undefined) || (run.state === "closing" && run.closingAt === undefined))
-				|| runs.some((run) => {
-					const hasActiveWork = works.some((work) => work.runId === run.runId && work.state === "active");
-					return (run.state === "busy") !== hasActiveWork;
-				})
-				|| runs.some((run) => (run.verifiedWorkFinished || run.readiness === "verified") && (run.agent !== "pi" || !run.processStarted || run.readiness !== "verified"))) {
-				throw new Error("Coordination ledger is malformed.");
-			}
-			return { version: 1, instanceId: this.instanceId, runs, works };
+			const parsed: unknown = JSON.parse(content);
+			assertValidLedgerState(parsed, this.instanceId);
+			return parsed;
 		} catch (cause) {
 			if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, instanceId: this.instanceId, runs: [], works: [] };
 			throw cause;
@@ -640,6 +700,7 @@ export class CoordinationLedger {
 
 	private async writeState(state: LedgerState, signal: AbortSignal): Promise<void> {
 		signal.throwIfAborted();
+		assertValidLedgerState(state, this.instanceId);
 		const destination = this.statePath();
 		const serialized = `${JSON.stringify(state)}\n`;
 		if (Buffer.byteLength(serialized, "utf8") > MAX_LEDGER_BYTES) throw new Error("Coordination ledger exceeds its size limit.");
@@ -726,6 +787,47 @@ export function sameTargetRuntime(left: TerminalTarget, right: TerminalTarget): 
 		&& left.dead === right.dead;
 }
 
+function assertValidLedgerState(value: unknown, instanceId: string): asserts value is LedgerState {
+	if (typeof value !== "object" || value === null) throw new Error("Coordination ledger is malformed.");
+	const candidate = value as { readonly version?: unknown; readonly instanceId?: unknown; readonly runs?: unknown; readonly works?: unknown };
+	if (candidate.version !== 1 || candidate.instanceId !== instanceId || !Array.isArray(candidate.runs) || !Array.isArray(candidate.works)
+		|| candidate.runs.length > MAX_RUNS || candidate.works.length > MAX_WORKS
+		|| !candidate.runs.every(validRunRecord) || !candidate.works.every(validWorkRecord)) {
+		throw new Error("Coordination ledger is malformed.");
+	}
+	const runs = candidate.runs as ManagedRunRecord[];
+	const works = candidate.works as ManagedWorkRecord[];
+	const openRuns = runs.filter((run) => run.state !== "closed" && run.state !== "lost");
+	if (new Set(runs.map((run) => run.runId)).size !== runs.length
+		|| new Set(works.map((work) => work.workId)).size !== works.length
+		|| openRuns.some((run, index) => openRuns.slice(index + 1).some((other) => sameTargetIdentity(run.targetIdentity, other.targetIdentity)))
+		|| runs.some((run) => run.targetIdentity.instanceId !== instanceId
+		|| run.controllerTargetIdentity.instanceId !== instanceId
+		|| run.controllerTargetIdentity.paneId !== run.controllerPaneId
+		|| run.targetIdentity.sessionId !== run.target.sessionId
+		|| run.targetIdentity.windowId !== run.target.windowId
+		|| run.targetIdentity.paneId !== run.target.paneId)
+		|| works.some((work) => {
+			const run = runs.find((candidateRun) => candidateRun.runId === work.runId);
+			return !run || run.controllerPaneId !== work.controllerPaneId
+				|| !sameTargetIdentity(run.controllerTargetIdentity, work.controllerTargetIdentity)
+				|| run.target.paneId !== work.workerPaneId;
+		})
+		|| runs.some((run) => (run.state === "closed" || run.state === "lost" || run.state === "closing")
+			&& works.some((work) => work.runId === run.runId && work.state === "active"))
+		|| runs.some((run) => (run.state === "closed" && run.closedAt === undefined)
+			|| (run.state === "lost" && run.lostAt === undefined)
+			|| (run.state === "closing" && run.closingAt === undefined))
+		|| runs.some((run) => {
+			const hasActiveWork = works.some((work) => work.runId === run.runId && work.state === "active");
+			return (run.state === "busy") !== hasActiveWork;
+		})
+		|| runs.some((run) => (run.verifiedWorkFinished || run.readiness === "verified")
+			&& (run.agent !== "pi" || !run.processStarted || run.readiness !== "verified"))) {
+		throw new Error("Coordination ledger is malformed.");
+	}
+}
+
 function pruneState(state: LedgerState): LedgerState {
 	const activeRuns = state.runs.filter((run) => run.state !== "closed" && run.state !== "lost");
 	const historicalRuns = state.runs
@@ -736,15 +838,15 @@ function pruneState(state: LedgerState): LedgerState {
 	const retainedRunIds = new Set(runs.map((run) => run.runId));
 	const activeRunIds = new Set(activeRuns.map((run) => run.runId));
 	const activeWorks = state.works.filter((work) => activeRunIds.has(work.runId) && work.state === "active");
-	const finished = state.works
-		.filter((work) => retainedRunIds.has(work.runId) && work.state === "finished")
+	const terminal = state.works
+		.filter((work) => retainedRunIds.has(work.runId) && work.state !== "active")
 		.sort((left, right) => right.createdAt - left.createdAt);
-	const latestFinishedByRun = new Map<string, ManagedWorkRecord>();
-	for (const work of finished) if (!latestFinishedByRun.has(work.runId)) latestFinishedByRun.set(work.runId, work);
-	const latestFinished = [...latestFinishedByRun.values()];
-	const latestIds = new Set(latestFinished.map((work) => work.workId));
-	const extraFinished = finished.filter((work) => !latestIds.has(work.workId)).slice(0, RETAINED_EXTRA_FINISHED_WORKS);
-	const works = [...activeWorks, ...latestFinished, ...extraFinished].slice(0, MAX_WORKS);
+	const latestTerminalByRun = new Map<string, ManagedWorkRecord>();
+	for (const work of terminal) if (!latestTerminalByRun.has(work.runId)) latestTerminalByRun.set(work.runId, work);
+	const latestTerminal = [...latestTerminalByRun.values()];
+	const latestIds = new Set(latestTerminal.map((work) => work.workId));
+	const extraTerminal = terminal.filter((work) => !latestIds.has(work.workId)).slice(0, RETAINED_EXTRA_FINISHED_WORKS);
+	const works = [...activeWorks, ...latestTerminal, ...extraTerminal].slice(0, MAX_WORKS);
 	if (runs.length === state.runs.length && works.length === state.works.length
 		&& runs.every((run, index) => run === state.runs[index]) && works.every((work, index) => work === state.works[index])) return state;
 	return { ...state, runs, works };
@@ -781,6 +883,8 @@ function validRunRecord(value: unknown): value is ManagedRunRecord {
 function validWorkRecord(value: unknown): value is ManagedWorkRecord {
 	if (!value || typeof value !== "object") return false;
 	const candidate = value as ManagedWorkRecord;
+	const hasResult = candidate.resultReceivedAt !== undefined;
+	const terminalWithoutSettlement = candidate.state === "interrupted" || candidate.state === "rejected" || candidate.state === "lost";
 	return isUuid(candidate.workId)
 		&& isUuid(candidate.runId)
 		&& /^%[0-9]+$/.test(candidate.controllerPaneId)
@@ -789,7 +893,7 @@ function validWorkRecord(value: unknown): value is ManagedWorkRecord {
 		&& /^%[0-9]+$/.test(candidate.workerPaneId)
 		&& /^[0-9a-f]{64}$/i.test(candidate.promptHash)
 		&& isUuid(candidate.deliveryId)
-		&& (candidate.state === "active" || candidate.state === "finished")
+		&& (candidate.state === "active" || candidate.state === "finished" || terminalWithoutSettlement)
 		&& (candidate.input === "prompt" || candidate.input === "command")
 		&& Number.isSafeInteger(candidate.createdAt)
 		&& (candidate.outcome === undefined || candidate.outcome === "completed" || candidate.outcome === "blocked" || candidate.outcome === "failed")
@@ -797,16 +901,24 @@ function validWorkRecord(value: unknown): value is ManagedWorkRecord {
 		&& (candidate.resultDeliveryId === undefined || isUuid(candidate.resultDeliveryId))
 		&& optionalTimestamp(candidate.resultReceivedAt)
 		&& optionalTimestamp(candidate.workFinishedAt)
+		&& optionalTimestamp(candidate.terminalAt)
 		&& optionalBoundedString(candidate.protocolFailure)
+		&& optionalBoundedString(candidate.terminalReason)
 		&& validModel(candidate.effectiveModel)
 		&& validThinking(candidate.effectiveThinking)
 		&& optionalBoundedString(candidate.sessionId)
 		&& optionalBoundedString(candidate.sessionFile)
 		&& (candidate.truncated === undefined || typeof candidate.truncated === "boolean")
-		&& (candidate.resultReceivedAt === undefined || (candidate.outcome !== undefined && candidate.text !== undefined && candidate.resultDeliveryId !== undefined))
-		&& (candidate.protocolFailure === undefined || (candidate.resultReceivedAt === undefined && candidate.workFinishedAt !== undefined))
-		&& (candidate.state !== "finished" || candidate.workFinishedAt !== undefined)
-		&& (candidate.workFinishedAt === undefined || candidate.state === "finished");
+		&& (hasResult
+			? candidate.outcome !== undefined && candidate.text !== undefined && candidate.resultDeliveryId !== undefined
+			: candidate.outcome === undefined && candidate.text === undefined && candidate.resultDeliveryId === undefined && candidate.truncated === undefined)
+		&& (candidate.state === "finished"
+			? candidate.workFinishedAt !== undefined && candidate.terminalAt === undefined && candidate.terminalReason === undefined && (hasResult || candidate.protocolFailure !== undefined)
+			: candidate.workFinishedAt === undefined)
+		&& (terminalWithoutSettlement
+			? candidate.terminalAt !== undefined && candidate.terminalReason !== undefined && candidate.protocolFailure === undefined
+			: candidate.terminalAt === undefined && candidate.terminalReason === undefined)
+		&& (candidate.protocolFailure === undefined || (candidate.state === "finished" && !hasResult && candidate.workFinishedAt !== undefined));
 }
 
 function validTarget(value: unknown): value is TerminalTarget {
@@ -848,6 +960,14 @@ function boundedString(value: unknown, maximum: number): value is string {
 
 function optionalBoundedString(value: string | undefined): boolean {
 	return value === undefined || boundedString(value, 4_096);
+}
+
+function boundedReason(value: string): string {
+	let bounded = boundManagedText(value).text;
+	let end = bounded.length;
+	while (end > 0 && Buffer.byteLength(bounded.slice(0, end), "utf8") > 4_096) end -= 1;
+	bounded = bounded.slice(0, end);
+	return bounded.replace(/[\0\r\n]/g, " ");
 }
 
 function optionalTimestamp(value: number | undefined): boolean {

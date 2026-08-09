@@ -62,7 +62,7 @@ A verified Pi worker uses the same workspace send action:
 }
 ```
 
-The worker supplies no `targetId`, `runId`, or `workId`. The controller wraps terminal transport in a private correlated envelope so Pi's TUI cannot trim the task or intercept it as a built-in command. The child input hook validates and removes that envelope before prompt-template or skill expansion, binds the exact Work Cycle, and passes the original task text onward. Protocol guidance is injected privately into the worker's Pi system prompt. If the worker is already processing steer/follow-up input, the envelope is handled without entering that turn and managed wait returns a protocol failure. Result text goes into the shared per-tmux-instance durable ledger and is never pasted into the controller terminal. The result send terminates the current Pi turn only; it does not close Pi, tmux, or the run.
+The worker supplies no `targetId`, `runId`, or `workId`. The controller wraps terminal transport in a private correlated envelope so Pi's TUI cannot trim the task or intercept it as a built-in command. The child input hook authenticates the launch before resolving or mutating the run, removes the envelope before prompt-template or skill expansion, binds the exact Work Cycle, and passes the original task text onward. Protocol guidance is injected privately into the worker's Pi system prompt. Rejected input, shutdown, readiness revocation, and target loss are reported as interruptions without inventing Work Finished. Result text goes into the shared per-tmux-instance durable ledger and is never pasted into the controller terminal. The result send terminates the current Pi turn only; it does not close Pi, tmux, or the run.
 
 The controller waits for both durable facts:
 
@@ -73,7 +73,7 @@ The controller waits for both durable facts:
 }
 ```
 
-Managed wait returns the exact correlated result text, explicit outcome, delivery/result timestamps, effective session metadata, and the separate Result Received / Work Finished state. Work Finished without Result Received returns a protocol failure instead of inventing an outcome. Fast results are retained before wait starts, and unrelated target sends cannot satisfy it.
+Managed wait returns the exact correlated result text, explicit outcome, delivery/result timestamps, effective session metadata, and the separate Result Received / Work Finished state. Work Finished without Result Received returns a protocol failure instead of inventing an outcome. An interrupted, rejected, or lost Work Cycle explicitly reports that Work Finished was not observed while retaining any previously received result. Fast results are retained before wait starts, and unrelated target sends cannot satisfy it.
 
 ## Raw compatibility
 
@@ -86,7 +86,7 @@ Raw send remains literal bracketed paste and writes a source-pane inbox signal:
 }
 ```
 
-Raw wait remains target/sequence based and returns the next signal from its selected inbox. Use the send result's `replyAfterSequence` to avoid missing a fast raw signal. Raw close still accepts `%pane` or `@window` and rejects `$session`.
+Raw send reserves a delivery UUID before paste, then commits its inbox signal only after transport succeeds. Pending or uncertain deliveries do not wake raw wait. If transport was attempted but its outcome cannot be committed, the error identifies `delivery_uncertain` and its delivery ID so callers do not blindly retry and duplicate input. Raw wait remains target/sequence based and returns the next committed signal from its selected inbox. Use the send result's `replyAfterSequence` to avoid missing a fast raw signal. Raw close still accepts `%pane` or `@window` and rejects `$session`.
 
 ## Close
 
@@ -100,7 +100,7 @@ Managed close validates run ownership, tmux server identity, and the recorded ta
 
 ## Persistence and safety
 
-The shared coordination ledger is per tmux server instance under the user's private cache root. It uses owner-only directories/files, lock ownership, atomic writes, bounded payloads, UUID correlation, idempotent result/finish facts, and bounded retention of historical runs/Work Cycles. Pi session snapshot entries are validated branch-local diagnostics only; the ledger is runtime authority and launch tokens are never stored in Pi session details. Existing v1 source-only signal files continue to support raw operations.
+The shared coordination ledger is per tmux server instance under the user's private cache root. It uses owner-only directories/files, lock ownership, atomic writes, full post-transition validation, bounded payloads, authenticated destructive transitions, UUID correlation, idempotent result/finish facts, and bounded retention of historical runs/Work Cycles. Validated custom snapshots are written for parent and worker sessions, restored only from the active branch, and reconciled against exact live tmux identity/runtime; the ledger remains runtime authority and launch tokens are never stored in Pi session details. Existing v1 source-only signal files continue to support raw operations.
 
 ## TUI
 

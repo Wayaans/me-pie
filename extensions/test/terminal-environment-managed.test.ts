@@ -11,6 +11,7 @@ import {
 	boundManagedText,
 	createManagedLaunchContext,
 	managedLaunchEnvironment,
+	latestManagedSnapshots,
 	normalizeWorkspaceParameters,
 	validateManagedSnapshot,
 } from "../terminal-environment/index.ts";
@@ -36,6 +37,10 @@ function target(paneId: string, overrides: Partial<TerminalTarget> = {}): Termin
 
 function identity(targetValue: TerminalTarget): TargetIdentity {
 	return { instanceId, sessionId: targetValue.sessionId, windowId: targetValue.windowId, paneId: targetValue.paneId };
+}
+
+function controllerLoss(runId: string) {
+	return { runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")) } as const;
 }
 
 class ManagedFakeAdapter implements TerminalAdapter {
@@ -317,7 +322,8 @@ test("managed input rejects delivery into a busy Pi turn without hanging or clos
 	const waited = await Effect.runPromise(setup.parent.execute({ action: "wait", request: { runId: setup.runId, workId: task.workId, timeoutMs: 100 } }, process.cwd()));
 	assert.equal(waited.action, "wait");
 	if (waited.action === "wait" && "mode" in waited) {
-		assert.equal(waited.reason, "protocol_failure");
+		assert.equal(waited.reason, "interrupted");
+		assert.equal(waited.terminalState, "rejected");
 		assert.match(waited.text ?? "", /already processing steer input/);
 	}
 	assert.deepEqual(setup.parentAdapter.closed, []);
@@ -352,7 +358,8 @@ test("worker restart abandons an unbound active Work Cycle before re-verifying",
 	const waited = await Effect.runPromise(setup.parent.execute({ action: "wait", request: { runId: setup.runId, workId: task.workId, timeoutMs: 100 } }, process.cwd()));
 	assert.equal(waited.action, "wait");
 	if (waited.action === "wait" && "mode" in waited) {
-		assert.equal(waited.reason, "protocol_failure");
+		assert.equal(waited.reason, "interrupted");
+		assert.equal(waited.terminalState, "rejected");
 		assert.match(waited.text ?? "", /session restarted/);
 	}
 }));
@@ -368,7 +375,112 @@ test("readiness revocation ends active work and blocks later managed tasks", asy
 	assert.equal(run?.readiness, "unverified");
 	assert.equal(run?.verifiedWorkFinished, false);
 	await assert.rejects(Effect.runPromise(setup.parent.execute({ action: "send", request: { kind: "task", runId: setup.runId, input: "prompt", text: "retry" } }, process.cwd())), /not a verified Pi Agent Run/);
-	assert.match((await Effect.runPromise(ledger.getWork(setup.runId, task.workId)))?.protocolFailure ?? "", /authentication/);
+	const interrupted = await Effect.runPromise(ledger.getWork(setup.runId, task.workId));
+	assert.equal(interrupted?.state, "interrupted");
+	assert.match(interrupted?.terminalReason ?? "", /authentication/);
+}));
+
+test("loss, readiness revocation, and rejection preserve Result Received without inventing Work Finished", async () => withRoot(async (root) => {
+	for (const transition of ["lost", "revoked", "rejected"] as const) {
+		const transitionRoot = path.join(root, transition);
+		const ledger = new CoordinationLedger(instanceId, { rootDirectory: transitionRoot });
+		const runId = crypto.randomUUID();
+		const token = crypto.randomUUID();
+		const targetValue = target("%2");
+		await Effect.runPromise(ledger.createRun({ runId, token, agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: targetValue, instanceId }));
+		await Effect.runPromise(ledger.markLaunched(runId));
+		await Effect.runPromise(ledger.recordReadiness({ runId, token, target: identity(targetValue) }));
+		const work = await Effect.runPromise(ledger.beginWork({ runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")), workerPaneId: "%2", input: "prompt", text: transition }));
+		await Effect.runPromise(ledger.recordResult({ runId, workId: work.workId, token, worker: identity(targetValue), outcome: "completed", text: `${transition} result` }));
+		if (transition === "lost") await Effect.runPromise(ledger.markLost(controllerLoss(runId)));
+		if (transition === "revoked") await Effect.runPromise(ledger.revokeReadiness({ runId, token, worker: identity(targetValue) }, "shutdown"));
+		if (transition === "rejected") await Effect.runPromise(ledger.rejectWork({ runId, workId: work.workId, token, worker: identity(targetValue) }, "input rejected"));
+		const fresh = new CoordinationLedger(instanceId, { rootDirectory: transitionRoot });
+		const persisted = await Effect.runPromise(fresh.getWork(runId, work.workId));
+		assert.equal(persisted?.state, transition === "revoked" ? "interrupted" : transition);
+		assert.equal(persisted?.text, `${transition} result`);
+		assert.equal(persisted?.resultReceivedAt !== undefined, true);
+		assert.equal(persisted?.workFinishedAt, undefined);
+		assert.equal(persisted?.protocolFailure, undefined);
+		assert.ok(await Effect.runPromise(fresh.getRun(runId)));
+	}
+}));
+
+test("invalid transitions are rejected before replacing the readable ledger", async () => withRoot(async (root) => {
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
+	const runId = crypto.randomUUID();
+	const token = crypto.randomUUID();
+	const targetValue = target("%2");
+	await Effect.runPromise(ledger.createRun({ runId, token, agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: targetValue, instanceId }));
+	await Effect.runPromise(ledger.markLaunched(runId));
+	await Effect.runPromise(ledger.recordReadiness({ runId, token, target: identity(targetValue) }));
+	await assert.rejects(Effect.runPromise(ledger.beginWork({ runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")), workerPaneId: "%9", input: "prompt", text: "poison" })), /worker pane/);
+	const fresh = new CoordinationLedger(instanceId, { rootDirectory: root });
+	assert.equal((await Effect.runPromise(fresh.getRun(runId)))?.state, "idle");
+	assert.equal(await Effect.runPromise(fresh.getActiveWork(runId)), undefined);
+}));
+
+test("forged managed launch context cannot mutate a victim run before authentication", async () => withRoot(async (root) => {
+	const setup = await setupManaged(root);
+	const task = await Effect.runPromise(setup.parent.execute({ action: "send", request: { kind: "task", runId: setup.runId, input: "prompt", text: "victim" } }, process.cwd()));
+	assert.equal(task.action, "send");
+	if (task.action !== "send" || task.kind !== "task") return;
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
+	const beforeRun = await Effect.runPromise(ledger.getRun(setup.runId));
+	const beforeWork = await Effect.runPromise(ledger.getWork(setup.runId, task.workId));
+	const forgedContext = createManagedLaunchContext({ runId: setup.runId, token: crypto.randomUUID(), agent: "pi", instanceId, controllerPaneId: "%1", target: setup.target });
+	const forgedAdapter = new ManagedFakeAdapter("%2");
+	forgedAdapter.stale = true;
+	const forged = new Workspace(forgedAdapter, { coordinationRoot: root, signalStoreRoot: root, environment: managedLaunchEnvironment(forgedContext) });
+	await assert.rejects(Effect.runPromise(forged.routeManagedInput(setup.parentAdapter.sent.at(-1)!.text, undefined)), /does not match/);
+	assert.deepEqual(await Effect.runPromise(ledger.getRun(setup.runId)), beforeRun);
+	assert.deepEqual(await Effect.runPromise(ledger.getWork(setup.runId, task.workId)), beforeWork);
+}));
+
+test("branch snapshot restoration uses only the latest validated entry per run", () => {
+	const firstRunId = crypto.randomUUID();
+	const secondRunId = crypto.randomUUID();
+	const entries = [
+		{ type: "custom", customType: "mepie-terminal-environment-workspace", data: { version: 1, runId: firstRunId, readiness: "unverified" } },
+		{ type: "custom", customType: "other", data: { version: 1, runId: secondRunId, readiness: "verified" } },
+		{ type: "custom", customType: "mepie-terminal-environment-workspace", data: { version: 1, runId: firstRunId, readiness: "verified" } },
+		{ type: "custom", customType: "mepie-terminal-environment-workspace", data: { secret: "invalid" } },
+	];
+	assert.deepEqual(latestManagedSnapshots(entries), [{ version: 1, runId: firstRunId, readiness: "verified" }]);
+});
+
+test("startup reconciliation handles abandoned, closing, dead busy, and foreign-controller runs without closing panes", async () => withRoot(async (root) => {
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
+	const adapter = new ManagedFakeAdapter("%1");
+	const workspace = new Workspace(adapter, { coordinationRoot: root, signalStoreRoot: root });
+
+	const abandoned = { runId: crypto.randomUUID(), token: crypto.randomUUID(), target: target("%2") };
+	await Effect.runPromise(ledger.createRun({ ...abandoned, agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), instanceId }));
+	await Effect.runPromise(workspace.reconcileSession([]));
+	assert.equal((await Effect.runPromise(ledger.getRun(abandoned.runId)))?.state, "lost");
+
+	const closing = { runId: crypto.randomUUID(), token: crypto.randomUUID(), target: target("%3") };
+	adapter.targets.set("%3", closing.target);
+	await Effect.runPromise(ledger.createRun({ ...closing, agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), instanceId }));
+	await Effect.runPromise(ledger.markLaunched(closing.runId));
+	await Effect.runPromise(ledger.markClosing({ runId: closing.runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: identity(closing.target) }));
+	await Effect.runPromise(workspace.reconcileSession([{ version: 1, runId: closing.runId, readiness: "process_started" }]));
+	assert.equal((await Effect.runPromise(ledger.getRun(closing.runId)))?.state, "idle");
+
+	const busy = { runId: crypto.randomUUID(), token: crypto.randomUUID(), target: target("%4") };
+	adapter.targets.set("%4", { ...busy.target, dead: true });
+	await Effect.runPromise(ledger.createRun({ ...busy, agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), instanceId }));
+	await Effect.runPromise(ledger.markLaunched(busy.runId));
+	await Effect.runPromise(ledger.recordReadiness({ runId: busy.runId, token: busy.token, target: identity(busy.target) }));
+	const busyWork = await Effect.runPromise(ledger.beginWork({ runId: busy.runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")), workerPaneId: "%4", input: "prompt", text: "busy" }));
+	await Effect.runPromise(workspace.reconcileSession([{ version: 1, runId: busy.runId, readiness: "verified", workId: busyWork.workId, workState: "active", resultReceived: false, workFinished: false }]));
+	assert.equal((await Effect.runPromise(ledger.getWork(busy.runId, busyWork.workId)))?.state, "lost");
+
+	const foreign = { runId: crypto.randomUUID(), token: crypto.randomUUID(), target: target("%5") };
+	await Effect.runPromise(ledger.createRun({ ...foreign, agent: "pi", controllerPaneId: "%9", controllerTarget: identity(target("%9")), instanceId }));
+	await Effect.runPromise(workspace.reconcileSession([]));
+	assert.equal((await Effect.runPromise(ledger.getRun(foreign.runId)))?.state, "starting");
+	assert.deepEqual(adapter.closed, []);
 }));
 
 test("run target ownership is reserved without retiring a live run", async () => withRoot(async (root) => {
@@ -379,7 +491,7 @@ test("run target ownership is reserved without retiring a live run", async () =>
 	await assert.rejects(Effect.runPromise(ledger.beginWork({ runId: first.runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")), workerPaneId: "%2", input: "prompt", text: "not ready" })), /verified Pi Agent Run/);
 	await assert.rejects(Effect.runPromise(ledger.createRun({ runId: crypto.randomUUID(), token: crypto.randomUUID(), agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: targetValue, instanceId })), /already owned/);
 	assert.equal((await Effect.runPromise(ledger.getRun(first.runId)))?.state, "starting");
-	await Effect.runPromise(ledger.markLost(first.runId));
+	await Effect.runPromise(ledger.markLost(controllerLoss(first.runId)));
 	await Effect.runPromise(ledger.createRun({ runId: crypto.randomUUID(), token: crypto.randomUUID(), agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: targetValue, instanceId }));
 }));
 
@@ -412,15 +524,15 @@ test("completed Work Cycles are pruned while the latest cycle remains addressabl
 	}
 	assert.equal(await Effect.runPromise(ledger.getWork(runId, firstWorkId)), undefined);
 	assert.equal((await Effect.runPromise(ledger.getWork(runId)))?.text, "done 79");
-	await Effect.runPromise(ledger.markLost(runId));
+	await Effect.runPromise(ledger.markLost(controllerLoss(runId)));
 	const firstRunId = crypto.randomUUID();
 	await Effect.runPromise(ledger.createRun({ runId: firstRunId, token: crypto.randomUUID(), agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: targetValue, instanceId }));
-	await Effect.runPromise(ledger.markLost(firstRunId));
+	await Effect.runPromise(ledger.markLost(controllerLoss(firstRunId)));
 	let latestRunId = firstRunId;
 	for (let index = 0; index < 80; index += 1) {
 		latestRunId = crypto.randomUUID();
 		await Effect.runPromise(ledger.createRun({ runId: latestRunId, token: crypto.randomUUID(), agent: "pi", controllerPaneId: "%1", controllerTarget: identity(target("%1")), target: targetValue, instanceId }));
-		await Effect.runPromise(ledger.markLost(latestRunId));
+		await Effect.runPromise(ledger.markLost(controllerLoss(latestRunId)));
 	}
 	assert.equal(await Effect.runPromise(ledger.getRun(firstRunId)), undefined);
 	assert.equal((await Effect.runPromise(ledger.getRun(latestRunId)))?.state, "lost");
@@ -490,6 +602,35 @@ test("aborting workspace run rolls back its newly spawned target", async () => w
 	assert.deepEqual(adapter.closed, ["@1"]);
 }));
 
+test("cancelling launch readiness in a caller-supplied target never closes that target", async () => withRoot(async (root) => {
+	const adapter = new ManagedFakeAdapter("%1");
+	adapter.targets.set("%2", target("%2"));
+	const workspace = new Workspace(adapter, {
+		coordinationRoot: root,
+		signalStoreRoot: root,
+		agentExecutables: { pi: process.execPath },
+		readinessTimeoutMs: 30_000,
+	});
+	const controller = new AbortController();
+	const running = Effect.runPromise(workspace.execute({ action: "run", request: { agent: "pi", targetId: "%2", replace: true } }, process.cwd()), { signal: controller.signal });
+	for (let attempt = 0; attempt < 50 && !adapter.launched; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+	controller.abort();
+	await assert.rejects(running);
+	assert.deepEqual(adapter.closed, []);
+}));
+
+test("post-launch failure in a caller-supplied target leaves it open", async () => withRoot(async (root) => {
+	const adapter = new ManagedFakeAdapter("%1");
+	adapter.targets.set("%2", target("%2"));
+	const originalResolve = adapter.resolve.bind(adapter);
+	adapter.resolve = (targetId) => adapter.launched && targetId === "%2"
+		? Effect.fail(environmentError("resolve target", "readiness target disappeared"))
+		: originalResolve(targetId);
+	const workspace = new Workspace(adapter, { coordinationRoot: root, signalStoreRoot: root, agentExecutables: { pi: process.execPath } });
+	await assert.rejects(Effect.runPromise(workspace.execute({ action: "run", request: { agent: "pi", targetId: "%2", replace: true } }, process.cwd())), /disappeared/);
+	assert.deepEqual(adapter.closed, []);
+}));
+
 test("canceling a failed delivery preserves a lost or closed run state", async () => withRoot(async (root) => {
 	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
 	const runId = crypto.randomUUID();
@@ -499,7 +640,7 @@ test("canceling a failed delivery preserves a lost or closed run state", async (
 	await Effect.runPromise(ledger.markLaunched(runId));
 	await Effect.runPromise(ledger.recordReadiness({ runId, token, target: identity(targetValue) }));
 	const work = await Effect.runPromise(ledger.beginWork({ runId, controllerPaneId: "%1", controllerTarget: identity(target("%1")), workerPaneId: "%2", input: "prompt", text: "cancel" }));
-	await Effect.runPromise(ledger.markLost(runId));
+	await Effect.runPromise(ledger.markLost(controllerLoss(runId)));
 	await Effect.runPromise(ledger.cancelWork(runId, work.workId));
 	assert.equal((await Effect.runPromise(ledger.getRun(runId)))?.state, "lost");
 }));

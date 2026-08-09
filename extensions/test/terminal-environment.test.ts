@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -290,15 +291,123 @@ test("signal store serializes concurrent inbox signals and preserves source orde
 			sourcePaneId: "%2",
 		});
 		assert.equal(await Effect.runPromise(store.signal("%1", "%3")), 21);
-		assert.deepEqual(await Effect.runPromise(store.poll("%1", 19)), {
-			currentSequence: 21,
-			signal: { sequence: 20, sourcePaneId: "%2" },
-		});
-		assert.deepEqual(await Effect.runPromise(store.poll("%1", 20)), {
-			currentSequence: 21,
-			signal: { sequence: 21, sourcePaneId: "%3" },
-		});
+		const twentieth = await Effect.runPromise(store.poll("%1", 19));
+		assert.equal(twentieth.currentSequence, 21);
+		assert.deepEqual({ sequence: twentieth.signal?.sequence, sourcePaneId: twentieth.signal?.sourcePaneId }, { sequence: 20, sourcePaneId: "%2" });
+		assert.ok(twentieth.signal?.deliveryId);
+		const twentyFirst = await Effect.runPromise(store.poll("%1", 20));
+		assert.equal(twentyFirst.currentSequence, 21);
+		assert.deepEqual({ sequence: twentyFirst.signal?.sequence, sourcePaneId: twentyFirst.signal?.sourcePaneId }, { sequence: 21, sourcePaneId: "%3" });
+		assert.ok(twentyFirst.signal?.deliveryId);
 		assert.equal(await Effect.runPromise(store.currentSequence("%2")), 0);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("two-phase raw deliveries wake wait only after commit and remain idempotent", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
+	const store = new SignalStore(`${socketPath}:4822`, { rootDirectory: directory });
+	try {
+		const deliveryId = crypto.randomUUID();
+		await Effect.runPromise(store.reserve("%1", "%2", deliveryId));
+		assert.equal((await Effect.runPromise(store.poll("%1", 0))).signal, undefined);
+		await Effect.runPromise(store.markUncertain("%1", deliveryId));
+		assert.equal((await Effect.runPromise(store.poll("%1", 0))).signal, undefined);
+		const committedId = crypto.randomUUID();
+		await Effect.runPromise(store.reserve("%1", "%2", committedId));
+		const first = await Effect.runPromise(store.commit("%1", committedId));
+		const duplicate = await Effect.runPromise(store.commit("%1", committedId));
+		assert.deepEqual(duplicate, first);
+		const poll = await Effect.runPromise(store.poll("%1", 0));
+		assert.equal(poll.signal?.deliveryId, committedId);
+		assert.equal(poll.signal?.sequence, 1);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("legacy v1 inbox signals remain readable", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
+	const serverId = createHash("sha256").update(`${socketPath}:4822`).digest("hex").slice(0, 24);
+	try {
+		const inboxDirectory = path.join(directory, serverId);
+		await mkdir(inboxDirectory, { recursive: true });
+		await writeFile(path.join(inboxDirectory, "to-1.json"), JSON.stringify({ version: 1, sequence: 1, signals: [{ sequence: 1, sourcePaneId: "%2" }] }));
+		const store = new SignalStore(`${socketPath}:4822`, { rootDirectory: directory });
+		assert.deepEqual(await Effect.runPromise(store.poll("%1", 0)), {
+			currentSequence: 1,
+			signal: { sequence: 1, sourcePaneId: "%2" },
+		});
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("raw send reserves before paste and reports uncertain commit failures without retrying", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
+	const adapter = new FakeTerminalAdapter();
+	const workspace = new Workspace(adapter, { signalStoreRoot: directory });
+	const signalStore = (workspace as unknown as { signalStore: SignalStore }).signalStore;
+	const commit = signalStore.commit.bind(signalStore);
+	try {
+		signalStore.commit = (_paneId, deliveryId) => Effect.fail(environmentError("commit signal", `forced commit failure ${deliveryId}`));
+		await assert.rejects(Effect.runPromise(workspace.execute({ action: "send", request: { targetId: "%2", input: "prompt", text: "once" } }, process.cwd())), /delivery_uncertain.*do not retry/);
+		assert.deepEqual(adapter.sent, ["once"]);
+		assert.equal((await Effect.runPromise(signalStore.poll("%2", 0))).signal, undefined);
+		signalStore.commit = commit;
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("raw delivery failures before or during paste never create committed wakeups", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
+	try {
+		const reserveAdapter = new FakeTerminalAdapter();
+		const reserveWorkspace = new Workspace(reserveAdapter, { signalStoreRoot: directory });
+		const reserveStore = (reserveWorkspace as unknown as { signalStore: SignalStore }).signalStore;
+		reserveStore.reserve = () => Effect.fail(environmentError("reserve signal", "reservation failed"));
+		await assert.rejects(Effect.runPromise(reserveWorkspace.execute({ action: "send", request: { targetId: "%2", input: "prompt", text: "never pasted" } }, process.cwd())), /reservation failed/);
+		assert.deepEqual(reserveAdapter.sent, []);
+
+		const pasteAdapter = new FakeTerminalAdapter();
+		pasteAdapter.send = () => Effect.fail(environmentError("paste input", "paste failed"));
+		const pasteWorkspace = new Workspace(pasteAdapter, { signalStoreRoot: directory });
+		await assert.rejects(Effect.runPromise(pasteWorkspace.execute({ action: "send", request: { targetId: "%3", input: "prompt", text: "attempted once" } }, process.cwd())), /delivery_uncertain/);
+		const pasteStore = (pasteWorkspace as unknown as { signalStore: SignalStore }).signalStore;
+		assert.equal((await Effect.runPromise(pasteStore.poll("%3", 0))).signal, undefined);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("raw delivery cancellation before and after paste begins never commits a wakeup", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-signals-${crypto.randomUUID()}`);
+	try {
+		const beforeAdapter = new FakeTerminalAdapter();
+		const beforeWorkspace = new Workspace(beforeAdapter, { signalStoreRoot: directory });
+		const beforeStore = (beforeWorkspace as unknown as { signalStore: SignalStore }).signalStore;
+		const reserve = beforeStore.reserve.bind(beforeStore);
+		beforeStore.reserve = (paneId, sourcePaneId, deliveryId) => Effect.sleep(1_000).pipe(Effect.flatMap(() => reserve(paneId, sourcePaneId, deliveryId)));
+		const beforeController = new AbortController();
+		const before = Effect.runPromise(beforeWorkspace.execute({ action: "send", request: { targetId: "%2", input: "prompt", text: "cancel before" } }, process.cwd()), { signal: beforeController.signal });
+		beforeController.abort();
+		await assert.rejects(before);
+		assert.deepEqual(beforeAdapter.sent, []);
+
+		const afterAdapter = new FakeTerminalAdapter();
+		let pasteStarted = false;
+		afterAdapter.send = () => Effect.sync(() => { pasteStarted = true; }).pipe(Effect.flatMap(() => Effect.never));
+		const afterWorkspace = new Workspace(afterAdapter, { signalStoreRoot: directory });
+		const afterController = new AbortController();
+		const after = Effect.runPromise(afterWorkspace.execute({ action: "send", request: { targetId: "%3", input: "prompt", text: "cancel after" } }, process.cwd()), { signal: afterController.signal });
+		for (let attempt = 0; attempt < 50 && !pasteStarted; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+		assert.equal(pasteStarted, true);
+		afterController.abort();
+		await assert.rejects(after);
+		const afterStore = (afterWorkspace as unknown as { signalStore: SignalStore }).signalStore;
+		assert.equal((await Effect.runPromise(afterStore.poll("%3", 0))).signal, undefined);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

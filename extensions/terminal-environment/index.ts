@@ -8,7 +8,7 @@ import {
 	renderWorkspaceResult,
 	runWithWorkspaceWaitProgress,
 } from "./tool-ui.ts";
-import { MANAGED_CONTEXT_ENV, MANAGED_SNAPSHOT_TYPE, decodeManagedTaskInput, validateManagedSnapshot } from "./managed.ts";
+import { MANAGED_CONTEXT_ENV, MANAGED_SNAPSHOT_TYPE, decodeManagedTaskInput, latestManagedSnapshots, validateManagedSnapshot } from "./managed.ts";
 import type { WorkspaceResult } from "./model.ts";
 
 export interface TerminalEnvironmentExtensionOptions extends TmuxAdapterOptions, WorkspaceOptions {}
@@ -30,6 +30,7 @@ function resultText(result: WorkspaceResult): string {
 			if ("mode" in result && result.mode === "managed") {
 				if (result.reason === "work_finished") return `Work Finished for Agent Run ${result.runId}, Work Cycle ${result.workId}; outcome ${result.outcome ?? "?"}. Result Received.\n${safeResultText(result.text ?? "")}`.trim();
 				if (result.reason === "protocol_failure") return `Protocol failure for Agent Run ${result.runId}, Work Cycle ${result.workId}: Work Finished was recorded without Result Received.\n${safeResultText(result.text ?? "")}`.trim();
+				if (result.reason === "interrupted") return `Work Cycle ${result.workId} for Agent Run ${result.runId} was ${result.terminalState ?? "interrupted"}; verified Work Finished was not observed. Result Received=${result.resultReceived}.\n${safeResultText(result.text ?? "")}`.trim();
 				return `Managed wait for Agent Run ${result.runId}, Work Cycle ${result.workId} timed out; Result Received=${result.resultReceived}, Work Finished=${result.workFinished}.`;
 			}
 			return result.reason === "signaled"
@@ -62,9 +63,9 @@ export default function terminalEnvironment(
 	let registered = false;
 	let sessionAbort = new AbortController();
 
-	const appendWorkerSnapshot = async (activeWorkspace: Workspace): Promise<void> => {
+	const appendManagedSnapshot = async (activeWorkspace: Workspace, runId?: string): Promise<void> => {
 		try {
-			const snapshot = await Effect.runPromise(activeWorkspace.managedSnapshot());
+			const snapshot = await Effect.runPromise(activeWorkspace.managedSnapshot(runId));
 			const validated = validateManagedSnapshot(snapshot);
 			if (!validated) return;
 			pi.appendEntry(MANAGED_SNAPSHOT_TYPE, validated);
@@ -89,6 +90,8 @@ export default function terminalEnvironment(
 			const adapter = await Effect.runPromise(TmuxAdapter.detect(options), { signal: sessionAbort.signal });
 			if (!adapter) return;
 			workspace = new Workspace(adapter, options);
+			const branchSnapshots = latestManagedSnapshots(ctx.sessionManager?.getBranch?.() ?? []);
+			await Effect.runPromise(workspace.reconcileSession(branchSnapshots), { signal: sessionAbort.signal });
 			const currentPaneId = adapter.currentTarget.paneId;
 			if (!registered) pi.registerTool({
 				name: "workspace",
@@ -101,7 +104,7 @@ export default function terminalEnvironment(
 					"Use workspace run to start a fresh coding agent. Keep the returned runId as the authoritative Agent Run identity; tmux pane/window IDs are diagnostics and raw-operation targets.",
 					`For a verified Pi Agent Run from ${currentPaneId}, use workspace send with kind=task, runId, input, and the literal text. The managed task target is resolved internally and creates a new workId and deliveryId. Do not start another Work Cycle until managed workspace wait reports Work Finished.`,
 					"A managed Pi worker must report with this same workspace send action using kind=result, explicit outcome completed, blocked, or failed, and text only; do not provide targetId, runId, or workId. The private current-turn Work Cycle binding correlates the result.",
-					"Managed workspace wait uses runId and optional workId and returns a durable Result Received text only after Work Finished. If Work Finished arrives without Result Received, it returns an explicit protocol failure. Result Received and Work Finished are separate facts; never infer completion from a raw inbox signal.",
+					"Managed workspace wait uses runId and optional workId and returns a durable Result Received text only after Work Finished. If Work Finished arrives without Result Received, it returns an explicit protocol failure. Rejection, shutdown, readiness loss, and target loss report interruption without claiming Work Finished and preserve any Result Received text. Result Received and Work Finished are separate facts; never infer completion from a raw inbox signal.",
 					"Codex, Claude, and OpenCode runs are unverified for Work Finished even though their UUID and process-started state are persisted; never claim their work is verified.",
 					`Raw workspace send and wait remain available for backward-compatible target-based coordination. Raw wait on ${currentPaneId} still uses afterSequence and reports only source-pane signals. The worker should not call workspace wait for its task.`,
 					`For raw compatibility, wait with targetId ${currentPaneId} after a send baseline; if wait on ${currentPaneId} times out, call workspace wait again with the returned sequence.`,
@@ -122,6 +125,8 @@ export default function terminalEnvironment(
 					const result = request.action === "wait"
 						? await runWithWorkspaceWaitProgress(onUpdate, execute, "runId" in request.request ? "a managed Result Received and Work Finished pair" : "a workspace inbox signal")
 						: await execute();
+					const resultRunId = "runId" in result && typeof result.runId === "string" ? result.runId : undefined;
+					if (resultRunId) await appendManagedSnapshot(activeWorkspace, resultRunId);
 					return {
 						content: [{ type: "text", text: bounded(resultText(result)) }],
 						details: result,
@@ -147,7 +152,7 @@ export default function terminalEnvironment(
 					...(sessionId === undefined ? {} : { sessionId }),
 					...(sessionFile === undefined ? {} : { sessionFile }),
 				}));
-				if (verified) await appendWorkerSnapshot(workspace);
+				if (verified) await appendManagedSnapshot(workspace);
 			} catch (cause) {
 				// Revoke any older verified capability before exposing this failed session.
 				const message = cause instanceof Error ? cause.message : String(cause);
@@ -217,17 +222,22 @@ export default function terminalEnvironment(
 			if (ctx.hasUI) ctx.ui.notify(`Failed to persist Work Finished: ${cause instanceof Error ? cause.message : String(cause)}`, "warning");
 			return false;
 		});
-		await appendWorkerSnapshot(activeWorkspace);
+		await appendManagedSnapshot(activeWorkspace);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		const activeWorkspace = workspace;
+		if (!activeWorkspace) return;
+		await Effect.runPromise(activeWorkspace.reconcileSession(latestManagedSnapshots(ctx.sessionManager?.getBranch?.() ?? []))).catch(() => undefined);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const activeWorkspace = workspace;
 		if (activeWorkspace) {
-			await finishManagedWork(activeWorkspace).catch((cause) => {
-				if (ctx.hasUI) ctx.ui.notify(`Failed to persist Work Finished during shutdown: ${cause instanceof Error ? cause.message : String(cause)}`, "warning");
-				return false;
+			await Effect.runPromise(activeWorkspace.revokeManagedReadiness("Pi session shut down before verified Work Finished was observed.")).catch((cause) => {
+				if (ctx.hasUI) ctx.ui.notify(`Failed to persist managed interruption during shutdown: ${cause instanceof Error ? cause.message : String(cause)}`, "warning");
 			});
-			await appendWorkerSnapshot(activeWorkspace);
+			await appendManagedSnapshot(activeWorkspace);
 		}
 		sessionAbort.abort(new Error("terminal-environment session shut down."));
 		workspace = undefined;
@@ -241,7 +251,7 @@ export { CoordinationLedger, CoordinationStore, boundManagedText, hashLaunchToke
 export { buildAgentInvocation } from "./agents.ts";
 export { normalizeWorkspaceParameters, WorkspaceParametersSchema } from "./schema.ts";
 export { renderWorkspaceCall, renderWorkspaceResult } from "./tool-ui.ts";
-export { createManagedLaunchContext, decodeManagedTaskInput, encodeManagedTaskInput, managedLaunchEnvironment, readManagedLaunchContext, validateManagedSnapshot } from "./managed.ts";
+export { createManagedLaunchContext, decodeManagedTaskInput, encodeManagedTaskInput, latestManagedSnapshots, managedLaunchEnvironment, readManagedLaunchContext, validateManagedSnapshot } from "./managed.ts";
 export type * from "./model.ts";
 export type * from "./coordination.ts";
 export type * from "./managed.ts";

@@ -216,6 +216,8 @@ interface WaitResultBase {
 export interface SignaledWaitResult extends WaitResultBase {
 	readonly reason: "signaled";
 	readonly sourcePaneId: string;
+	/** Absent only for legacy v1 inbox signals. */
+	readonly deliveryId?: string;
 }
 
 export interface TimedOutWaitResult extends WaitResultBase {
@@ -239,7 +241,7 @@ export interface ManagedWorkMetadata {
 export interface ManagedWaitResult {
 	readonly action: "wait";
 	readonly mode: "managed";
-	readonly reason: "work_finished" | "protocol_failure" | "timeout";
+	readonly reason: "work_finished" | "protocol_failure" | "interrupted" | "timeout";
 	readonly target: TerminalTarget;
 	readonly runId: string;
 	readonly workId: string;
@@ -249,6 +251,7 @@ export interface ManagedWaitResult {
 	readonly text?: string;
 	readonly metadata?: ManagedWorkMetadata;
 	readonly protocolFailure?: true;
+	readonly terminalState?: "interrupted" | "rejected" | "lost";
 	readonly resultReceived: boolean;
 	readonly workFinished: boolean;
 	readonly sequence: number;
