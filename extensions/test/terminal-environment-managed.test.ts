@@ -49,8 +49,10 @@ class ManagedFakeAdapter implements TerminalAdapter {
 	stale = false;
 	runtimeStale = false;
 	closeFails = false;
+	closeStarted = false;
 	closeGate: Promise<void> | undefined;
 	sendGate: Promise<void> | undefined;
+	sendStarted = false;
 	launched = false;
 	launchPath: string | undefined;
 
@@ -84,12 +86,19 @@ class ManagedFakeAdapter implements TerminalAdapter {
 	close(targetId: string, _expected?: TerminalTarget): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
 		if (this.closeFails) return Effect.fail(environmentError("close target", "close failed"));
 		const wait = this.closeGate === undefined ? Effect.void : Effect.promise(() => this.closeGate!);
-		return wait.pipe(Effect.flatMap(() => this.resolve(targetId)), Effect.tap(() => Effect.sync(() => { this.closed.push(targetId); })));
+		return Effect.sync(() => { this.closeStarted = true; }).pipe(
+			Effect.flatMap(() => wait),
+			Effect.flatMap(() => this.resolve(targetId)),
+			Effect.tap(() => Effect.sync(() => { this.closed.push(targetId); })),
+		);
 	}
 
 	send(targetValue: TerminalTarget, text: string, _submit: boolean): Effect.Effect<void, TerminalEnvironmentError> {
 		const wait = this.sendGate === undefined ? Effect.void : Effect.promise(() => this.sendGate!);
-		return wait.pipe(Effect.tap(() => Effect.sync(() => { this.sent.push({ target: targetValue.paneId, text }); })));
+		return Effect.sync(() => { this.sendStarted = true; }).pipe(
+			Effect.flatMap(() => wait),
+			Effect.tap(() => Effect.sync(() => { this.sent.push({ target: targetValue.paneId, text }); })),
+		);
 	}
 }
 
@@ -417,7 +426,34 @@ test("completed Work Cycles are pruned while the latest cycle remains addressabl
 	assert.equal((await Effect.runPromise(ledger.getRun(latestRunId)))?.state, "lost");
 }));
 
-test("aborting managed task delivery cannot orphan an active Work Cycle", async () => withRoot(async (root) => {
+test("cancellation after a durable task reservation cleans up atomically", async () => withRoot(async (root) => {
+	const setup = await setupManaged(root);
+	const coordination = (setup.parent as unknown as { coordination: CoordinationLedger }).coordination;
+	const beginWork = coordination.beginWork.bind(coordination);
+	let reportReserved!: () => void;
+	let releaseReservation!: () => void;
+	const reserved = new Promise<void>((resolve) => { reportReserved = resolve; });
+	const reservationGate = new Promise<void>((resolve) => { releaseReservation = resolve; });
+	// Force cancellation after the ledger write but before beginWork returns to Workspace.
+	coordination.beginWork = (input) => beginWork(input).pipe(
+		Effect.tap(() => Effect.sync(reportReserved)),
+		Effect.tap(() => Effect.promise(() => reservationGate)),
+	);
+	const controller = new AbortController();
+	const sending = Effect.runPromise(
+		setup.parent.execute({ action: "send", request: { kind: "task", runId: setup.runId, input: "prompt", text: "abort reservation" } }, process.cwd()),
+		{ signal: controller.signal },
+	);
+	await reserved;
+	controller.abort();
+	releaseReservation();
+	await assert.rejects(sending);
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
+	assert.equal((await Effect.runPromise(ledger.getRun(setup.runId)))?.state, "idle");
+	assert.equal(await Effect.runPromise(ledger.getActiveWork(setup.runId)), undefined);
+}));
+
+test("aborting an attempted managed task delivery marks its run lost", async () => withRoot(async (root) => {
 	const setup = await setupManaged(root);
 	let release!: () => void;
 	setup.parentAdapter.sendGate = new Promise<void>((resolve) => { release = resolve; });
@@ -426,12 +462,13 @@ test("aborting managed task delivery cannot orphan an active Work Cycle", async 
 		setup.parent.execute({ action: "send", request: { kind: "task", runId: setup.runId, input: "prompt", text: "abort delivery" } }, process.cwd()),
 		{ signal: controller.signal },
 	);
-	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
-	for (let attempt = 0; attempt < 50 && !(await Effect.runPromise(ledger.getActiveWork(setup.runId))); attempt += 1) {
+	for (let attempt = 0; attempt < 50 && !setup.parentAdapter.sendStarted; attempt += 1) {
 		await new Promise((resolve) => setTimeout(resolve, 2));
 	}
+	assert.equal(setup.parentAdapter.sendStarted, true);
 	controller.abort();
 	await assert.rejects(sending);
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
 	assert.equal((await Effect.runPromise(ledger.getRun(setup.runId)))?.state, "lost");
 	assert.equal(await Effect.runPromise(ledger.getActiveWork(setup.runId)), undefined);
 	release();
@@ -495,7 +532,33 @@ test("managed close marks ownership lost when the adapter close outcome is uncer
 	assert.deepEqual(setup.parentAdapter.closed, []);
 }));
 
-test("aborting a managed close cannot leave the run permanently closing", async () => withRoot(async (root) => {
+test("cancellation after a durable close reservation restores the run atomically", async () => withRoot(async (root) => {
+	const setup = await setupManaged(root);
+	const coordination = (setup.parent as unknown as { coordination: CoordinationLedger }).coordination;
+	const markClosing = coordination.markClosing.bind(coordination);
+	let reportReserved!: () => void;
+	let releaseReservation!: () => void;
+	const reserved = new Promise<void>((resolve) => { reportReserved = resolve; });
+	const reservationGate = new Promise<void>((resolve) => { releaseReservation = resolve; });
+	// Force cancellation after the ledger write but before markClosing returns to Workspace.
+	coordination.markClosing = (input) => markClosing(input).pipe(
+		Effect.tap(() => Effect.sync(reportReserved)),
+		Effect.tap(() => Effect.promise(() => reservationGate)),
+	);
+	const controller = new AbortController();
+	const closing = Effect.runPromise(
+		setup.parent.execute({ action: "close", request: { runId: setup.runId } }, process.cwd()),
+		{ signal: controller.signal },
+	);
+	await reserved;
+	controller.abort();
+	releaseReservation();
+	await assert.rejects(closing);
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
+	assert.equal((await Effect.runPromise(ledger.getRun(setup.runId)))?.state, "idle");
+}));
+
+test("aborting an attempted managed close marks its run lost", async () => withRoot(async (root) => {
 	const setup = await setupManaged(root);
 	let release!: () => void;
 	setup.parentAdapter.closeGate = new Promise<void>((resolve) => { release = resolve; });
@@ -504,12 +567,13 @@ test("aborting a managed close cannot leave the run permanently closing", async 
 		setup.parent.execute({ action: "close", request: { runId: setup.runId } }, process.cwd()),
 		{ signal: controller.signal },
 	);
-	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
-	for (let attempt = 0; attempt < 50 && (await Effect.runPromise(ledger.getRun(setup.runId)))?.state !== "closing"; attempt += 1) {
+	for (let attempt = 0; attempt < 50 && !setup.parentAdapter.closeStarted; attempt += 1) {
 		await new Promise((resolve) => setTimeout(resolve, 2));
 	}
+	assert.equal(setup.parentAdapter.closeStarted, true);
 	controller.abort();
 	await assert.rejects(closing);
+	const ledger = new CoordinationLedger(instanceId, { rootDirectory: root });
 	assert.equal((await Effect.runPromise(ledger.getRun(setup.runId)))?.state, "lost");
 	release();
 }));

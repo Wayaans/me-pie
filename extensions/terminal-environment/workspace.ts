@@ -300,8 +300,10 @@ export class Workspace {
 		let runId: string | undefined;
 		let launcherPath: string | undefined;
 		let launchCompleted = false;
-		const operation = Effect.gen(function* () {
-			const cwd = yield* resolveCwd(request.cwd, defaultCwd);
+		// Keep acquired resources and their cleanup handles atomic with cancellation.
+		// Restore interruption only before acquisition or after cleanup state is captured.
+		const operation = Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+			const cwd = yield* restore(resolveCwd(request.cwd, defaultCwd));
 			const invocation = yield* Effect.try({
 				try: () => buildAgentInvocation(request),
 				catch: (cause) => cause instanceof TerminalEnvironmentError
@@ -309,14 +311,14 @@ export class Workspace {
 					: environmentError("build agent invocation", errorMessage(cause), cause),
 			});
 			const executable = self.options.agentExecutables?.[invocation.agent]
-				?? (yield* findExecutable(invocation.executableName, self.environment));
+				?? (yield* restore(findExecutable(invocation.executableName, self.environment)));
 			const launchArgs = invocation.agent === "pi"
 				? [...invocation.args, "-e", TERMINAL_ENVIRONMENT_PACKAGE_ROOT]
 				: invocation.args;
 			const spawnedTarget = request.targetId === undefined;
 			const token = crypto.randomUUID();
 			const target = request.targetId
-				? (yield* self.adapter.resolve(request.targetId))
+				? (yield* restore(self.adapter.resolve(request.targetId)))
 				: (yield* self.adapter.spawn({ kind: "window", cwd, title: invocation.agent }, cwd));
 			if (spawnedTarget) createdTarget = target;
 			if (target.paneId === self.adapter.currentTarget.paneId) {
@@ -347,14 +349,14 @@ export class Workspace {
 			yield* self.adapter.launch(target, launcherPath, cwd, spawnedTarget || (request.replace ?? false), spawnedTarget);
 			launchCompleted = true;
 			launchedTarget = target;
-			launchedTarget = yield* self.waitForProcessTarget(target.paneId);
+			launchedTarget = yield* restore(self.waitForProcessTarget(target.paneId));
 			if (launchedTarget.dead || !sameTargetIdentity(targetIdentity(self.adapter.instanceId, launchedTarget), targetIdentity(self.adapter.instanceId, target))) {
 				return yield* environmentError("run coding agent", "Managed launch target changed or exited before process start was recorded.");
 			}
 			yield* self.coordination.updateTarget({ runId, token, target: launchedTarget });
 			const started = yield* self.coordination.markLaunched(runId);
 			const ready = invocation.agent === "pi"
-				? yield* self.waitForReadiness(runId)
+				? yield* restore(self.waitForReadiness(runId))
 				: started;
 			return {
 				action: "run",
@@ -379,7 +381,7 @@ export class Workspace {
 				...(ready.sessionId === undefined ? {} : { sessionId: ready.sessionId }),
 				...(ready.sessionFile === undefined ? {} : { sessionFile: ready.sessionFile }),
 			} as const;
-		});
+		}));
 		return operation.pipe(Effect.onExit((exit) => {
 			if (Exit.isSuccess(exit)) return Effect.void;
 			const markLost = runId === undefined ? Effect.void : self.coordination.markLost(runId).pipe(Effect.ignore);
@@ -476,10 +478,9 @@ export class Workspace {
 					: `Run ${request.runId} target identity or runtime diagnostics are stale or was reused.`);
 			}
 			const owned = yield* self.coordination.assertController(request.runId, sourcePaneId, sourceIdentity, resolvedIdentity);
-			let reservedWork: ManagedWorkRecord | undefined;
 			let deliveryAttempted = false;
-			const reservation = Effect.gen(function* () {
-				reservedWork = yield* self.coordination.beginWork({
+			const reservation = Effect.acquireUseRelease(
+				self.coordination.beginWork({
 					runId: owned.runId,
 					controllerPaneId: sourcePaneId,
 					controllerTarget: sourceIdentity,
@@ -487,20 +488,23 @@ export class Workspace {
 					targetSnapshot: target,
 					input: request.input,
 					text: request.text,
-				});
-				const transportText = yield* Effect.try({
-					try: () => encodeManagedTaskInput({ workId: reservedWork!.workId, text: request.text }),
-					catch: (cause) => environmentError("encode managed task input", errorMessage(cause), cause),
-				});
-				yield* Effect.sync(() => { deliveryAttempted = true; });
-				yield* self.adapter.send(target, transportText, request.submit ?? true);
-				return reservedWork;
-			}).pipe(Effect.onExit((exit) => {
-				if (Exit.isSuccess(exit) || reservedWork === undefined) return Effect.void;
-				return deliveryAttempted
-					? self.coordination.markLost(request.runId).pipe(Effect.ignore)
-					: self.coordination.cancelWork(request.runId, reservedWork.workId).pipe(Effect.ignore);
-			}));
+				}),
+				(reservedWork) => Effect.gen(function* () {
+					const transportText = yield* Effect.try({
+						try: () => encodeManagedTaskInput({ workId: reservedWork.workId, text: request.text }),
+						catch: (cause) => environmentError("encode managed task input", errorMessage(cause), cause),
+					});
+					yield* Effect.sync(() => { deliveryAttempted = true; });
+					yield* self.adapter.send(target, transportText, request.submit ?? true);
+					return reservedWork;
+				}),
+				(reservedWork, exit) => {
+					if (Exit.isSuccess(exit)) return Effect.void;
+					return deliveryAttempted
+						? self.coordination.markLost(request.runId).pipe(Effect.ignore)
+						: self.coordination.cancelWork(request.runId, reservedWork.workId).pipe(Effect.ignore);
+				},
+			);
 			const work = yield* reservation;
 			return {
 				action: "send",
@@ -607,28 +611,29 @@ export class Workspace {
 				return yield* environmentError("close managed Agent Run", `Agent Run ${request.runId} target has exited; it was marked lost.`);
 			}
 			const closeInput = { runId: request.runId, controllerPaneId: sourcePaneId, controllerTarget: sourceIdentity, target: resolvedIdentity } as const;
-			// Reserve the run and install cleanup in one scope. Cancellation before a
+			// Reserve the run as an uninterruptible acquisition. Cancellation before a
 			// close attempt restores it; cancellation during/after close marks it lost.
-			let reserved = false;
 			let closeAttempted = false;
-			const closeReserved = Effect.gen(function* () {
-				yield* self.coordination.markClosing(closeInput);
-				reserved = true;
-				const finalTarget = yield* self.resolveManagedTarget(request.runId, run.target.paneId);
-				if (finalTarget.dead || !sameTargetIdentity(resolvedIdentity, targetIdentity(self.adapter.instanceId, finalTarget)) || !sameTargetRuntime(target, finalTarget)) {
-					yield* self.markLostIfPresent(request.runId);
-					return yield* environmentError("close managed Agent Run", `Agent Run ${request.runId} target changed before close; no pane was closed.`);
-				}
-				yield* Effect.sync(() => { closeAttempted = true; });
-				yield* self.adapter.close(finalTarget.paneId, finalTarget);
-				yield* self.coordination.markClosed(closeInput);
-				return finalTarget;
-			}).pipe(Effect.onExit((exit) => {
-				if (Exit.isSuccess(exit) || !reserved) return Effect.void;
-				return closeAttempted
-					? self.markLostIfPresent(request.runId)
-					: self.coordination.restoreClosing(request.runId).pipe(Effect.ignore);
-			}));
+			const closeReserved = Effect.acquireUseRelease(
+				self.coordination.markClosing(closeInput),
+				() => Effect.gen(function* () {
+					const finalTarget = yield* self.resolveManagedTarget(request.runId, run.target.paneId);
+					if (finalTarget.dead || !sameTargetIdentity(resolvedIdentity, targetIdentity(self.adapter.instanceId, finalTarget)) || !sameTargetRuntime(target, finalTarget)) {
+						yield* self.markLostIfPresent(request.runId);
+						return yield* environmentError("close managed Agent Run", `Agent Run ${request.runId} target changed before close; no pane was closed.`);
+					}
+					yield* Effect.sync(() => { closeAttempted = true; });
+					yield* self.adapter.close(finalTarget.paneId, finalTarget);
+					yield* self.coordination.markClosed(closeInput);
+					return finalTarget;
+				}),
+				(_, exit) => {
+					if (Exit.isSuccess(exit)) return Effect.void;
+					return closeAttempted
+						? self.markLostIfPresent(request.runId)
+						: self.coordination.restoreClosing(request.runId).pipe(Effect.ignore);
+				},
+			);
 			const finalTarget = yield* closeReserved;
 			return {
 				action: "close",
