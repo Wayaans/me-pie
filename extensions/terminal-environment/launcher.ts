@@ -1,18 +1,28 @@
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
 import { environmentError, errorMessage, TerminalEnvironmentError } from "./errors.ts";
+import { TERMINAL_ENVIRONMENT_RUNTIME_ROOT } from "./paths.ts";
 
 export function quotePosix(value: string): string {
 	if (value.includes("\0")) throw environmentError("create launcher", "Launcher arguments cannot contain NUL bytes.");
 	return value.length === 0 ? "''" : `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function launcherScript(executable: string, args: readonly string[]): string {
+function launcherScript(
+	executable: string,
+	args: readonly string[],
+	environment: Readonly<Record<string, string>> = {},
+): string {
+	const exports = Object.entries(environment).map(([key, value]) => {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw environmentError("create launcher", `Invalid launcher environment key: ${key}`);
+		if (value.includes("\0")) throw environmentError("create launcher", `Launcher environment ${key} contains a NUL byte.`);
+		return `export ${key}=${quotePosix(value)}`;
+	});
 	return [
 		"#!/bin/sh",
 		"set -eu",
+		...exports,
 		"launcher=$0",
 		"runtime_dir=${launcher%/*}",
 		"rm -f -- \"$launcher\"",
@@ -22,16 +32,20 @@ function launcherScript(executable: string, args: readonly string[]): string {
 	].join("\n");
 }
 
-export function makeLauncher(executable: string, args: readonly string[]): Effect.Effect<string, TerminalEnvironmentError> {
+export function makeLauncher(
+	executable: string,
+	args: readonly string[],
+	environment: Readonly<Record<string, string>> = {},
+): Effect.Effect<string, TerminalEnvironmentError> {
 	return Effect.tryPromise({
 		try: async (signal) => {
 			signal.throwIfAborted();
-			const directory = path.join(os.tmpdir(), "mepie-terminal-environment", `launcher-${crypto.randomUUID()}`);
+			const directory = path.join(TERMINAL_ENVIRONMENT_RUNTIME_ROOT, `launcher-${crypto.randomUUID()}`);
 			await mkdir(directory, { recursive: true, mode: 0o700 });
 			try {
 				await chmod(directory, 0o700);
 				const launcherPath = path.join(directory, "launch.sh");
-				await writeFile(launcherPath, launcherScript(executable, args), { encoding: "utf8", mode: 0o700, flag: "wx", signal });
+				await writeFile(launcherPath, launcherScript(executable, args, environment), { encoding: "utf8", mode: 0o700, flag: "wx", signal });
 				await chmod(launcherPath, 0o700);
 				return launcherPath;
 			} catch (cause) {

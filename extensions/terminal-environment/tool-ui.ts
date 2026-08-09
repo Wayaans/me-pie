@@ -11,8 +11,11 @@ import type { WorkspaceParameters } from "./schema.ts";
 const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 const PROGRESS_INTERVAL_MS = 160;
 const NARROW_WIDTH = 32;
-const WAIT_BOUNDARY = "Wait listens on the selected target inbox; the signal reports its source pane.";
-const WAIT_TIMEOUT_GUIDANCE = "After a timeout, call workspace wait again with the returned sequence.";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RAW_WAIT_BOUNDARY = "Raw wait listens on the selected target inbox; the signal reports its source pane.";
+const MANAGED_WAIT_BOUNDARY = "Managed wait listens for the correlated Result Received and Work Finished facts in one Work Cycle.";
+const RAW_WAIT_TIMEOUT_GUIDANCE = "After a timeout, call workspace wait again with the returned sequence for raw inbox correlation.";
+const MANAGED_WAIT_TIMEOUT_GUIDANCE = "After a managed wait timeout, inspect Result Received and Work Finished separately and retry with the same runId/workId if appropriate.";
 
 export interface WorkspaceProgressDetails {
 	readonly workspaceUi: {
@@ -43,13 +46,14 @@ interface WorkspaceView {
 export async function runWithWorkspaceWaitProgress<A>(
 	onUpdate: WorkspaceUpdate | undefined,
 	work: () => Promise<A>,
+	label = "a workspace inbox signal",
 ): Promise<A> {
 	const startedAt = Date.now();
 	let frame = 0;
 	const publish = (): void => {
 		const elapsedMs = Date.now() - startedAt;
 		onUpdate?.({
-			content: [{ type: "text", text: `Waiting for a workspace inbox signal · ${formatElapsed(elapsedMs)}` }],
+			content: [{ type: "text", text: `Waiting for ${label} · ${formatElapsed(elapsedMs)}` }],
 			details: { workspaceUi: { action: "wait", elapsedMs, frame } },
 		});
 		frame = (frame + 1) % SPINNER_FRAMES.length;
@@ -138,12 +142,15 @@ function createPartialView(args: WorkspaceParameters, details: WorkspaceToolDeta
 	}
 	const progress = workspaceProgress(details);
 	const frame = SPINNER_FRAMES[(progress?.frame ?? 0) % SPINNER_FRAMES.length]!;
+	const wait = args.wait;
+	const managed = wait?.runId !== undefined;
+	const correlation = wait === undefined ? "?" : wait.runId !== undefined ? wait.runId : wait.targetId ?? "?";
 	return {
 		icon: frame,
 		tone: "accent",
-		status: "Waiting for inbox signal",
-		meta: `${sanitizeInline(args.wait?.targetId ?? "?")} · ${formatElapsed(progress?.elapsedMs ?? 0)}`,
-		details: [WAIT_BOUNDARY, WAIT_TIMEOUT_GUIDANCE],
+		status: managed ? "Waiting for Result Received and Work Finished" : "Waiting for inbox signal",
+		meta: `${sanitizeInline(correlation)} · ${formatElapsed(progress?.elapsedMs ?? 0)}`,
+		details: managed ? [MANAGED_WAIT_BOUNDARY, MANAGED_WAIT_TIMEOUT_GUIDANCE] : [RAW_WAIT_BOUNDARY, RAW_WAIT_TIMEOUT_GUIDANCE],
 	};
 }
 
@@ -172,12 +179,15 @@ function createRunView(result: Extract<WorkspaceResult, { action: "run" }>, args
 	const run = args.action === "run" ? args.run : undefined;
 	const model = run?.model ? sanitizeInline(run.model) : undefined;
 	const thinking = run?.thinking;
+	const runId = result.runId ? sanitizeInline(result.runId) : undefined;
+	const readiness = result.readiness ? sanitizeInline(result.readiness) : undefined;
 	return {
 		icon: "✓",
 		tone: "success",
 		status: `${titleCase(result.agent)} launched`,
-		meta: `${sanitizeInline(result.target.paneId)} · ${result.spawnedTarget ? "new target" : "existing target"}`,
+		meta: `${sanitizeInline(result.target.paneId)} · ${result.spawnedTarget ? "new target" : "existing target"}${runId ? ` · run ${runId}` : ""}`,
 		details: [
+			...(readiness ? [`readiness ${readiness} · ${result.capability === "verified" ? "Work Finished verified" : "Work Finished unverified"}`] : []),
 			...(model ? [`model ${model}${thinking ? ` · thinking ${thinking}` : ""}`] : thinking ? [`thinking ${thinking}`] : []),
 			...targetDetails(result.target),
 		],
@@ -186,16 +196,46 @@ function createRunView(result: Extract<WorkspaceResult, { action: "run" }>, args
 
 function createSendView(result: Extract<WorkspaceResult, { action: "send" }>, args: WorkspaceParameters): WorkspaceView {
 	const send = args.action === "send" ? args.send : undefined;
-	const source = sanitizeMultiline(send?.text ?? "");
+	const sendText = send === undefined ? undefined : "text" in send ? send.text : undefined;
+	const source = sanitizeMultiline(result.kind === "result" ? result.text : sendText ?? "");
 	const firstLine = source.split("\n").find((line) => line.trim())?.trim();
+	if (result.kind === "task") {
+		return {
+			icon: "✓",
+			tone: "success",
+			status: "Work Cycle queued",
+			meta: `run ${sanitizeInline(result.runId ?? "?")} · work ${sanitizeInline(result.workId ?? "?")} · delivery ${sanitizeInline(result.deliveryId)}`,
+			details: [
+				...targetDetails(result.target),
+				"Managed task text is delivered literally; use managed wait by runId/workId for the durable result.",
+			],
+			...(firstLine ? { preview: firstLine } : {}),
+			...(source ? { markdown: source } : {}),
+		};
+	}
+	if (result.kind === "result") {
+		return {
+			icon: "✓",
+			tone: "success",
+			status: "Result Received",
+			meta: `run ${sanitizeInline(result.runId ?? "?")} · work ${sanitizeInline(result.workId ?? "?")} · outcome ${sanitizeInline(result.outcome ?? "?")}`,
+			details: [
+				...targetDetails(result.target),
+				result.workFinished ? "Work Finished" : "Awaiting Work Finished",
+				`delivery ${sanitizeInline(result.deliveryId)}`,
+			],
+			...(firstLine ? { preview: firstLine } : {}),
+			...(source ? { markdown: source } : {}),
+		};
+	}
 	return {
 		icon: "✓",
 		tone: "success",
-		status: `${titleCase(result.input)} ${send?.submit === false ? "pasted" : "sent"}`,
-		meta: `${sanitizeInline(result.sourcePaneId)} → ${sanitizeInline(result.target.paneId)} · recipient sequence ${result.sequence} · ${result.bytes} B`,
+		status: `${titleCase(result.input)} ${send !== undefined && "submit" in send && send.submit === false ? "pasted" : "sent"}`,
+		meta: `${sanitizeInline(result.sourcePaneId)} → ${sanitizeInline(result.target.paneId)} · recipient sequence ${result.sequence ?? 0} · ${result.bytes} B`,
 		details: [
 			...targetDetails(result.target),
-			`wait on ${sanitizeInline(result.sourcePaneId)} for reply from ${sanitizeInline(result.target.paneId)} after sequence ${result.replyAfterSequence}`,
+			`wait on ${sanitizeInline(result.sourcePaneId)} for reply from ${sanitizeInline(result.target.paneId)} after sequence ${result.replyAfterSequence ?? 0}`,
 			`delivery ${sanitizeInline(result.deliveryId)}`,
 		],
 		...(firstLine ? { preview: firstLine } : {}),
@@ -218,11 +258,47 @@ function createCloseView(result: Extract<WorkspaceResult, { action: "close" }>):
 }
 
 function createWaitView(result: Extract<WorkspaceResult, { action: "wait" }>): WorkspaceView {
+	if ("mode" in result && result.mode === "managed") {
+		const meta = `run ${sanitizeInline(result.runId)} · work ${sanitizeInline(result.workId)} · ${formatElapsed(result.elapsedMs)}`;
+		const text = sanitizeMultiline(result.text ?? "");
+		const firstLine = text.split("\n").find((line) => line.trim())?.trim();
+		if (result.reason === "work_finished") {
+			return {
+				icon: "✓",
+				tone: "success",
+				status: "Work Finished",
+				meta: `${meta} · Result Received · outcome ${sanitizeInline(result.outcome ?? "?")}`,
+				details: [...targetDetails(result.target), "Result Received and Work Finished are correlated durable facts.", ...managedMetadataDetails(result.metadata)],
+				...(firstLine ? { preview: firstLine } : {}),
+				...(text ? { markdown: text } : {}),
+			};
+		}
+		if (result.reason === "protocol_failure") {
+			return {
+				icon: "✕",
+				tone: "error",
+				status: "Work Finished without Result Received",
+				meta: `${meta} · protocol failure`,
+				details: [...targetDetails(result.target), "Work Finished is recorded, but no worker result was received; do not infer an outcome."],
+				...(firstLine ? { preview: firstLine } : {}),
+				...(text ? { markdown: text } : {}),
+			};
+		}
+		return {
+			icon: "!",
+			tone: "warning",
+			status: "Managed wait timed out",
+			meta: `${meta} · Result Received ${result.resultReceived ? "yes" : "no"} · Work Finished ${result.workFinished ? "yes" : "no"}`,
+			details: [...targetDetails(result.target), "Managed wait timeout is distinct from raw inbox timeout; partial facts are not completion."],
+			...(firstLine ? { preview: firstLine } : {}),
+			...(text ? { markdown: text } : {}),
+		};
+	}
 	const route = result.reason === "signaled"
 		? `${sanitizeInline(result.sourcePaneId)} → ${sanitizeInline(result.target.paneId)}`
 		: `inbox ${sanitizeInline(result.target.paneId)}`;
 	const meta = `${route} · sequence ${result.sequence} · ${formatElapsed(result.elapsedMs)}`;
-	const details = [...targetDetails(result.target), WAIT_BOUNDARY];
+	const details = [...targetDetails(result.target), RAW_WAIT_BOUNDARY];
 	if (result.reason === "signaled") {
 		return { icon: "✓", tone: "success", status: "Inbox signal received", meta, details };
 	}
@@ -231,8 +307,21 @@ function createWaitView(result: Extract<WorkspaceResult, { action: "wait" }>): W
 		tone: "warning",
 		status: "No inbox signal before timeout",
 		meta,
-		details: [...details, WAIT_TIMEOUT_GUIDANCE],
+		details: [...details, RAW_WAIT_TIMEOUT_GUIDANCE],
 	};
+}
+
+function managedMetadataDetails(metadata: Extract<WorkspaceResult, { action: "wait"; mode: "managed" }>["metadata"]): readonly string[] {
+	if (!metadata) return [];
+	return compact([
+		metadata.controllerPaneId ? `controller ${sanitizeInline(metadata.controllerPaneId)}` : undefined,
+		metadata.workerPaneId ? `worker ${sanitizeInline(metadata.workerPaneId)}` : undefined,
+		metadata.effectiveModel ? `model ${sanitizeInline(metadata.effectiveModel.provider)}/${sanitizeInline(metadata.effectiveModel.id)}` : undefined,
+		metadata.effectiveThinking ? `thinking ${sanitizeInline(metadata.effectiveThinking)}` : undefined,
+		metadata.sessionId ? `Pi session ${sanitizeInline(metadata.sessionId)}` : undefined,
+		metadata.sessionFile ? `session file ${sanitizeInline(metadata.sessionFile)}` : undefined,
+		metadata.truncated ? "result text bounded" : undefined,
+	]);
 }
 
 function formatCallMeta(args: WorkspaceParameters): string[] {
@@ -258,21 +347,27 @@ function formatCallMeta(args: WorkspaceParameters): string[] {
 				run?.replace ? "replace" : undefined,
 			]);
 		}
-		case "send": return [
-			titleCase(args.send?.input ?? "input"),
-			sanitizeInline(args.send?.targetId ?? "?"),
-			args.send?.submit === false ? "paste only" : "submit",
-		];
-		case "wait": return compact([
-			"Inbox",
-			sanitizeInline(args.wait?.targetId ?? "?"),
-			args.wait?.afterSequence === undefined ? undefined : `after ${args.wait.afterSequence}`,
-			args.wait?.timeoutMs === undefined ? undefined : `timeout ${formatElapsed(args.wait.timeoutMs)}`,
-		]);
-		case "close": return [
-			titleCase(closeTargetKindFromId(args.close?.targetId ?? "")),
-			sanitizeInline(args.close?.targetId ?? "?"),
-		];
+		case "send": {
+			const send = args.send;
+			const managedKind = send?.kind;
+			const target = send === undefined ? undefined : send.targetId !== undefined ? send.targetId : send.runId !== undefined ? `run ${send.runId}` : "launch context";
+			const mode = managedKind === "result"
+				? "result"
+				: send !== undefined && "submit" in send && send.submit === false ? "paste only" : "submit";
+			return compact([managedKind === "result" ? "Result" : managedKind === "task" ? "Task" : send !== undefined && "input" in send ? titleCase(send.input) : "input", target ? sanitizeInline(target) : undefined, mode]);
+		}
+		case "wait": {
+			const wait = args.wait;
+			if (wait === undefined) return [];
+			if (wait.runId !== undefined) return compact(["Managed", `run ${sanitizeInline(wait.runId)}`, wait.workId ? `work ${sanitizeInline(wait.workId)}` : undefined, wait.timeoutMs === undefined ? undefined : `timeout ${formatElapsed(wait.timeoutMs)}`]);
+			return compact(["Inbox", wait.targetId ? sanitizeInline(wait.targetId) : undefined, wait.afterSequence === undefined ? undefined : `after ${wait.afterSequence}`, wait.timeoutMs === undefined ? undefined : `timeout ${formatElapsed(wait.timeoutMs)}`]);
+		}
+		case "close": {
+			const close = args.close;
+			if (close === undefined) return [];
+			if (close.runId !== undefined) return ["Agent Run", sanitizeInline(close.runId)];
+			return close.targetId === undefined ? [] : [titleCase(closeTargetKindFromId(close.targetId)), sanitizeInline(close.targetId)];
+		}
 	}
 }
 
@@ -280,9 +375,24 @@ function formatNarrowCall(args: WorkspaceParameters): string {
 	switch (args.action) {
 		case "spawn": return `Workspace · Spawn ${args.spawn?.kind ?? "window"}`;
 		case "run": return `Workspace · Run ${titleCase(args.run?.agent ?? "pi")} → ${sanitizeInline(args.run?.targetId ?? "new")}`;
-		case "send": return `Workspace · Send ${args.send?.input ?? "input"} → ${sanitizeInline(args.send?.targetId ?? "?")}`;
-		case "wait": return `Workspace · Wait inbox ${sanitizeInline(args.wait?.targetId ?? "?")}`;
-		case "close": return `Workspace · Close ${sanitizeInline(args.close?.targetId ?? "?")}`;
+		case "send": {
+			const send = args.send;
+			const kind = send?.kind ?? send?.input ?? "input";
+			const target = send?.targetId ?? send?.runId ?? "launch";
+			return `Workspace · Send ${kind} → ${sanitizeInline(target)}`;
+		}
+		case "wait": {
+			const wait = args.wait;
+			if (wait === undefined) return "Workspace · Wait";
+			return wait.runId !== undefined
+				? `Workspace · Wait managed ${sanitizeInline(wait.runId)}`
+				: `Workspace · Wait inbox ${sanitizeInline(wait.targetId ?? "?")}`;
+		}
+		case "close": {
+			const close = args.close;
+			if (close === undefined) return "Workspace · Close";
+			return `Workspace · Close ${sanitizeInline(close.runId ?? close.targetId ?? "?")}`;
+		}
 	}
 }
 
@@ -294,10 +404,16 @@ function formatNarrowResultMeta(result: WorkspaceToolResult, context: WorkspaceR
 	switch (result.details.action) {
 		case "spawn": return sanitizeInline(result.details.target.paneId);
 		case "run": return sanitizeInline(result.details.target.paneId);
-		case "send": return `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · seq ${result.details.sequence}`;
-		case "wait": return result.details.reason === "signaled"
-			? `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`
-			: `${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`;
+		case "send": return result.details.kind === "task"
+			? `run ${sanitizeInline(result.details.runId)} · work ${sanitizeInline(result.details.workId)}`
+			: result.details.kind === "result"
+				? `run ${sanitizeInline(result.details.runId)} · ${sanitizeInline(result.details.outcome)}`
+				: `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · seq ${result.details.sequence}`;
+		case "wait": return "mode" in result.details && result.details.mode === "managed"
+			? `run ${sanitizeInline(result.details.runId)} · work ${sanitizeInline(result.details.workId)} · ${result.details.reason === "work_finished" ? "finished" : result.details.reason === "protocol_failure" ? "protocol failure" : "timeout"}`
+			: result.details.reason === "signaled"
+				? `${sanitizeInline(result.details.sourcePaneId)} → ${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`
+				: `${sanitizeInline(result.details.target.paneId)} · ${formatElapsed(result.details.elapsedMs)}`;
 		case "close": return sanitizeInline(closedTargetId(result.details));
 	}
 }
@@ -339,14 +455,29 @@ function isWorkspaceResult(details: WorkspaceToolDetails): details is WorkspaceR
 	switch (candidate.action) {
 		case "spawn": return true;
 		case "run": return typeof candidate.agent === "string" &&
+			typeof candidate.runId === "string" && UUID_PATTERN.test(candidate.runId) &&
 			typeof candidate.executable === "string" && typeof candidate.spawnedTarget === "boolean";
-		case "send": return typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId) &&
-			typeof candidate.deliveryId === "string" && Number.isInteger(candidate.sequence) &&
-			Number.isInteger(candidate.replyAfterSequence) && Number.isInteger(candidate.bytes) &&
-			(candidate.input === "prompt" || candidate.input === "command");
-		case "wait": return (candidate.reason === "signaled" || candidate.reason === "timeout") &&
-			(candidate.reason !== "signaled" || (typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId))) &&
-			Number.isInteger(candidate.sequence) && typeof candidate.elapsedMs === "number" && Number.isFinite(candidate.elapsedMs);
+		case "send": {
+			if (candidate.kind === "task") return typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId) &&
+				typeof candidate.deliveryId === "string" && typeof candidate.runId === "string" && UUID_PATTERN.test(candidate.runId) && typeof candidate.workId === "string" && UUID_PATTERN.test(candidate.workId) && Number.isInteger(candidate.bytes);
+			if (candidate.kind === "result") return typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId) &&
+				typeof candidate.deliveryId === "string" && typeof candidate.runId === "string" && UUID_PATTERN.test(candidate.runId) && typeof candidate.workId === "string" && UUID_PATTERN.test(candidate.workId) &&
+				(candidate.outcome === "completed" || candidate.outcome === "blocked" || candidate.outcome === "failed") && typeof candidate.text === "string" &&
+				candidate.resultReceived === true && typeof candidate.workFinished === "boolean" && Number.isInteger(candidate.bytes);
+			return typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId) &&
+				typeof candidate.deliveryId === "string" && Number.isInteger(candidate.sequence) &&
+				Number.isInteger(candidate.replyAfterSequence) && Number.isInteger(candidate.bytes) &&
+				(candidate.input === "prompt" || candidate.input === "command");
+		}
+		case "wait": {
+			if (candidate.mode === "managed") return (candidate.reason === "work_finished" || candidate.reason === "protocol_failure" || candidate.reason === "timeout") &&
+				typeof candidate.runId === "string" && UUID_PATTERN.test(candidate.runId) && typeof candidate.workId === "string" && UUID_PATTERN.test(candidate.workId) && typeof candidate.resultReceived === "boolean" &&
+				typeof candidate.workFinished === "boolean" && (candidate.reason !== "protocol_failure" || (candidate.protocolFailure === true && candidate.resultReceived === false && candidate.workFinished === true)) &&
+				Number.isInteger(candidate.sequence) && typeof candidate.elapsedMs === "number" && Number.isFinite(candidate.elapsedMs);
+			return (candidate.reason === "signaled" || candidate.reason === "timeout") &&
+				(candidate.reason !== "signaled" || (typeof candidate.sourcePaneId === "string" && /^%[0-9]+$/.test(candidate.sourcePaneId))) &&
+				Number.isInteger(candidate.sequence) && typeof candidate.elapsedMs === "number" && Number.isFinite(candidate.elapsedMs);
+		}
 		case "close": return candidate.kind === "window" || candidate.kind === "pane";
 		default: return false;
 	}
@@ -366,9 +497,24 @@ function targetId(args: WorkspaceParameters): string | undefined {
 	switch (args.action) {
 		case "spawn": return args.spawn?.targetId ? sanitizeInline(args.spawn.targetId) : undefined;
 		case "run": return args.run?.targetId ? sanitizeInline(args.run.targetId) : undefined;
-		case "send": return args.send?.targetId ? sanitizeInline(args.send.targetId) : undefined;
-		case "wait": return args.wait?.targetId ? sanitizeInline(args.wait.targetId) : undefined;
-		case "close": return args.close?.targetId ? sanitizeInline(args.close.targetId) : undefined;
+		case "send": {
+			const send = args.send;
+			if (send === undefined) return undefined;
+			const target = send.targetId ?? send.runId;
+			return target === undefined ? undefined : sanitizeInline(target);
+		}
+		case "wait": {
+			const wait = args.wait;
+			if (wait === undefined) return undefined;
+			const target = wait.runId ?? wait.targetId;
+			return target === undefined ? undefined : sanitizeInline(target);
+		}
+		case "close": {
+			const close = args.close;
+			if (close === undefined) return undefined;
+			const target = close.runId ?? close.targetId;
+			return target === undefined ? undefined : sanitizeInline(target);
+		}
 	}
 }
 

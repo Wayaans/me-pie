@@ -1,18 +1,26 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
+import { MANAGED_TEXT_MAX_BYTES } from "./coordination.ts";
 import { environmentError } from "./errors.ts";
 import {
 	CODING_AGENTS,
 	TARGET_KINDS,
 	THINKING_LEVELS,
 	WORKSPACE_ACTIONS,
+	WORK_OUTCOMES,
 	type WorkspaceRequest,
 } from "./model.ts";
 
 const StrictObject = <T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
 
+const Uuid = Type.String({
+	minLength: 36,
+	maxLength: 36,
+	pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+	description: "Authoritative Agent Run or Work Cycle correlation UUID.",
+});
 const TargetId = Type.String({
 	minLength: 2,
 	maxLength: 64,
@@ -23,7 +31,7 @@ const WaitTargetId = Type.String({
 	minLength: 2,
 	maxLength: 64,
 	pattern: "^[%@$][0-9]+$",
-	description: "Recipient tmux target whose inbox should be observed. Use the current pane ID to wait for worker reports.",
+	description: "Recipient tmux target whose inbox should be observed by raw wait.",
 });
 const CloseTargetId = Type.String({
 	minLength: 2,
@@ -32,6 +40,7 @@ const CloseTargetId = Type.String({
 	description: "Native tmux pane (%pane) or window (@window) ID.",
 });
 const Cwd = Type.String({ minLength: 1, maxLength: 4_096 });
+const RawText = Type.String({ minLength: 1, maxLength: 48 * 1_024 });
 
 export const SpawnParametersSchema = StrictObject({
 	kind: Type.Optional(StringEnum(TARGET_KINDS, { default: "window", description: "Target kind. Defaults to window." })),
@@ -51,24 +60,34 @@ export const RunParametersSchema = StrictObject({
 	replace: Type.Optional(Type.Boolean({ default: false })),
 });
 
+/**
+ * Keep one Google-compatible object schema per action. Normalization below
+ * enforces the strict raw/task/result variants and rejects mixed fields.
+ */
 export const SendParametersSchema = StrictObject({
-	targetId: TargetId,
-	input: StringEnum(["prompt", "command"] as const),
-	text: Type.String({ minLength: 1, maxLength: 48 * 1_024 }),
+	targetId: Type.Optional(TargetId),
+	runId: Type.Optional(Uuid),
+	kind: Type.Optional(StringEnum(["task", "result"] as const)),
+	input: Type.Optional(StringEnum(["prompt", "command"] as const)),
+	outcome: Type.Optional(StringEnum(WORK_OUTCOMES)),
+	text: RawText,
 	submit: Type.Optional(Type.Boolean({ default: true })),
 });
 
 export const WaitParametersSchema = StrictObject({
-	targetId: WaitTargetId,
+	targetId: Type.Optional(WaitTargetId),
+	runId: Type.Optional(Uuid),
+	workId: Type.Optional(Uuid),
 	afterSequence: Type.Optional(Type.Integer({
 		minimum: 0,
-		description: "Ignore inbox signals through this sequence. Use replyAfterSequence returned by the task send.",
+		description: "Raw inbox baseline. Managed waits correlate by runId/workId.",
 	})),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 * 60_000, default: 120_000 })),
 });
 
 export const CloseParametersSchema = StrictObject({
-	targetId: CloseTargetId,
+	targetId: Type.Optional(CloseTargetId),
+	runId: Type.Optional(Uuid),
 });
 
 export const WorkspaceParametersSchema = StrictObject({
@@ -102,8 +121,78 @@ export function normalizeWorkspaceParameters(params: WorkspaceParameters): Works
 	switch (params.action) {
 		case "spawn": return { action: "spawn", request: params.spawn! };
 		case "run": return { action: "run", request: params.run! };
-		case "send": return { action: "send", request: params.send! };
-		case "wait": return { action: "wait", request: params.wait! };
-		case "close": return { action: "close", request: params.close! };
+		case "send": return normalizeSend(params.send!);
+		case "wait": return normalizeWait(params.wait!);
+		case "close": return normalizeClose(params.close!);
 	}
+}
+
+function normalizeSend(payload: NonNullable<WorkspaceParameters["send"]>): WorkspaceRequest {
+	if (payload.kind === "task") {
+		if (payload.runId === undefined || payload.targetId !== undefined || payload.input === undefined
+			|| payload.outcome !== undefined || payload.submit === false || payload.text.trim().length === 0
+			|| Buffer.byteLength(payload.text, "utf8") > MANAGED_TEXT_MAX_BYTES) return invalid("send payload is invalid.");
+		return {
+			action: "send",
+			request: {
+				kind: "task",
+				runId: payload.runId,
+				input: payload.input,
+				text: payload.text,
+				...(payload.submit === undefined ? {} : { submit: payload.submit }),
+			},
+		};
+	}
+	if (payload.kind === "result") {
+		if (payload.targetId !== undefined || payload.runId !== undefined || payload.input !== undefined
+			|| payload.submit !== undefined || payload.outcome === undefined || payload.text.trim().length === 0
+			|| Buffer.byteLength(payload.text, "utf8") > MANAGED_TEXT_MAX_BYTES) return invalid("send payload is invalid.");
+		return { action: "send", request: { kind: "result", outcome: payload.outcome, text: payload.text } };
+	}
+	if (payload.targetId === undefined || payload.input === undefined || payload.runId !== undefined || payload.outcome !== undefined) {
+		return invalid("send payload is invalid.");
+	}
+	return {
+		action: "send",
+		request: {
+			targetId: payload.targetId,
+			input: payload.input,
+			text: payload.text,
+			...(payload.submit === undefined ? {} : { submit: payload.submit }),
+		},
+	};
+}
+
+function normalizeWait(payload: NonNullable<WorkspaceParameters["wait"]>): WorkspaceRequest {
+	if (payload.runId !== undefined) {
+		if (payload.targetId !== undefined || payload.afterSequence !== undefined) return invalid("wait payload is invalid.");
+		return {
+			action: "wait",
+			request: {
+				runId: payload.runId,
+				...(payload.workId === undefined ? {} : { workId: payload.workId }),
+				...(payload.timeoutMs === undefined ? {} : { timeoutMs: payload.timeoutMs }),
+			},
+		};
+	}
+	if (payload.targetId === undefined || payload.workId !== undefined) return invalid("wait payload is invalid.");
+	return {
+		action: "wait",
+		request: {
+			targetId: payload.targetId,
+			...(payload.afterSequence === undefined ? {} : { afterSequence: payload.afterSequence }),
+			...(payload.timeoutMs === undefined ? {} : { timeoutMs: payload.timeoutMs }),
+		},
+	};
+}
+
+function normalizeClose(payload: NonNullable<WorkspaceParameters["close"]>): WorkspaceRequest {
+	if ((payload.targetId === undefined) === (payload.runId === undefined)) return invalid("close payload is invalid.");
+	return payload.runId === undefined
+		? { action: "close", request: { targetId: payload.targetId! } }
+		: { action: "close", request: { runId: payload.runId } };
+}
+
+function invalid(message: string): never {
+	throw environmentError("validate workspace request", message);
 }

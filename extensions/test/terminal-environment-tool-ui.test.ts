@@ -99,6 +99,7 @@ test("run results distinguish created and existing targets and show only selecte
 			action: "run",
 			target: { ...target, currentCommand: agent },
 			agent,
+			runId: `4f6f0f37-6a7d-4d08-8a6e-1de9cc5a16f0`,
 			executable: `/usr/local/bin/${agent}`,
 			spawnedTarget: true,
 		}, { expanded: true, isPartial: false });
@@ -109,7 +110,7 @@ test("run results distinguish created and existing targets and show only selecte
 	}
 
 	const existing = resultOutput({ action: "run", run: { targetId: "%13", agent: "codex" } }, {
-		action: "run", target, agent: "codex", executable: "codex", spawnedTarget: false,
+		action: "run", target, agent: "codex", runId: "4f6f0f37-6a7d-4d08-8a6e-1de9cc5a16f0", executable: "codex", spawnedTarget: false,
 	}, { expanded: false, isPartial: false });
 	assert.match(existing, /existing target/);
 });
@@ -153,6 +154,39 @@ test("send results render Markdown previews, submission mode, and delivery seque
 		{ expanded: false, isPartial: false },
 	);
 	assert.match(pasted, /✓ Command pasted · %5 → %13 · recipient sequence 43/);
+});
+
+test("managed task, result, and wait rows distinguish correlation and separate lifecycle facts", () => {
+	const runId = "4f6f0f37-6a7d-4d08-8a6e-1de9cc5a16f0";
+	const workId = "b0b4b2f7-1f72-4c85-bc88-f9d7d88c5a0c";
+	const taskArgs: WorkspaceParameters = { action: "send", send: { kind: "task", runId, input: "prompt", text: "Review" } };
+	const task: WorkspaceResult = {
+		action: "send", target, sourcePaneId: "%5", deliveryId: "delivery-task",
+		bytes: 6, input: "prompt", kind: "task", runId, workId,
+	};
+	assert.match(resultOutput(taskArgs, task, { expanded: true, isPartial: false }), /Work Cycle queued/);
+	assert.match(resultOutput(taskArgs, task, { expanded: true, isPartial: false }), new RegExp(workId));
+	const resultArgs: WorkspaceParameters = { action: "send", send: { kind: "result", outcome: "completed", text: "Done" } };
+	const result: WorkspaceResult = {
+		action: "send", target, sourcePaneId: "%13", deliveryId: "delivery-result", bytes: 4, input: "prompt",
+		kind: "result", runId, workId, outcome: "completed", resultReceived: true, workFinished: false, text: "Done",
+	};
+	assert.match(resultOutput(resultArgs, result, { expanded: true, isPartial: false }), /Result Received/);
+	assert.match(resultOutput(resultArgs, result, { expanded: true, isPartial: false }), /Awaiting Work Finished/);
+	const waitArgs: WorkspaceParameters = { action: "wait", wait: { runId, workId } };
+	const waited: WorkspaceResult = {
+		action: "wait", mode: "managed", target, runId, workId, reason: "work_finished", outcome: "completed", text: "Done",
+		resultReceived: true, workFinished: true, sequence: 0, elapsedMs: 120,
+	};
+	assert.match(resultOutput(waitArgs, waited, { expanded: true, isPartial: false }), /Work Finished/);
+	assert.match(resultOutput(waitArgs, waited, { expanded: true, isPartial: false }), /Result Received/);
+	const protocolFailure: WorkspaceResult = {
+		action: "wait", mode: "managed", target, runId, workId, reason: "protocol_failure",
+		text: "Work Finished was observed, but Result Received was missing.", protocolFailure: true,
+		resultReceived: false, workFinished: true, sequence: 0, elapsedMs: 80,
+	};
+	assert.match(resultOutput(waitArgs, protocolFailure, { expanded: true, isPartial: false }), /Work Finished without Result Received/);
+	assert.match(resultOutput(waitArgs, protocolFailure, { expanded: true, isPartial: false }), /protocol failure/);
 });
 
 test("wait rendering covers inbox progress, source attribution, timeout, and cancellation", () => {

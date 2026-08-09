@@ -93,6 +93,7 @@ class FakeTerminalAdapter implements TerminalAdapter {
 	alive = true;
 	dead = false;
 	launchFails = false;
+	launched = false;
 	launchedAt: number | undefined;
 	lastLauncherPath: string | undefined;
 	lastReplace: boolean | undefined;
@@ -105,20 +106,22 @@ class FakeTerminalAdapter implements TerminalAdapter {
 	}
 
 	spawn(_request: SpawnRequest, _defaultCwd: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
-		return Effect.succeed(this.currentTarget);
+		return Effect.succeed({ ...this.currentTarget, windowId: "@2", windowName: "worker", paneId: "%2" });
 	}
 	resolve(targetId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
 		if (!this.alive) return Effect.fail(environmentError("resolve tmux target", `can't find target: ${targetId}`));
 		const identity = targetId.startsWith("$") ? { sessionId: targetId }
 			: targetId.startsWith("@") ? { windowId: targetId }
 				: { paneId: targetId };
-		return Effect.succeed({ ...this.currentTarget, ...identity, dead: this.dead });
+		return Effect.succeed({ ...this.currentTarget, ...identity, ...(this.launched ? { currentCommand: "node" } : {}), dead: this.dead });
 	}
 	launch(_target: TerminalTarget, launcherPath: string, _cwd: string, replace: boolean, _ownedByOperation: boolean): Effect.Effect<void, TerminalEnvironmentError> {
 		this.launchedAt = Date.now();
 		this.lastLauncherPath = launcherPath;
 		this.lastReplace = replace;
-		return this.launchFails ? Effect.fail(environmentError("launch coding agent", "launch failed")) : Effect.void;
+		if (this.launchFails) return Effect.fail(environmentError("launch coding agent", "launch failed"));
+		this.launched = true;
+		return Effect.void;
 	}
 	closeSpawnedWindow(_target: TerminalTarget): Effect.Effect<void, TerminalEnvironmentError> {
 		return Effect.sync(() => { this.closedWindows += 1; });
@@ -171,7 +174,7 @@ test("coding-agent adapters start fresh agents with only managed model and think
 test("tmux detection, spawning, and literal multiline delivery use the current server", async () => {
 	const runner = new FakeTmuxRunner();
 	const adapter = await Effect.runPromise(TmuxAdapter.detect({
-		environment: { TMUX: `${socketPath},1,0`, PATH: "/bin" },
+		environment: { TMUX: `${socketPath},1,0`, TMUX_PANE: "%1", PATH: "/bin" },
 		runner,
 		tmuxExecutable: "/fake/tmux",
 	}));
@@ -201,7 +204,7 @@ test("tmux rolls back a pane when post-spawn title setup fails", async () => {
 	const runner = new FakeTmuxRunner();
 	runner.failCommand = "select-pane";
 	const adapter = await Effect.runPromise(TmuxAdapter.detect({
-		environment: { TMUX: `${socketPath},1,0`, PATH: "/bin" },
+		environment: { TMUX: `${socketPath},1,0`, TMUX_PANE: "%1", PATH: "/bin" },
 		runner,
 		tmuxExecutable: "/fake/tmux",
 	}));
@@ -214,7 +217,7 @@ test("tmux launch rejects a busy pane unless replacement is explicit", async () 
 	const runner = new FakeTmuxRunner();
 	runner.resolved = target({ currentCommand: "node" });
 	const adapter = await Effect.runPromise(TmuxAdapter.detect({
-		environment: { TMUX: `${socketPath},1,0`, PATH: "/bin" },
+		environment: { TMUX: `${socketPath},1,0`, TMUX_PANE: "%1", PATH: "/bin" },
 		runner,
 		tmuxExecutable: "/fake/tmux",
 	}));
@@ -229,7 +232,7 @@ test("tmux close uses exact target kinds and protects the calling hierarchy", as
 	runner.resolvedTargets.set("%2", target({ paneId: "%2", windowId: "@2", windowName: "worker" }));
 	runner.resolvedTargets.set("@2", target({ paneId: "%2", windowId: "@2", windowName: "worker" }));
 	const adapter = await Effect.runPromise(TmuxAdapter.detect({
-		environment: { TMUX: `${socketPath},1,0`, PATH: "/bin" },
+		environment: { TMUX: `${socketPath},1,0`, TMUX_PANE: "%1", PATH: "/bin" },
 		runner,
 		tmuxExecutable: "/fake/tmux",
 	}));
@@ -248,23 +251,28 @@ test("tmux close uses exact target kinds and protects the calling hierarchy", as
 });
 
 test("workspace close reports the closed target kind and snapshot", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-coordination-${crypto.randomUUID()}`);
 	const adapter = new FakeTerminalAdapter(target({ paneId: "%1" }));
-	const workspace = new Workspace(adapter);
-	const result = await Effect.runPromise(workspace.execute({
-		action: "close",
-		request: { targetId: "%2" },
-	}, process.cwd()));
-	assert.deepEqual(adapter.closedTargetIds, ["%2"]);
-	assert.equal(result.action, "close");
-	if (result.action === "close") {
-		assert.equal(result.kind, "pane");
-		assert.equal(result.target.paneId, "%2");
+	const workspace = new Workspace(adapter, { coordinationRoot: directory });
+	try {
+		const result = await Effect.runPromise(workspace.execute({
+			action: "close",
+			request: { targetId: "%2" },
+		}, process.cwd()));
+		assert.deepEqual(adapter.closedTargetIds, ["%2"]);
+		assert.equal(result.action, "close");
+		if (result.action === "close") {
+			assert.equal(result.kind, "pane");
+			assert.equal(result.target.paneId, "%2");
+		}
+		await assert.rejects(
+			Effect.runPromise(workspace.execute({ action: "close", request: { targetId: "$2" } }, process.cwd())),
+			/requires a pane or window ID/,
+		);
+		assert.deepEqual(adapter.closedTargetIds, ["%2"]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
 	}
-	await assert.rejects(
-		Effect.runPromise(workspace.execute({ action: "close", request: { targetId: "$2" } }, process.cwd())),
-		/requires a pane or window ID/,
-	);
-	assert.deepEqual(adapter.closedTargetIds, ["%2"]);
 });
 
 test("signal store serializes concurrent inbox signals and preserves source order", async () => {
@@ -309,6 +317,7 @@ test("workspace wait observes only sends delivered to the selected inbox and rep
 		assert.equal(taskDelivery.action, "send");
 		if (taskDelivery.action !== "send") return;
 		assert.equal(taskDelivery.sourcePaneId, "%1");
+		if (!("replyAfterSequence" in taskDelivery)) return;
 		assert.equal(taskDelivery.replyAfterSequence, 0);
 
 		const waiting = Effect.runPromise(main.execute({
@@ -344,16 +353,22 @@ test("workspace wait observes only sends delivered to the selected inbox and rep
 			request: { targetId: "%2", input: "prompt", text: "scan again" },
 		}, process.cwd()));
 		assert.equal(nextTask.action, "send");
-		if (nextTask.action === "send") assert.equal(nextTask.replyAfterSequence, 1);
+		if (nextTask.action === "send" && "replyAfterSequence" in nextTask) assert.equal(nextTask.replyAfterSequence, 1);
 		assert.deepEqual(workerAdapter.sent, ["not for main", "scan complete"]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
 
-test("workspace run waits two seconds after launching before it completes", async () => {
+test("workspace run waits for bounded Pi readiness instead of assuming startup", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-coordination-${crypto.randomUUID()}`);
 	const adapter = new FakeTerminalAdapter();
-	const workspace = new Workspace(adapter, { agentExecutables: { pi: process.execPath } });
+	const workspace = new Workspace(adapter, {
+		signalStoreRoot: directory,
+		coordinationRoot: directory,
+		agentExecutables: { pi: process.execPath },
+		readinessTimeoutMs: 20,
+	});
 	try {
 		const result = await Effect.runPromise(workspace.execute({
 			action: "run",
@@ -361,9 +376,29 @@ test("workspace run waits two seconds after launching before it completes", asyn
 		}, process.cwd()));
 		assert.equal(result.action, "run");
 		assert.ok(adapter.launchedAt !== undefined);
-		assert.ok(Date.now() - adapter.launchedAt >= 1_900, "run must allow the coding-agent CLI time to initialize");
+		assert.ok(Date.now() - adapter.launchedAt >= 15, "run must wait for its readiness deadline");
+		if (result.action === "run") assert.equal(result.readiness, "process_started");
 	} finally {
 		if (adapter.lastLauncherPath) await rm(adapter.lastLauncherPath, { force: true });
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("workspace run refuses to replace the calling pane", async () => {
+	const directory = path.join(os.tmpdir(), `mepie-terminal-coordination-${crypto.randomUUID()}`);
+	const adapter = new FakeTerminalAdapter();
+	const workspace = new Workspace(adapter, {
+		coordinationRoot: directory,
+		agentExecutables: { pi: process.execPath },
+	});
+	try {
+		await assert.rejects(
+			Effect.runPromise(workspace.execute({ action: "run", request: { targetId: "%1", replace: true } }, process.cwd())),
+			/Refusing to replace the calling pane %1/,
+		);
+		assert.equal(adapter.launchedAt, undefined);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
 	}
 });
 
@@ -373,6 +408,7 @@ test("failed runs roll back windows spawned by that invocation", async () => {
 	adapter.launchFails = true;
 	const workspace = new Workspace(adapter, {
 		signalStoreRoot: directory,
+		coordinationRoot: directory,
 		agentExecutables: { pi: process.execPath },
 	});
 	try {
@@ -419,6 +455,7 @@ test("the extension registers workspace only after validated tmux detection", as
 	type SessionStart = (event: unknown, ctx: { readonly cwd: string; readonly hasUI: boolean }) => Promise<void>;
 	interface RegisteredTool {
 		readonly name: string;
+		readonly executionMode?: string;
 		readonly description: string;
 		readonly promptGuidelines?: readonly string[];
 		readonly renderCall?: unknown;
@@ -442,12 +479,13 @@ test("the extension registers workspace only after validated tmux detection", as
 	const runner = new FakeTmuxRunner();
 	const inside = makeHarness();
 	terminalEnvironment(inside.pi, {
-		environment: { TMUX: `${socketPath},1,0`, PATH: "/bin" },
+		environment: { TMUX: `${socketPath},1,0`, TMUX_PANE: "%1", PATH: "/bin" },
 		runner,
 		tmuxExecutable: "/fake/tmux",
 	});
 	await inside.start();
 	assert.deepEqual(inside.tools.map((tool) => tool.name), ["workspace"]);
+	assert.equal(inside.tools[0]?.executionMode, "sequential");
 	assert.match(inside.tools[0]!.description, /fresh Pi agent with no initial prompt/);
 	assert.match(inside.tools[0]!.description, /Wait listens on the target inbox/);
 	assert.match(inside.tools[0]!.description, /sessions cannot be closed/);

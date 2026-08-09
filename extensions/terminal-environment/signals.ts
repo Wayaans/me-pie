@@ -1,9 +1,9 @@
 import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
 import { environmentError, errorMessage, type TerminalEnvironmentError } from "./errors.ts";
+import { TERMINAL_ENVIRONMENT_RUNTIME_ROOT } from "./paths.ts";
 
 const LOCK_RETRY_MS = 20;
 const LOCK_TIMEOUT_MS = 2_000;
@@ -58,7 +58,7 @@ export class SignalStore {
 
 	constructor(environmentInstanceId: string, options: SignalStoreOptions = {}) {
 		const serverId = createHash("sha256").update(environmentInstanceId).digest("hex").slice(0, 24);
-		const root = options.rootDirectory ?? path.join(os.tmpdir(), "mepie-terminal-environment", "signals");
+		const root = options.rootDirectory ?? path.join(TERMINAL_ENVIRONMENT_RUNTIME_ROOT, "signals");
 		this.directory = path.join(root, serverId);
 	}
 

@@ -54,6 +54,21 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `localize` — translate and refine prompts into English before submission.
 - `mepie-ui` — add a theme-aware PI header and model, context, cost, and Git dashboard.
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
+- `terminal-environment` — expose one tmux-backed `workspace` tool for raw target operations and managed Agent Runs / Work Cycles.
+
+## Managed Agent Runs and Work Cycles
+
+`workspace` remains one tool with the existing `spawn`, `run`, `send`, `wait`, and `close` actions. Raw target-based calls remain backward compatible. A successful `run` returns a UUID Run ID while retaining tmux target diagnostics.
+
+For verified Pi lifecycle support:
+
+1. Run an agent and keep its `runId`.
+2. Send one task with `send: { kind: "task", runId, input: "prompt", text }`. This creates a `workId` and delivery UUID and resolves the target internally.
+3. The managed transport wraps correlation privately, then the child input hook removes it before prompt-template or skill expansion and binds the exact Work Cycle. The Pi worker reports through the same action with `send: { kind: "result", outcome: "completed" | "blocked" | "failed", text }`; the result is stored durably and is not pasted into the controller terminal.
+4. Wait with `{ runId, workId? }` until both **Result Received** and **Work Finished** are recorded. A result/finish pair leaves the process and tmux target open for another Work Cycle.
+5. Close only with `close: { runId }` when the Agent Run should actually end.
+
+Pi readiness and Work Finished are verified through bounded launch/readiness coordination. Only verified Pi runs accept managed Work Cycles; Codex, Claude, and OpenCode retain UUID/process-started persistence and raw target operations but never claim verified Work Finished. The shared per-tmux-instance ledger uses owner-only files, locking, atomic writes, bounded result payloads, UUID correlation, and bounded historical retention. Pi session snapshot entries are validated branch-local diagnostics; the ledger remains runtime authority.
 
 ## Add an extension
 

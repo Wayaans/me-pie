@@ -1,8 +1,8 @@
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Effect, Exit } from "effect";
 import { environmentError, errorMessage, type TerminalEnvironmentError } from "./errors.ts";
+import { TERMINAL_ENVIRONMENT_RUNTIME_ROOT } from "./paths.ts";
 import { closeTargetKindFromId, type SpawnRequest, type TerminalAdapter, type TerminalTarget } from "./model.ts";
 import { findExecutable, nodeCommandRunner, runCommand, type CommandResult, type CommandRunner } from "./process.ts";
 
@@ -82,7 +82,9 @@ export class TmuxAdapter implements TerminalAdapter {
 		const runner = options.runner ?? nodeCommandRunner;
 		return Effect.gen(function* () {
 			const executable = options.tmuxExecutable ?? (yield* findExecutable("tmux", environment));
-			const result = yield* runCommand(runner, executable, ["display-message", "-p", "-F", RECORD_FORMAT], "detect tmux", environment);
+			const paneId = environment.TMUX_PANE?.trim();
+			if (!paneId || !/^%[0-9]+$/.test(paneId)) return yield* environmentError("detect tmux", "TMUX_PANE does not identify the calling pane.");
+			const result = yield* runCommand(runner, executable, ["display-message", "-p", "-t", paneId, "-F", RECORD_FORMAT], "detect tmux", environment);
 			if (result.code !== 0) return yield* failedCommand("detect tmux", result);
 			const parsed = parseTarget(result.stdout);
 			if (!parsed) return yield* environmentError("detect tmux", "tmux returned malformed current-target identity.");
@@ -165,7 +167,7 @@ export class TmuxAdapter implements TerminalAdapter {
 		});
 	}
 
-	close(targetId: string): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
+	close(targetId: string, expected?: TerminalTarget): Effect.Effect<TerminalTarget, TerminalEnvironmentError> {
 		if (!/^[%@][0-9]+$/.test(targetId)) {
 			return Effect.fail(environmentError("close tmux target", `Close requires a pane or window ID: ${targetId}`));
 		}
@@ -174,6 +176,9 @@ export class TmuxAdapter implements TerminalAdapter {
 			const caller = yield* self.resolve(self.currentTarget.paneId);
 			const target = yield* self.resolve(targetId);
 			const kind = closeTargetKindFromId(targetId);
+			if (expected !== undefined && !sameTargetSnapshot(expected, target)) {
+				return yield* environmentError("close tmux target", `Target ${targetId} changed before close.`);
+			}
 			const protectedTarget = kind === "window"
 				? target.windowId === caller.windowId
 				: target.paneId === caller.paneId;
@@ -191,24 +196,25 @@ export class TmuxAdapter implements TerminalAdapter {
 		return Effect.gen(function* () {
 			const verified = yield* self.resolve(target.paneId);
 			if (verified.dead) return yield* environmentError("send terminal input", `Target ${verified.paneId} has exited.`);
+			if (!sameTargetSnapshot(target, verified)) return yield* environmentError("send terminal input", `Target ${target.paneId} changed before delivery.`);
 			const bufferName = `mepie-${crypto.randomUUID()}`;
-			const directory = path.join(os.tmpdir(), "mepie-terminal-environment", `input-${crypto.randomUUID()}`);
+			const directory = path.join(TERMINAL_ENVIRONMENT_RUNTIME_ROOT, `input-${crypto.randomUUID()}`);
 			const inputPath = path.join(directory, "input.txt");
-			yield* Effect.tryPromise({
-				try: async (signal) => {
-					await mkdir(directory, { recursive: true, mode: 0o700 });
-					await chmod(directory, 0o700);
-					await writeFile(inputPath, text, { encoding: "utf8", mode: 0o600, flag: "wx", signal });
-					await chmod(inputPath, 0o600);
-				},
-				catch: (cause) => environmentError("prepare terminal input", errorMessage(cause), cause),
-			});
-			const delivery = Effect.gen(function* () {
+			const preparedDelivery = Effect.gen(function* () {
+				yield* Effect.tryPromise({
+					try: async (signal) => {
+						await mkdir(directory, { recursive: true, mode: 0o700 });
+						await chmod(directory, 0o700);
+						await writeFile(inputPath, text, { encoding: "utf8", mode: 0o600, flag: "wx", signal });
+						await chmod(inputPath, 0o600);
+					},
+					catch: (cause) => environmentError("prepare terminal input", errorMessage(cause), cause),
+				});
 				yield* self.command(["load-buffer", "-b", bufferName, inputPath], "load terminal input");
 				yield* self.command(["paste-buffer", "-p", "-d", "-b", bufferName, "-t", verified.paneId], "paste terminal input");
 				if (submit) yield* self.command(["send-keys", "-t", verified.paneId, "Enter"], "submit terminal input");
 			});
-			return yield* delivery.pipe(Effect.ensuring(Effect.promise(async () => {
+			return yield* preparedDelivery.pipe(Effect.ensuring(Effect.promise(async () => {
 				await self.runner.run(self.executable, ["-S", self.socketPath, "delete-buffer", "-b", bufferName], { env: self.processEnvironment }).catch(() => undefined);
 				await rm(directory, { recursive: true, force: true }).catch(() => undefined);
 			})));
@@ -232,4 +238,14 @@ export class TmuxAdapter implements TerminalAdapter {
 		}
 		return Effect.succeed(parsed.target);
 	}
+}
+
+function sameTargetSnapshot(expected: TerminalTarget, actual: TerminalTarget): boolean {
+	return expected.environment === actual.environment
+		&& expected.sessionId === actual.sessionId
+		&& expected.windowId === actual.windowId
+		&& expected.paneId === actual.paneId
+		&& expected.cwd === actual.cwd
+		&& expected.currentCommand === actual.currentCommand
+		&& expected.dead === actual.dead;
 }

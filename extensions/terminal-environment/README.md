@@ -1,105 +1,114 @@
 # Terminal Environment
 
-`terminal-environment` exposes one `workspace` tool when Pi is running inside a functioning supported terminal environment. The MVP supports tmux. Herdr and cmux adapters are planned but are not activated through the tmux fallback.
+`terminal-environment` exposes exactly one `workspace` tool when Pi is running inside a validated tmux environment. It keeps the existing `spawn`, `run`, `send`, `wait`, and `close` actions. Raw target-based operations remain available for compatibility; managed operations add UUID correlation without changing those raw semantics.
 
-## Actions
+## Vocabulary
 
-### Spawn
+- **Agent Run** — one coding-agent process in a tmux Target.
+- **Run ID** — authoritative UUID for an Agent Run; tmux target IDs remain diagnostics.
+- **Work Cycle** — one managed task on an idle Agent Run, identified by a new `workId` and delivery UUID.
+- **Result Received** — the worker result is durably stored and correlated.
+- **Work Finished** — verified Pi lifecycle observed the worker turn finish; it is recorded separately from Result Received.
 
-With no options, spawn creates a detached window in the current tmux session and uses Pi's current working directory.
+Result Received and Work Finished are separate facts. A raw inbox signal is only a cooperative source-pane notification and never means Work Finished.
+
+## Spawn and Run
+
+Raw spawn still creates detached tmux sessions, windows, or panes and returns native `$session`, `@window`, and `%pane` IDs.
 
 ```json
 { "action": "spawn", "spawn": {} }
 ```
 
-Supported tmux kinds are `session`, `window`, and `pane`. Results include the stable tmux session (`$`), window (`@`), and pane (`%`) IDs. Prefer pane IDs for later operations.
-
-### Run
-
-With no target, run creates a detached window and starts Pi. Supported coding agents are `pi`, `codex`, `claude`, and `opencode`.
+Run starts a fresh interactive Pi, Codex, Claude, or OpenCode process without an initial prompt or user-supplied arbitrary CLI arguments. Managed Pi launches add only the package's controlled extension path so the child can validate its private launch context:
 
 ```json
 {
   "action": "run",
-  "run": {
-    "agent": "codex",
-    "model": "gpt-5.4",
-    "thinking": "high",
-    "cwd": "."
-  }
+  "run": { "agent": "pi", "model": "openai/gpt", "thinking": "high", "cwd": "." }
 }
 ```
 
-A supplied target must be an idle shell unless `replace` is explicitly true. A window created by the same `run` action is safe to replace automatically. Agent launches use owner-only temporary scripts and managed argument arrays.
+Every successful run returns a UUID `runId`, tmux target diagnostics, durable persistence, and process-started capability. Pi launch context is validated against the tmux server, target identity, run token, current pane, selected model, and resolved provider authentication. Pi readiness reports effective model, thinking level, and session metadata through the shared coordination ledger using bounded polling. Only verified Pi runs accept managed Work Cycles; Codex, Claude, and OpenCode retain UUID/process-started persistence and raw target operations but never claim verified Work Finished.
 
-Run never supplies an initial prompt or arbitrary CLI arguments. It starts a fresh interactive coding agent only. Deliver the task afterward with `workspace send`.
+## Managed task / result / wait
 
-### Send
-
-Send requests tmux bracketed paste so supported destination editors receive multiline Markdown as one paste. It presses Enter exactly once when `submit` is true, then writes a signal to the destination pane's inbox. The signal records the current pane as its source.
+The controller sends a task through the existing send action. The target is resolved from the Run ID, so no target ID is supplied:
 
 ```json
 {
   "action": "send",
   "send": {
-    "targetId": "%13",
+    "kind": "task",
+    "runId": "<run UUID>",
     "input": "prompt",
-    "text": "# Task\n\nReview the authentication module. When done, report with workspace send to %5."
+    "text": "Review the authentication module literally."
   }
 }
 ```
 
-`prompt` and `command` describe the input's intent. Both are delivered literally; the process running in the pane decides how to interpret the text. The result identifies the source and destination. Its `sequence` is the destination inbox sequence. Its `replyAfterSequence` is the source inbox baseline: use it when the source pane waits for a reply.
+One Agent Run can have only one active Work Cycle. A completed Work Cycle leaves the Pi process, tmux pane/window, Agent Run, and internal bridge open; a later task gets a new `workId` without resume.
 
-### Wait
+A verified Pi worker uses the same workspace send action:
 
-Wait listens on the resolved recipient target's inbox for the next successful `workspace` send delivered there. The signal identifies its source pane. For a controller/worker handshake, the controller sends a task to the worker, the worker sends its report back to the controller, and the controller waits on its own pane ID.
+```json
+{
+  "action": "send",
+  "send": {
+    "kind": "result",
+    "outcome": "completed",
+    "text": "Tests pass; authentication review is complete."
+  }
+}
+```
+
+The worker supplies no `targetId`, `runId`, or `workId`. The controller wraps terminal transport in a private correlated envelope so Pi's TUI cannot trim the task or intercept it as a built-in command. The child input hook validates and removes that envelope before prompt-template or skill expansion, binds the exact Work Cycle, and passes the original task text onward. Protocol guidance is injected privately into the worker's Pi system prompt. If the worker is already processing steer/follow-up input, the envelope is handled without entering that turn and managed wait returns a protocol failure. Result text goes into the shared per-tmux-instance durable ledger and is never pasted into the controller terminal. The result send terminates the current Pi turn only; it does not close Pi, tmux, or the run.
+
+The controller waits for both durable facts:
 
 ```json
 {
   "action": "wait",
-  "wait": {
-    "targetId": "%5",
-    "afterSequence": 4,
-    "timeoutMs": 120000
-  }
+  "wait": { "runId": "<run UUID>", "workId": "<work UUID>", "timeoutMs": 120000 }
 }
 ```
 
-Use the task send result's `replyAfterSequence` as `afterSequence`. This prevents a fast worker report from being missed between send and wait. If `afterSequence` is omitted, wait uses the current inbox sequence and waits for the next signal. Wait ends only when a signal reaches that inbox or the timeout expires. After a timeout, call wait again with the returned `sequence`.
+Managed wait returns the exact correlated result text, explicit outcome, delivery/result timestamps, effective session metadata, and the separate Result Received / Work Finished state. Work Finished without Result Received returns a protocol failure instead of inventing an outcome. Fast results are retained before wait starts, and unrelated target sends cannot satisfy it.
 
-The worker must be told to deliver its final report with `workspace send` to the controller pane. The worker should not call `workspace wait` to receive its task: the task is normal terminal input. A received signal is the worker's cooperative report; it does not independently inspect coding-agent process state.
+## Raw compatibility
 
-### Close
-
-Close terminates the exact native tmux pane or window: `%` IDs close panes and `@` IDs close windows. Session (`$`) IDs are rejected. Prefer the worker pane ID returned by spawn or run so the operation has the smallest scope.
+Raw send remains literal bracketed paste and writes a source-pane inbox signal:
 
 ```json
 {
-  "action": "close",
-  "close": {
-    "targetId": "%13"
-  }
+  "action": "send",
+  "send": { "targetId": "%13", "input": "prompt", "text": "# Task\n\nReview this." }
 }
 ```
 
-Close resolves the target immediately before issuing the corresponding tmux `kill-*` command and returns its pre-close metadata snapshot. It rejects the calling pane and its containing window, preventing the controller from terminating itself. Missing targets and tmux failures are reported as tool errors. Close workers explicitly after their reports and any verification are complete; wait does not close them automatically.
+Raw wait remains target/sequence based and returns the next signal from its selected inbox. Use the send result's `replyAfterSequence` to avoid missing a fast raw signal. Raw close still accepts `%pane` or `@window` and rejects `$session`.
 
-## TUI presentation
+## Close
 
-The `workspace` tool uses compact action and result rows. Expanded results show tmux target metadata; send results preview Markdown and show the race-safe reply baseline; pending waits show the recipient inbox and elapsed time, while successful waits show the source-to-recipient route. Narrow terminals keep only the action, primary pane ID, and status.
+Only explicit close closes a successfully launched managed run:
 
-Renderer text strips terminal control characters from requests, target metadata, previews, and errors before display. Executable paths remain hidden.
+```json
+{ "action": "close", "close": { "runId": "<run UUID>" } }
+```
+
+Managed close validates run ownership, tmux server identity, and the recorded target/runtime identity before closing the run's pane. Stale, reused, interrupted, or otherwise uncertain close targets are marked lost and are never blindly killed again. A new run never retires a live run that owns the same target; close or mark the old run lost first. Raw target close retains its hierarchy protection and rejects panes or windows owned by an open Agent Run, which must be closed by `runId`.
+
+## Persistence and safety
+
+The shared coordination ledger is per tmux server instance under the user's private cache root. It uses owner-only directories/files, lock ownership, atomic writes, bounded payloads, UUID correlation, idempotent result/finish facts, and bounded retention of historical runs/Work Cycles. Pi session snapshot entries are validated branch-local diagnostics only; the ledger is runtime authority and launch tokens are never stored in Pi session details. Existing v1 source-only signal files continue to support raw operations.
+
+## TUI
+
+Workspace rows distinguish Agent Run, Work Cycle, Result Received, Work Finished, outcomes, and raw inbox signals. Expanded managed waits show correlated result text and metadata; managed results never render as terminal input delivery. Requests, target diagnostics, result text, and errors are sanitized before display and tool output remains bounded.
 
 ## Activation
 
-The tool is registered during `session_start` only when:
-
-- `TMUX` is present,
-- Pi is not marked as running inside Herdr or cmux, and
-- `tmux display-message` returns a valid current socket/session/window/pane identity.
-
-Outside a supported environment, the tool is absent. tmux metadata containing newlines or the ASCII unit-separator control character is rejected fail-closed because tmux format output cannot represent those values unambiguously.
+The tool is registered only when `TMUX` is present, Herdr/cmux guards are absent, and tmux returns a valid current socket/server/session/window/pane identity. All tmux commands use that validated server instance.
 
 ## Validation
 
