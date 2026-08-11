@@ -1,11 +1,11 @@
 # Worker prompt templates
 
-Replace every `{placeholder}` before sending. Remove empty optional sections. Each prompt is one managed Work Cycle; the terminal-environment extension privately binds the worker's final `workspace send` result to that cycle.
+Replace every `{placeholder}` before sending. Remove empty optional sections. Set `{repository_cwd}` to the `cwd` passed to `workspace run`; render files inside it as `cwd`-relative paths, never paths based on the orchestrator's shell `pwd`. Use absolute paths only for sources outside that `cwd`. Each prompt is one managed Work Cycle; the terminal-environment extension privately binds the worker's final `workspace send` result to that cycle.
 
 ## Implementation worker
 
 ```text
-You are the implementation worker for exactly one ticket. Work in {repository_path}.
+You are the implementation worker for exactly one ticket. Your cwd is {repository_cwd}. All relative paths below use this cwd.
 
 Assigned ticket:
 {ticket_path_and_identifier}
@@ -17,6 +17,12 @@ Source of truth:
 
 Resolved decisions and remaining scope:
 {ticket_clarifications_and_partial_scope}
+
+AFK decision channel:
+- The orchestrator is your sole decision-maker; the user is unavailable.
+- Work non-interactively. Do not invoke interactive question or confirmation tools.
+- Resolve routine implementation details from the sources and established repository conventions.
+- If safe completion requires an unresolved decision, report one precise question and its consequences with outcome `blocked`. The orchestrator will answer in a managed follow-up when it can decide safely.
 
 Scope boundary:
 - HEAD before this assignment: {head_before_assignment}
@@ -32,7 +38,7 @@ After that commit, invoke and follow the `code-review` skill using `/skill:code-
 
 Before reporting, inspect the final diff, commits, review results, and worktree state. Completion requires implemented behavior, passing required validation and code review, an updated ticket status, and reported commit SHAs.
 
-If a missing decision, dependency, credential, or conflicting work makes safe completion impossible, stop rather than guess.
+If a missing decision, dependency, credential, or conflicting work makes safe completion impossible, stop and report the blocker through the AFK decision channel.
 
 Report through the workspace tool exactly once at the end:
 - `kind: "result"`
@@ -46,5 +52,5 @@ Report through the workspace tool exactly once at the end:
   - validation commands and results
   - code-review command, findings, fixes, and final Standards/Spec verdicts
   - final `git status --short`
-  - blockers or concerns
+  - blockers or concerns; for outcome `blocked`, the exact decision needed, available options, consequences, and your evidence-based recommendation
 ```

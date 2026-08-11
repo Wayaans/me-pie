@@ -11,6 +11,12 @@ You are the orchestrator. Prepare the queue, delegate every implementation, veri
 
 Use only fresh Pi Agent Runs created with `workspace` for worker work. Keep tickets sequential.
 
+## AFK boundary
+
+Phase 1 is the only interactive phase. Gather every user decision, confirmation, credential, and foreseeable blocker there, then obtain explicit approval to begin unattended work. The start of Phase 2 closes the boundary: Phases 2 and 3 run AFK through the final report, with no user questions or confirmation requests.
+
+During AFK work, act as the user's proxy for worker questions. Resolve them from the spec, ticket clarifications, repository evidence, established conventions, and the smallest intent-preserving choice. Send the decision to the worker in a managed follow-up. When no safe resolution exists, mark the ticket blocked, record the exact unresolved decision, block its dependents, and continue any independent ready tickets. Never reopen Phase 1 after Phase 2 starts.
+
 ## Inputs and worker defaults
 
 Obtain before unattended work starts:
@@ -25,13 +31,15 @@ When the user omits the model, inspect `PI_PROVIDER` and `PI_MODEL` through `bas
 
 If required paths or worker settings cannot be resolved, collect them with all other preparation questions.
 
+For worker prompts, use the repository/worktree `cwd` passed to `workspace run` as the path base. Render repository files as paths relative to that `cwd`; use absolute paths only for sources outside it. Never derive prompt paths from the orchestrator's shell `pwd`.
+
 ## Managed worker protocol
 
 For every implementation ticket:
 
 1. Call `workspace run` with `agent: "pi"`, the resolved model, chosen thinking level, repository `cwd`, and no target. A successful call creates the fresh tmux window and authoritative `runId`.
 2. Require `processStarted: true` and `verifiedWorkFinished: true`. Treat unverified readiness as a failed launch; close the run when possible and retry or report the blocker.
-3. Read [WORKER-PROMPTS.md](WORKER-PROMPTS.md), render the implementation template with concrete paths, scope, decisions, and report requirements, then call managed `workspace send` with `kind: "task"`, the `runId`, `input: "prompt"`, and the rendered text. Retain its `workId`.
+3. Read [WORKER-PROMPTS.md](WORKER-PROMPTS.md), render the implementation template with `cwd`-based paths, scope, decisions, and report requirements, then call managed `workspace send` with `kind: "task"`, the `runId`, `input: "prompt"`, and the rendered text. Retain its `workId`.
 4. Call managed `workspace wait` with the `runId` and `workId`. On timeout, wait again for the same work. Completion requires both Result Received and Work Finished; a raw signal or result text alone is not completion.
 5. Accept, follow up, or block based on the reported outcome and the verification rules below. Start no other Work Cycle on that run before Work Finished.
 6. Call `workspace close` with the `runId` after its assignment is accepted or abandoned. Record the lifecycle in the ledger.
@@ -63,11 +71,12 @@ The ledger is the source of truth after context compaction. It is complete when 
 3. Exclude verified-complete tickets. Keep partial tickets in scope with their remaining work stated explicitly.
 4. Order remaining tickets by schema/migrations, shared contracts, prerequisites, dependencies, then dependents. Preserve the given order where no dependency requires a change.
 5. Inspect git status and history. Record baseline HEAD and pre-existing changes. Resolve ownership of dirty files; any overlap or unclear ownership that could contaminate worker commits is a preparation blocker.
-6. Collect every ambiguity, missing decision, invalid ticket, dependency blocker, credential need, or AFK interruption risk. Ask all preparation questions together. Preparation is not complete while any ready ticket could predictably need user input.
+6. Collect every ambiguity, missing decision, invalid ticket, dependency blocker, credential need, confirmation, or AFK interruption risk. Ask all preparation questions together. Preparation is not complete while any ready ticket could predictably need user input.
 7. Add concise clarification notes to affected ticket files after decisions resolve. Add only decisions, constraints, dependencies, and execution context; preserve original intent. Include these edits in the first relevant worker's commit rather than making an implementation commit yourself.
-8. Initialize the ledger and present the classifications, queue, ordering reasons, blockers, notes added, and baseline.
+8. Initialize the ledger and present the classifications, queue, ordering reasons, blockers, notes added, baseline, and the AFK decision policy for anything unforeseen.
+9. Ask for explicit confirmation to cross the AFK boundary and begin Phase 2. Resolve any response that changes scope or decisions before asking for confirmation again.
 
-**Preparation gate:** all source files have been inspected; every ticket is classified; all foreseeable questions are resolved and written into the tickets; the ready queue, clean scope boundary, and baseline are recorded.
+**Preparation gate:** all source files have been inspected; every ticket is classified; all foreseeable questions are resolved and written into the tickets; the ready queue, clean scope boundary, baseline, and proxy-decision policy are recorded; the user has explicitly approved unattended execution.
 
 # Phase 2 — Implementation
 
@@ -83,15 +92,16 @@ For each queued ticket in order:
    - only ticket-owned files were committed; baseline/unrelated changes remain excluded
    - worktree state is understood and no failure was hidden
 4. If verification fails, send the same worker a focused follow-up and wait again. Never repair the ticket yourself.
-5. Accept the ticket only after verification passes. Add its commit SHAs to the ledger, close the run, then start the next ticket.
+5. If the worker reports a question or blocker, apply the AFK proxy policy. Send a safe resolution to the same worker in a managed follow-up; otherwise record the ticket as blocked and close its run. Continue independent ready tickets.
+6. Accept the ticket only after verification passes. Add its commit SHAs to the ledger, close the run, then start the next ticket.
 
-Do not re-run excluded or accepted tickets. Change order only for a newly discovered dependency, missing/invalid ticket, or blocker; record and report the reason. An unforeseen question returns the workflow to Phase 1 before further implementation—do not guess through it.
+Do not re-run excluded or accepted tickets. Change order only for a newly discovered dependency, missing/invalid ticket, or blocker; record the reason and continue autonomously. Keep all user-facing questions deferred to the final report.
 
 **Ticket gate:** the managed work finished successfully, the ticket is marked complete, its validation passed, its commits and worktree effects are verified, and its run is closed.
 
-# Completion
+# Phase 3 — Completion
 
-Finish only after every ready ticket passes its ticket gate. Report:
+Finish autonomously after every ready ticket passes its ticket gate or is conclusively blocked. Report:
 
 - excluded, completed, blocked, and unresolved tickets
 - execution order and any changes to it
