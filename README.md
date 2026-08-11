@@ -47,6 +47,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 ## Included extensions
 
 - `answer` — extract questions from the latest assistant response into an interactive Q&A.
+- `checkpoint-compaction` — replace Pi compaction summaries with structured continuation checkpoints.
 - `codex-usage` — show OpenAI Codex subscription usage.
 - `file-search` — provide first-class, bounded `fd` and `rg` search tools.
 - `find-docs` — retrieve current Context7 documentation.
