@@ -12,6 +12,7 @@ import {
 	type AskMeQuestion,
 	type AskMeRequest,
 	formatAskMeTranscript,
+	getAskMeAnswerDescription,
 	getAskMeTranscriptSizeError,
 	normalizeAskMeRequest,
 } from "./schema.ts";
@@ -39,14 +40,22 @@ function rawDisplayType(args: unknown): AskMeDisplayType {
 	return type === "selection" || type === "confirmation" ? type : "question";
 }
 
-function headerText(theme: Theme, displayType: AskMeDisplayType, status: HeaderStatus): string {
+function headerText(
+	theme: Theme,
+	displayType: AskMeDisplayType,
+	status: HeaderStatus,
+	answerCount?: { answered: number; total: number },
+): string {
 	const presentation = HEADER_STATUS[status];
+	const statusText = answerCount && (status === "done" || status === "cancelled")
+		? `${presentation.icon} ${answerCount.answered} of ${answerCount.total} answered${status === "cancelled" ? " · cancelled" : ""}`
+		: `${presentation.icon} ${status}`;
 	return [
 		theme.fg("toolTitle", theme.bold("ask-me")),
 		theme.fg("dim", "·"),
 		theme.fg("accent", displayType),
 		theme.fg("dim", "·"),
-		theme.fg(presentation.color, `${presentation.icon} ${status}`),
+		theme.fg(presentation.color, statusText),
 	].join(" ");
 }
 
@@ -131,20 +140,45 @@ async function runRpcQuestionnaire(
 	for (let index = 0; index < request.questions.length; index++) {
 		const question = request.questions[index]!;
 		let response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
-		while (!response.cancelled && question.required && !response.answer) {
+		while (!response.cancelled && request.displayType !== "questionnaire" && question.required && !response.answer) {
 			ctx.ui.notify("An answer is required.", "warning");
 			response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
 		}
 		if (response.cancelled) return cancelledDetails(request, answers);
-		if (response.answer) {
-			const candidate = [...answers, response.answer];
-			const sizeError = getAskMeTranscriptSizeError({ ...request, status: "submitted", answers: candidate })
-				?? getAskMeTranscriptSizeError({ ...request, status: "cancelled", answers: candidate });
-			if (sizeError) throw new Error(sizeError);
-			answers.push(response.answer);
+		if (response.answer) answers.push(response.answer);
+	}
+
+	let overallResponse: string | undefined;
+	if (request.displayType === "questionnaire") {
+		const response = await ctx.ui.input(
+			"Overall response",
+			"Optionally answer the whole questionnaire at once",
+			signal ? { signal } : undefined,
+		);
+		if (signal?.aborted || response === undefined) return cancelledDetails(request, answers);
+		overallResponse = response.trim() || undefined;
+	}
+
+	if (!overallResponse) {
+		for (let index = 0; index < request.questions.length; index++) {
+			const question = request.questions[index]!;
+			if (!question.required || answers.some((answer) => answer.id === question.id)) continue;
+			ctx.ui.notify("Answer this required question or provide an Overall response.", "warning");
+			let response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
+			while (!response.cancelled && !response.answer) {
+				response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
+			}
+			if (response.cancelled) return cancelledDetails(request, answers);
+			if (response.answer) answers.push(response.answer);
 		}
 	}
-	return { ...request, status: "submitted", answers };
+
+	return {
+		...request,
+		status: "submitted",
+		answers,
+		...(overallResponse ? { overallResponse } : {}),
+	};
 }
 
 async function runTuiQuestionnaire(
@@ -239,12 +273,43 @@ export default function askMe(pi: ExtensionAPI): void {
 						? "cancelled"
 						: "done";
 			const header = context.state.header;
-			header?.setText(headerText(theme, displayType, status));
+			header?.setText(headerText(
+				theme,
+				displayType,
+				status,
+				details ? { answered: details.answers.length, total: details.questions.length } : undefined,
+			));
 			if (options.isPartial) return new Text("", 0, 0);
+			if (!details) return new Text("ask_me produced no result", 0, 0);
 
-			const content = result.content.find((item) => item.type === "text");
-			const transcript = content?.type === "text" ? content.text : "ask_me produced no result";
-			return new Text(transcript, 0, 0);
+			const answerById = new Map(details.answers.map((answer) => [answer.id, answer]));
+			const state = details.status === "submitted"
+				? `The user submitted ${details.answers.length} answer${details.answers.length === 1 ? "" : "s"} for ${details.questions.length} question${details.questions.length === 1 ? "" : "s"}.`
+				: `The user cancelled after answering ${details.answers.length} of ${details.questions.length} questions.`;
+			const lines = [details.title ?? "Questions", state, ""];
+			for (let index = 0; index < details.questions.length; index++) {
+				const question = details.questions[index]!;
+				const answer = answerById.get(question.id);
+				lines.push(theme.fg("toolTitle", theme.bold(`? Question ${index + 1}:`)), question.question);
+				if (question.detail) lines.push(theme.fg("muted", question.detail));
+				lines.push("", theme.fg("toolTitle", theme.bold("↳ Answer:")));
+				lines.push(answer
+					? `${theme.fg("success", "✓")} ${answer.label}`
+					: `${theme.fg("dim", "○")} Not answered`);
+				const answerDescription = getAskMeAnswerDescription(question, answer);
+				if (answerDescription) lines.push(theme.fg("muted", answerDescription));
+				if (answer?.source === "recommended" && question.recommendation) {
+					lines.push(theme.fg("muted", `Used recommendation: ${question.recommendation.reason}`));
+				}
+				lines.push("");
+			}
+			if (details.displayType === "questionnaire") {
+				lines.push(theme.fg("toolTitle", theme.bold("≡ Overall response:")));
+				lines.push(details.overallResponse
+					? `${theme.fg("success", "✓")} ${details.overallResponse}`
+					: `${theme.fg("dim", "○")} Not answered`);
+			}
+			return new Text(lines.join("\n").trimEnd(), 0, 0);
 		},
 	}));
 }

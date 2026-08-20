@@ -31,6 +31,7 @@ export class AskMeQuestionnaire implements Focusable {
 	private readonly recommendationPrimed = new Set<string>();
 	private readonly editor: Editor;
 	private currentIndex = 0;
+	private overallResponse: string | undefined;
 	private customInput = false;
 	private validationMessage: string | undefined;
 	private cachedWidth: number | undefined;
@@ -76,6 +77,9 @@ export class AskMeQuestionnaire implements Focusable {
 	}
 
 	cancel(): void {
+		if (!this.currentQuestion() && this.request.displayType === "questionnaire") {
+			this.overallResponse = this.editor.getText().trim() || undefined;
+		}
 		this.finish(this.result("cancelled"));
 	}
 
@@ -86,6 +90,7 @@ export class AskMeQuestionnaire implements Focusable {
 			answers: this.request.questions
 				.map((question) => this.answers.get(question.id))
 				.filter((answer): answer is AskMeAnswer => answer !== undefined),
+			...(this.overallResponse ? { overallResponse: this.overallResponse } : {}),
 		};
 	}
 
@@ -113,7 +118,11 @@ export class AskMeQuestionnaire implements Focusable {
 
 	private loadCurrentEditor(): void {
 		const question = this.currentQuestion();
-		if (!question || question.type !== "question") {
+		if (!question) {
+			this.editor.setText(this.request.displayType === "questionnaire" ? this.overallResponse ?? "" : "");
+			return;
+		}
+		if (question.type !== "question") {
 			this.editor.setText("");
 			return;
 		}
@@ -138,7 +147,7 @@ export class AskMeQuestionnaire implements Focusable {
 		const value = this.editor.getText().trim();
 		if (!value) {
 			this.answers.delete(question.id);
-			if (question.required) {
+			if (question.required && this.request.displayType !== "questionnaire") {
 				this.validationMessage = "An answer is required.";
 				return false;
 			}
@@ -158,7 +167,14 @@ export class AskMeQuestionnaire implements Focusable {
 				this.refresh();
 				return;
 			}
-			if (!hasDraft) this.saveTextAnswer(current);
+			if (!hasDraft) {
+				this.answers.delete(current.id);
+				if (this.request.displayType !== "questionnaire" && current.required) {
+					this.validationMessage = "An answer is required.";
+					this.refresh();
+					return;
+				}
+			}
 		}
 		if (current && this.customInput) {
 			const value = this.editor.getText().trim();
@@ -258,9 +274,16 @@ export class AskMeQuestionnaire implements Focusable {
 		return this.request.questions.every((question) => !question.required || this.answers.has(question.id));
 	}
 
+	private canSubmit(): boolean {
+		return this.allRequiredAnswered() || Boolean(this.overallResponse);
+	}
+
 	private submitAll(): void {
-		if (!this.allRequiredAnswered()) {
-			this.validationMessage = "Answer every required question before submitting.";
+		if (this.request.displayType === "questionnaire") {
+			this.overallResponse = this.editor.getText().trim() || undefined;
+		}
+		if (!this.canSubmit()) {
+			this.validationMessage = "Answer every required question or provide an Overall response.";
 			this.refresh();
 			return;
 		}
@@ -289,8 +312,14 @@ export class AskMeQuestionnaire implements Focusable {
 
 		const question = this.currentQuestion();
 		if (!question) {
-			if (this.keybindings.matches(data, "tui.select.confirm")) this.submitAll();
-			else if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) this.retreat();
+			if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) {
+				this.overallResponse = this.editor.getText().trim() || undefined;
+				this.retreat();
+			} else if (this.keybindings.matches(data, "tui.input.submit") && !this.keybindings.matches(data, "tui.input.newLine")) {
+				this.submitAll();
+			} else if (this.request.displayType === "questionnaire") {
+				this.editor.handleInput(data);
+			}
 			return;
 		}
 
@@ -388,9 +417,17 @@ export class AskMeQuestionnaire implements Focusable {
 				add(`${this.theme.fg(answer ? "success" : "warning", `A${index + 1}.`)} ${answer?.label ?? "(not answered)"}`);
 				lines.push("");
 			}
-			add(this.allRequiredAnswered()
+			if (this.request.displayType === "questionnaire") {
+				add(this.theme.bold("Overall response"));
+				add(this.theme.fg("muted", "Optionally answer the whole questionnaire at once."));
+				for (const line of this.editor.render(Math.max(1, renderWidth - 1))) {
+					lines.push(renderWidth > 1 ? ` ${line}` : truncateToWidth(line, renderWidth, ""));
+				}
+				lines.push("");
+			}
+			add(this.canSubmit()
 				? this.theme.fg("success", "Press Enter to submit all answers.")
-				: this.theme.fg("warning", "Some required questions are unanswered."));
+				: this.theme.fg("warning", "Answer required questions or provide an Overall response."));
 		} else {
 			add(this.theme.bold(question.question));
 			if (question.detail) add(this.theme.fg("muted", question.detail));

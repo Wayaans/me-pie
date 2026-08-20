@@ -86,6 +86,7 @@ export interface AskMeAnswer {
 export interface AskMeDetails extends AskMeRequest {
 	status: AskMeStatus;
 	answers: AskMeAnswer[];
+	overallResponse?: string;
 }
 
 function nonEmpty(value: string, field: string): string {
@@ -180,6 +181,14 @@ export function normalizeAskMeRequest(input: AskMeParamsInput): AskMeRequest {
 	};
 }
 
+export function getAskMeAnswerDescription(
+	question: AskMeQuestion,
+	answer: AskMeAnswer | undefined,
+): string | undefined {
+	if (!answer) return undefined;
+	return question.options.find((option) => option.value === answer.value)?.description;
+}
+
 export function formatAskMeTranscript(details: AskMeDetails): string {
 	const answerById = new Map(details.answers.map((answer) => [answer.id, answer]));
 	const heading = details.status === "submitted"
@@ -192,13 +201,23 @@ export function formatAskMeTranscript(details: AskMeDetails): string {
 	for (let index = 0; index < details.questions.length; index++) {
 		const question = details.questions[index]!;
 		const answer = answerById.get(question.id);
-		lines.push(`Q${index + 1}. ${question.question}`);
-		if (question.detail) lines.push(`    ${question.detail}`);
-		lines.push(`A${index + 1}. ${answer?.label || "(not answered)"}`);
+		lines.push(`? Question ${index + 1}:`);
+		lines.push(question.question);
+		if (question.detail) lines.push(question.detail);
+		lines.push("");
+		lines.push("↳ Answer:");
+		lines.push(answer?.label ?? "Not answered");
+		const answerDescription = getAskMeAnswerDescription(question, answer);
+		if (answerDescription) lines.push(answerDescription);
 		if (answer?.source === "recommended" && question.recommendation) {
-			lines.push(`    Used recommendation: ${question.recommendation.reason}`);
+			lines.push(`Used recommendation: ${question.recommendation.reason}`);
 		}
 		lines.push("");
+	}
+
+	if (details.displayType === "questionnaire") {
+		lines.push("≡ Overall response:");
+		lines.push(details.overallResponse ?? "Not answered");
 	}
 
 	return lines.join("\n").trimEnd();

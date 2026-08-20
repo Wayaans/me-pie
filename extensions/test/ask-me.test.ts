@@ -78,11 +78,12 @@ test("ask-me transcript permanently includes every submitted question and answer
 	};
 	const transcript = formatAskMeTranscript(details);
 	assert.match(transcript, /^Interview: Deployment choices/);
-	assert.match(transcript, /Q1\. Which database should the project use\?/);
-	assert.match(transcript, /A1\. PostgreSQL/);
+	assert.match(transcript, /\? Question 1:\nWhich database should the project use\?/);
+	assert.match(transcript, /↳ Answer:\nPostgreSQL\nSupports concurrent writes\./);
 	assert.match(transcript, /Used recommendation: Production requires concurrent writes\./);
-	assert.match(transcript, /Q2\. Should migrations run during deployment\?/);
-	assert.match(transcript, /A2\. Yes/);
+	assert.match(transcript, /Question 2:\nShould migrations run during deployment\?/);
+	assert.match(transcript, /↳ Answer:\nYes/);
+	assert.match(transcript, /≡ Overall response:\nNot answered$/);
 });
 
 test("ask-me cancellation prints partial and unanswered results without inferring answers", () => {
@@ -94,7 +95,8 @@ test("ask-me cancellation prints partial and unanswered results without inferrin
 	});
 	assert.match(transcript, /cancelled after answering 1 of 2/);
 	assert.match(transcript, /Do not infer answers/);
-	assert.match(transcript, /A2\. \(not answered\)/);
+	assert.match(transcript, /\? Question 2:[\s\S]*↳ Answer:\nNot answered/);
+	assert.match(transcript, /≡ Overall response:\nNot answered$/);
 });
 
 interface CapturedTool {
@@ -332,10 +334,10 @@ test("ask-me RPC exposes an explicit skip action for optional questions", async 
 	assert.equal(result.details.status, "submitted");
 	assert.equal(result.details.answers.length, 0);
 	assert.match(result.content[0]?.text ?? "", /submitted 0 answers for 1 question/);
-	assert.match(result.content[0]?.text ?? "", /A1\. \(not answered\)/);
+	assert.match(result.content[0]?.text ?? "", /Answer:\nNot answered/);
 });
 
-test("ask-me renderer updates its compact header and keeps answers visible while collapsed", () => {
+test("ask-me renderer shows the complete questionnaire result", () => {
 	const tool = captureTool();
 	assert.equal(tool.executionMode, "sequential");
 	assert.equal(tool.renderShell, undefined);
@@ -359,10 +361,12 @@ test("ask-me renderer updates its compact header and keeps answers visible while
 		plainTheme,
 		context,
 	);
-	assert.match(header.render(120).join("\n"), /ask-me · questionnaire · ✓ done/);
-	assert.match(result.render(120).join("\n"), /Interview: Deployment choices/);
-	assert.match(result.render(120).join("\n"), /Q1\. Which database/);
-	assert.match(result.render(120).join("\n"), /A2\. Yes/);
+	assert.match(header.render(120).join("\n"), /ask-me · questionnaire · ✓ 2 of 2 answered/);
+	assert.match(result.render(120).join("\n"), /Deployment choices/);
+	assert.match(result.render(120).join("\n"), /\? Question 1:[\s\S]*Which database/);
+	assert.match(result.render(120).join("\n"), /✓ PostgreSQL[\s\S]*Supports concurrent writes\./);
+	assert.match(result.render(120).join("\n"), /↳ Answer:[\s\S]*✓ Yes/);
+	assert.match(result.render(120).join("\n"), /≡ Overall response:[\s\S]*○ Not answered/);
 });
 
 test("ask-me fails clearly when interactive input is unavailable", async () => {
