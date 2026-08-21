@@ -1,5 +1,28 @@
 export type GitHubItemKind = "issue" | "pull-request";
 
+export function patchMarkdown(body: string, heading: string, operation: "append" | "replace" | "remove", content: string | undefined): string {
+	const name = heading.trim();
+	if (!name) throw new Error("section must be nonempty");
+	const normalizedContent = content?.trim();
+	if (operation !== "remove" && !normalizedContent) throw new Error(`${operation} requires nonempty content`);
+	const lines = body.split("\n");
+	const start = lines.findIndex((line) => /^##(?!#)\s+/.test(line) && line.replace(/^##\s+/, "").trim() === name);
+	const end = start < 0 ? -1 : lines.findIndex((line, index) => index > start && /^##(?!#)\s+/.test(line));
+	if (start < 0) {
+		if (operation === "remove" || operation === "replace") throw new Error(`section not found: ${name}`);
+		const suffix = body.length > 0 && !body.endsWith("\n") ? "\n" : "";
+		return `${body}${suffix}\n## ${name}\n${normalizedContent ?? ""}`;
+	}
+	const finish = end < 0 ? lines.length : end;
+	const existing = lines.slice(start + 1, finish).join("\n").trim();
+	if (operation === "remove") return [...lines.slice(0, start), ...lines.slice(finish)].join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+	const replacement = operation === "append"
+		? [existing, normalizedContent].filter(Boolean).join("\n\n")
+		: normalizedContent ?? "";
+	const separator = finish > start + 1 && lines[finish - 1] === "" ? [""] : [];
+	return [...lines.slice(0, start + 1), replacement, ...separator, ...lines.slice(finish)].join("\n");
+}
+
 export type GitHubIssueData = {
 	kind: GitHubItemKind;
 	number: number;
@@ -301,7 +324,7 @@ export function formatGitHubOverview(issue: GitHubIssueData, pullRequest?: GitHu
 		`Labels: ${formatList(issue.labels)}`,
 		`Assignees: ${formatList(issue.assignees)}`,
 		`Milestone: ${issue.milestone ? boundedSingleLine(issue.milestone) : "none"}`,
-		`General comments: ${issue.commentCount} (omitted; use github_comments)`,
+		`General comments: ${issue.commentCount} (omitted; use github command=comment action=list)`, 
 	];
 
 	if (pullRequest) {
