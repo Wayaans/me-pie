@@ -1,8 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { homedir } from "node:os";
+import {
+	initTheme,
+	type AgentToolResult,
+	type ExtensionAPI,
+	type Theme,
+	type ToolDefinition,
+	type ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import { installNotifications, makeBinaryInitializers } from "../file-search/index.ts";
+import type { Component } from "@earendil-works/pi-tui";
+import fileSearchTools, {
+	installNotifications,
+	makeBinaryInitializers,
+} from "../file-search/index.ts";
 import {
 	FD_DEFAULT_LIMIT,
 	buildFdArgs,
@@ -146,4 +158,101 @@ test("large output is truncated and its complete form is persisted", async () =>
 	assert.equal(formatted.truncated, true);
 	assert.match(formatted.text, /2000 of 3000 lines/);
 	assert.equal(formatted.fullOutputPath, "/tmp/mepie-search/output.txt");
+});
+
+interface RenderedSearchTool {
+	readonly name: string;
+	readonly renderShell?: "default" | "self";
+	renderCall(args: unknown, theme: Theme, context: unknown): Component;
+	renderResult(
+		result: AgentToolResult<unknown>,
+		options: ToolRenderResultOptions,
+		theme: Theme,
+		context: unknown,
+	): Component;
+}
+
+function registeredSearchTools(): Map<string, RenderedSearchTool> {
+	const tools = new Map<string, RenderedSearchTool>();
+	const pi = {
+		on() {},
+		registerTool(tool: ToolDefinition) {
+			tools.set(tool.name, tool as unknown as RenderedSearchTool);
+		},
+	};
+	fileSearchTools(pi as unknown as ExtensionAPI);
+	return tools;
+}
+
+function renderCompletedSearch(
+	tool: RenderedSearchTool,
+	args: unknown,
+	result: AgentToolResult<unknown>,
+	expanded = false,
+): { readonly call: string; readonly result: string } {
+	const context = {
+		args,
+		toolCallId: "search-1",
+		invalidate() {},
+		lastComponent: undefined,
+		state: {},
+		cwd: process.cwd(),
+		executionStarted: true,
+		argsComplete: true,
+		isPartial: false,
+		expanded,
+		showImages: true,
+		isError: false,
+	};
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as unknown as Theme;
+	const call = tool.renderCall(args, theme, context);
+	const renderedResult = tool.renderResult(
+		result,
+		{ expanded, isPartial: false },
+		theme,
+		context,
+	);
+	return {
+		call: call.render(120).join("\n").trim(),
+		result: renderedResult.render(120).join("\n").trim(),
+	};
+}
+
+initTheme();
+
+test("file-search uses the compact Mepie tool renderer", () => {
+	const tools = registeredSearchTools();
+	const fd = tools.get("fd");
+	const rg = tools.get("rg");
+	assert.ok(fd);
+	assert.ok(rg);
+	assert.equal(fd.renderShell, "self");
+	assert.equal(rg.renderShell, "self");
+
+	const fdResult = renderCompletedSearch(
+		fd,
+		{ pattern: "*.ts", path: "src" },
+		{
+			content: [{ type: "text", text: "src/a.ts\nsrc/b.ts" }],
+			details: { binarySource: "system", matchCount: 2, truncated: false },
+		},
+	);
+	assert.equal(fdResult.call, "Fd *.ts in src · 2 entries");
+	assert.equal(fdResult.result, "");
+
+	const rgResult = renderCompletedSearch(
+		rg,
+		{ pattern: "renderCall", path: "extensions", glob: "*.ts" },
+		{
+			content: [{ type: "text", text: "a.ts:1:renderCall\nb.ts:2:renderCall" }],
+			details: { binarySource: "system", outputLines: 2, truncated: true },
+		},
+		true,
+	);
+	assert.equal(rgResult.call, "Rg /renderCall/ in extensions · *.ts · 2 lines · truncated");
+	assert.match(rgResult.result, /a\.ts:1:renderCall/);
+	assert.match(rgResult.result, /b\.ts:2:renderCall/);
 });

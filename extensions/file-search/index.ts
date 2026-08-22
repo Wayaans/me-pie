@@ -16,10 +16,10 @@ import type {
   AgentToolResult,
   ExtensionAPI,
   ExtensionContext,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { Cause, Data, Effect, Exit } from "effect";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   buildFdArgs,
@@ -52,6 +52,12 @@ import {
   RG_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
 import { discardCapturedOutput, executeSearchProcess } from "./src/process.ts";
+import {
+  resultText,
+  withMepieToolUi,
+  type SummaryPart,
+  type ToolView,
+} from "../mepie-tool-ui/tool-renderer.ts";
 
 export function makeBinaryInitializers(
   binDir: string,
@@ -209,7 +215,10 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     );
   }
 
-  pi.registerTool<ReturnType<typeof fdParameters>, FdToolDetails>({
+  const fdDefinition: ToolDefinition<
+    ReturnType<typeof fdParameters>,
+    FdToolDetails
+  > = {
     name: "fd",
     label: "Find Files",
     description: FD_TOOL_DESCRIPTION,
@@ -248,39 +257,13 @@ export default function fileSearchTools(pi: ExtensionAPI) {
       return unwrapToolExit(exit, "fd");
     },
 
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("fd "));
-      text += theme.fg("accent", args.pattern ? `"${args.pattern}"` : "(all)");
-      if (args.path) text += theme.fg("muted", ` in ${args.path}`);
-      const flags = [
-        args.type && `type=${args.type}`,
-        args.extension && `ext=${args.extension}`,
-        args.glob && "glob",
-        args.hidden && "hidden",
-        args.max_depth !== undefined && `depth≤${args.max_depth}`,
-      ].filter((flag): flag is string => typeof flag === "string");
-      if (flags.length > 0) text += " " + theme.fg("dim", flags.join(" "));
-      return new Text(text, 0, 0);
-    },
+  };
+  pi.registerTool(withMepieToolUi(fdDefinition, fdView));
 
-    renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Searching..."), 0, 0);
-      const details = result.details;
-      if (!details || details.matchCount === 0) {
-        return new Text(theme.fg("dim", "No files found"), 0, 0);
-      }
-      let text = theme.fg(
-        "success",
-        `${details.matchCount} ${details.matchCount === 1 ? "entry" : "entries"}`,
-      );
-      if (details.truncated) text += theme.fg("warning", " (truncated)");
-      if (expanded)
-        text += expandedPreview(result, details.fullOutputPath, theme);
-      return new Text(text, 0, 0);
-    },
-  });
-
-  pi.registerTool<ReturnType<typeof rgParameters>, RgToolDetails>({
+  const rgDefinition: ToolDefinition<
+    ReturnType<typeof rgParameters>,
+    RgToolDetails
+  > = {
     name: "rg",
     label: "Search Content",
     description: RG_TOOL_DESCRIPTION,
@@ -319,66 +302,50 @@ export default function fileSearchTools(pi: ExtensionAPI) {
       return unwrapToolExit(exit, "rg");
     },
 
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("rg "));
-      text += theme.fg("accent", `"${args.pattern}"`);
-      if (args.path) text += theme.fg("muted", ` in ${args.path}`);
-      const flags = [
-        args.glob && `glob=${args.glob}`,
-        args.file_type && `type=${args.file_type}`,
-        args.fixed_strings && "literal",
-        args.hidden && "hidden",
-        args.context !== undefined && `ctx=${args.context}`,
-      ].filter((flag): flag is string => typeof flag === "string");
-      if (flags.length > 0) text += " " + theme.fg("dim", flags.join(" "));
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Searching..."), 0, 0);
-      const details = result.details;
-      if (!details || details.outputLines === 0) {
-        return new Text(theme.fg("dim", "No matches found"), 0, 0);
-      }
-      let text = theme.fg(
-        "success",
-        `${details.outputLines} output ${details.outputLines === 1 ? "line" : "lines"}`,
-      );
-      if (details.truncated) text += theme.fg("warning", " (truncated)");
-      if (expanded)
-        text += expandedPreview(result, details.fullOutputPath, theme);
-      return new Text(text, 0, 0);
-    },
-  });
+  };
+  pi.registerTool(withMepieToolUi(rgDefinition, rgView));
 }
 
-const PREVIEW_LINES = 20;
-
-interface ThemeLike {
-  fg(color: string, text: string): string;
-}
-
-function expandedPreview(
-  result: { content: { type: string; text?: string }[] },
-  fullOutputPath: string | undefined,
-  theme: ThemeLike,
-) {
-  let text = "";
-  const content = result.content[0];
-  if (content?.type === "text" && content.text) {
-    const lines = content.text.split("\n");
-    for (const line of lines.slice(0, PREVIEW_LINES)) {
-      text += `\n${theme.fg("dim", line)}`;
+const fdView: ToolView<Static<ReturnType<typeof fdParameters>>, FdToolDetails> = {
+  label: "Fd",
+  targetTruncation: "end",
+  target: (args) => `${args.pattern || "(all)"} in ${args.path || "."}`,
+  summary(_args, result) {
+    const details = result.details;
+    const count = details?.matchCount ?? 0;
+    const parts: SummaryPart[] = [
+      { text: `${count} ${count === 1 ? "entry" : "entries"}` },
+    ];
+    if (details?.truncated) {
+      parts.push({ text: "truncated", color: "warning" });
     }
-    if (lines.length > PREVIEW_LINES) {
-      text += `\n${theme.fg("muted", `... ${lines.length - PREVIEW_LINES} more lines`)}`;
+    return parts;
+  },
+  expanded(_args, result, theme) {
+    return resultText(result, theme);
+  },
+};
+
+const rgView: ToolView<Static<ReturnType<typeof rgParameters>>, RgToolDetails> = {
+  label: "Rg",
+  targetTruncation: "end",
+  target: (args) => `/${args.pattern}/ in ${args.path || "."}`,
+  summary(args, result) {
+    const details = result.details;
+    const count = details?.outputLines ?? 0;
+    const parts: SummaryPart[] = [];
+    if (args.glob) parts.push({ text: args.glob });
+    if (args.file_type) parts.push({ text: args.file_type });
+    parts.push({ text: `${count} ${count === 1 ? "line" : "lines"}` });
+    if (details?.truncated) {
+      parts.push({ text: "truncated", color: "warning" });
     }
-  }
-  if (fullOutputPath) {
-    text += `\n${theme.fg("dim", `Full output: ${fullOutputPath}`)}`;
-  }
-  return text;
-}
+    return parts;
+  },
+  expanded(_args, result, theme) {
+    return resultText(result, theme);
+  },
+};
 
 function fdParameters() {
   return Type.Object({
