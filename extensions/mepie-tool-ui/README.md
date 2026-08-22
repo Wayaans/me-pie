@@ -22,4 +22,6 @@ Edit extensions/mepie-tool-ui/tools.ts · failed
 ╰─ oldText did not match exactly. Re-read the file and retry.
 ```
 
+Thinking text also uses the active theme's `dim` color. Pi's italic style remains unchanged, and the extension does not add bold styling.
+
 The extension affects TUI presentation only. Tool inputs, outputs, execution semantics, and model context remain unchanged.

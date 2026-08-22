@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	initTheme,
+	Theme,
 	type AgentToolResult,
 	type ExtensionAPI,
-	type Theme,
 	type ToolDefinition,
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
@@ -36,6 +36,7 @@ function registeredTools(): Map<string, RegisteredTool> {
 		registerTool(tool: ToolDefinition) {
 			tools.set(tool.name, tool as unknown as RegisteredTool);
 		},
+		on() {},
 	};
 	mepieToolUi(pi as unknown as ExtensionAPI);
 	return tools;
@@ -90,6 +91,45 @@ function renderCompleted(
 		result: renderedResult.render(width).join("\n").trim(),
 	};
 }
+
+test("thinking text uses the dim theme color without changing font styles", async () => {
+	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
+	const handlers = new Map<string, EventHandler>();
+	const originalForeground = Theme.prototype.fg;
+	const originalBold = Theme.prototype.bold;
+	const originalItalic = Theme.prototype.italic;
+	const observedColors: string[] = [];
+	const foregroundSpy = (color: string, text: string) => {
+		observedColors.push(color);
+		return text;
+	};
+	Theme.prototype.fg = foregroundSpy;
+
+	try {
+		const pi = {
+			registerTool() {},
+			on(event: string, handler: EventHandler) {
+				handlers.set(event, handler);
+			},
+		};
+		mepieToolUi(pi as unknown as ExtensionAPI);
+
+		const start = handlers.get("session_start");
+		const shutdown = handlers.get("session_shutdown");
+		assert.ok(start);
+		assert.ok(shutdown);
+		await start({}, { mode: "tui" });
+		Theme.prototype.fg("thinkingText", "thinking");
+		assert.deepEqual(observedColors, ["dim"]);
+		assert.equal(Theme.prototype.bold, originalBold);
+		assert.equal(Theme.prototype.italic, originalItalic);
+
+		await shutdown({}, { mode: "tui" });
+		assert.equal(Theme.prototype.fg, foregroundSpy);
+	} finally {
+		Theme.prototype.fg = originalForeground;
+	}
+});
 
 test("mepie-tool-ui overrides every built-in tool with a self-rendered shell", () => {
 	const tools = registeredTools();
