@@ -54,6 +54,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `pi-github` — typed GitHub repository, issue, pull request, comment, and relation operations plus autocomplete.
 - `localize` — translate and refine prompts into English before submission.
 - `mepie-ui` — add a theme-aware PI header and model, context, cost, and Git dashboard.
+- `mepie-tool-ui`: render built-in tools as compact, state-colored conversation rows with expandable output.
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
 - `terminal-environment` — expose one tmux-backed `workspace` tool for raw target operations and managed Agent Runs / Work Cycles.
 
