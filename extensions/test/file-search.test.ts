@@ -280,7 +280,7 @@ test("file-search uses the compact Mepie tool renderer", () => {
 			details: { binarySource: "system", matchCount: 2, truncated: false },
 		},
 	);
-	assert.equal(fdResult.call, "Fd *.ts in src · 2 entries");
+	assert.equal(fdResult.call, "󰈞 Fd *.ts in src · 2 entries");
 	assert.equal(fdResult.result, "");
 
 	const rgResult = renderCompletedSearch(
@@ -292,7 +292,7 @@ test("file-search uses the compact Mepie tool renderer", () => {
 		},
 		true,
 	);
-	assert.equal(rgResult.call, "Rg /renderCall/ in extensions · *.ts · 2 lines · truncated");
+	assert.equal(rgResult.call, "󰍉 Rg /renderCall/ in extensions · *.ts · 2 lines · truncated");
 	assert.match(rgResult.result, /a\.ts:1:renderCall/);
 	assert.match(rgResult.result, /b\.ts:2:renderCall/);
 
@@ -313,7 +313,7 @@ test("file-search uses the compact Mepie tool renderer", () => {
 	);
 	assert.equal(
 		styledRgResult.call,
-		"<toolTitle><b>Rg</b></toolTitle> <muted>/renderCall/ in extensions</muted>" +
+		"<text>󰍉</text> <toolTitle><b>Rg</b></toolTitle> <muted>/renderCall/ in extensions</muted>" +
 			"<dim> · </dim><muted>*.ts</muted><dim> · </dim><success>2 lines</success>" +
 			"<dim> · </dim><warning>truncated</warning>",
 	);

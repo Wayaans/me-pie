@@ -59,6 +59,7 @@ import {
   type SummaryPart,
   type ToolView,
 } from "../mepie-tool-ui/tool-renderer.ts";
+import { TOOL_ICONS } from "../mepie-tool-ui/tool-icons.ts";
 
 export function makeBinaryInitializers(
   binDir: string,
@@ -310,6 +311,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
 }
 
 const fdView: ToolView<Static<ReturnType<typeof fdParameters>>, FdToolDetails> = {
+  icon: TOOL_ICONS.files,
   label: "Fd",
   targetTruncation: "end",
   target: (args) => `${args.pattern || "(all)"} in ${args.path || "."}`,
@@ -330,6 +332,7 @@ const fdView: ToolView<Static<ReturnType<typeof fdParameters>>, FdToolDetails> =
 };
 
 const rgView: ToolView<Static<ReturnType<typeof rgParameters>>, RgToolDetails> = {
+  icon: TOOL_ICONS.search,
   label: "Rg",
   targetTruncation: "end",
   target: (args) => `/${args.pattern}/ in ${args.path || "."}`,

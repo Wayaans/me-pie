@@ -38,6 +38,7 @@ import {
 	type SummaryPart,
 	type ToolView,
 } from "./tool-renderer.ts";
+import { TOOL_ICONS } from "./tool-icons.ts";
 
 export function registerMepieToolUi(pi: ExtensionAPI, cwd: string): void {
 	pi.registerTool(withMepieToolUi(createReadToolDefinition(cwd), readView));
@@ -50,6 +51,7 @@ export function registerMepieToolUi(pi: ExtensionAPI, cwd: string): void {
 }
 
 const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
+	icon: TOOL_ICONS.read,
 	label: "Read",
 	compactCall(args, cwd, theme) {
 		const name = skillName(args.path, cwd);
@@ -82,6 +84,7 @@ const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 };
 
 const bashView: ToolView<BashToolInput, BashToolDetails | undefined> = {
+	icon: TOOL_ICONS.terminal,
 	label: "Bash",
 	targetTruncation: "end",
 	target: (args) => firstScriptLine(args.command),
@@ -111,6 +114,7 @@ const bashView: ToolView<BashToolInput, BashToolDetails | undefined> = {
 };
 
 const editView: ToolView<EditToolInput, EditToolDetails | undefined> = {
+	icon: TOOL_ICONS.edit,
 	label: "Edit",
 	target: (args, cwd) => displayPath(args.path, cwd),
 	summary(_args, result) {
@@ -128,6 +132,7 @@ const editView: ToolView<EditToolInput, EditToolDetails | undefined> = {
 };
 
 const writeView: ToolView<WriteToolInput, undefined> = {
+	icon: TOOL_ICONS.write,
 	label: "Write",
 	target: (args, cwd) => displayPath(args.path, cwd),
 	summary(args) {
@@ -143,6 +148,7 @@ const writeView: ToolView<WriteToolInput, undefined> = {
 };
 
 const grepView: ToolView<GrepToolInput, GrepToolDetails | undefined> = {
+	icon: TOOL_ICONS.search,
 	label: "Grep",
 	targetTruncation: "end",
 	target: (args, cwd) => `/${args.pattern}/ in ${displayPath(args.path ?? ".", cwd)}`,
@@ -163,6 +169,7 @@ const grepView: ToolView<GrepToolInput, GrepToolDetails | undefined> = {
 };
 
 const findView: ToolView<FindToolInput, FindToolDetails | undefined> = {
+	icon: TOOL_ICONS.files,
 	label: "Find",
 	targetTruncation: "end",
 	target: (args, cwd) => `${args.pattern} in ${displayPath(args.path ?? ".", cwd)}`,
@@ -182,6 +189,7 @@ const findView: ToolView<FindToolInput, FindToolDetails | undefined> = {
 };
 
 const listView: ToolView<LsToolInput, LsToolDetails | undefined> = {
+	icon: TOOL_ICONS.list,
 	label: "List",
 	target: (args, cwd) => displayPath(args.path ?? ".", cwd),
 	summary(_args, result) {

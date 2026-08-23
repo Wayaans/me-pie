@@ -17,6 +17,7 @@ export interface SummaryPart {
 }
 
 export interface ToolView<TArgs, TDetails> {
+	readonly icon: string;
 	readonly label: string;
 	readonly targetTruncation?: "end" | "middle";
 	compactCall?(args: TArgs, cwd: string, theme: Theme): Component | undefined;
@@ -45,6 +46,7 @@ interface ToolStateContext {
 }
 
 interface SummaryLineInput {
+	readonly icon: string;
 	readonly label: string;
 	readonly target: string;
 	readonly targetTruncation: "end" | "middle";
@@ -92,6 +94,7 @@ export function withMepieToolUi<
 				? context.lastComponent
 				: new SummaryLine();
 			line.update({
+				icon: view.icon,
 				label: view.label,
 				target: sanitizeInline(view.target(args, context.cwd)),
 				targetTruncation: view.targetTruncation ?? "middle",
@@ -190,14 +193,14 @@ class SummaryLine implements Component {
 	render(width: number): string[] {
 		if (!this.input || width <= 0) return [];
 		const contentWidth = insetContentWidth(width);
-		const { context, label, state, target, targetTruncation, theme } = this.input;
-		const labelText = theme.fg(toolTone(context), theme.bold(label));
+		const { context, icon, label, state, target, targetTruncation, theme } = this.input;
+		const heading = `${theme.fg("text", icon)} ${theme.fg(toolTone(context), theme.bold(label))}`;
 		const summary = summaryText(context, state.finalSummary, theme);
 		const targetPrefix = target ? " " : "";
-		const fixedWidth = visibleWidth(labelText) + visibleWidth(targetPrefix) + visibleWidth(summary);
+		const fixedWidth = visibleWidth(heading) + visibleWidth(targetPrefix) + visibleWidth(summary);
 		const targetWidth = Math.max(0, contentWidth - fixedWidth);
 		const fittedTarget = fitTarget(target, targetWidth, targetTruncation);
-		const line = `${labelText}${fittedTarget ? `${targetPrefix}${theme.fg("muted", fittedTarget)}` : ""}${summary}`;
+		const line = `${heading}${fittedTarget ? `${targetPrefix}${theme.fg("muted", fittedTarget)}` : ""}${summary}`;
 		return insetLines([truncateToWidth(line, contentWidth, "…")], width);
 	}
 

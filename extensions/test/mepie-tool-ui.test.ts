@@ -316,13 +316,13 @@ test("Mepie tool rows omit Pi's leading spacer without affecting other tools", a
 test("collapsed successful tools render one summary line and no result row", () => {
 	const tools = registeredTools();
 	const cases: readonly [string, unknown, AgentToolResult<unknown>, RegExp][] = [
-		["read", { path: "src/index.ts" }, { content: [{ type: "text", text: "one\ntwo\nthree" }], details: undefined }, /^Read src\/index\.ts · 3 lines$/],
-		["bash", { command: "bun run check" }, { content: [{ type: "text", text: "(no output)" }], details: undefined }, /^Bash bun run check · no output$/],
-		["edit", { path: "src/index.ts", edits: [] }, { content: [{ type: "text", text: "Updated" }], details: { diff: " context\n-old\n+new", patch: "" } }, /^Edit src\/index\.ts · \+1 −1$/],
-		["write", { path: "README.md", content: "a\nb" }, { content: [{ type: "text", text: "Wrote README.md" }], details: undefined }, /^Write README\.md · 2 lines · 3 B$/],
-		["grep", { pattern: "renderCall", path: "src" }, { content: [{ type: "text", text: "a.ts:1: renderCall\nb.ts:2: renderCall" }], details: undefined }, /^Grep \/renderCall\/ in src · 2 results$/],
-		["find", { pattern: "*.ts", path: "src" }, { content: [{ type: "text", text: "src/a.ts\nsrc/b.ts" }], details: undefined }, /^Find \*\.ts in src · 2 files$/],
-		["ls", { path: "src" }, { content: [{ type: "text", text: "a.ts\nb.ts" }], details: undefined }, /^List src · 2 entries$/],
+		["read", { path: "src/index.ts" }, { content: [{ type: "text", text: "one\ntwo\nthree" }], details: undefined }, /^󰈙 Read src\/index\.ts · 3 lines$/],
+		["bash", { command: "bun run check" }, { content: [{ type: "text", text: "(no output)" }], details: undefined }, /^ Bash bun run check · no output$/],
+		["edit", { path: "src/index.ts", edits: [] }, { content: [{ type: "text", text: "Updated" }], details: { diff: " context\n-old\n+new", patch: "" } }, /^󰏫 Edit src\/index\.ts · \+1 −1$/],
+		["write", { path: "README.md", content: "a\nb" }, { content: [{ type: "text", text: "Wrote README.md" }], details: undefined }, /^󰆓 Write README\.md · 2 lines · 3 B$/],
+		["grep", { pattern: "renderCall", path: "src" }, { content: [{ type: "text", text: "a.ts:1: renderCall\nb.ts:2: renderCall" }], details: undefined }, /^󰍉 Grep \/renderCall\/ in src · 2 results$/],
+		["find", { pattern: "*.ts", path: "src" }, { content: [{ type: "text", text: "src/a.ts\nsrc/b.ts" }], details: undefined }, /^󰈞 Find \*\.ts in src · 2 files$/],
+		["ls", { path: "src" }, { content: [{ type: "text", text: "a.ts\nb.ts" }], details: undefined }, /^󰉋 List src · 2 entries$/],
 	];
 
 	for (const [name, args, result, expected] of cases) {
@@ -363,7 +363,7 @@ test("collapsed Bash rows show only the first physical script line", () => {
 		{ command: "set -e\nbun test\nbun run check" },
 		{ content: [{ type: "text", text: "(no output)" }], details: undefined },
 	);
-	assert.equal(rendered.call, "Bash set -e · no output");
+	assert.equal(rendered.call, " Bash set -e · no output");
 });
 
 test("bash summaries do not count a trailing line terminator as output", () => {
@@ -374,7 +374,7 @@ test("bash summaries do not count a trailing line terminator as output", () => {
 			content: [{ type: "text", text: "done\n" }],
 			details: undefined,
 		}).call,
-		"Bash printf 'done\\n' · 1 line",
+		" Bash printf 'done\\n' · 1 line",
 	);
 });
 
@@ -389,14 +389,14 @@ test("empty find and list results report zero instead of counting status prose",
 			content: [{ type: "text", text: "No files found matching pattern" }],
 			details: undefined,
 		}).call,
-		"Find *.ts in . · 0 files",
+		"󰈞 Find *.ts in . · 0 files",
 	);
 	assert.equal(
 		renderCompleted(list, { path: "." }, {
 			content: [{ type: "text", text: "(empty directory)" }],
 			details: undefined,
 		}).call,
-		"List . · 0 entries",
+		"󰉋 List . · 0 entries",
 	);
 });
 
@@ -417,7 +417,7 @@ test("failed tools add one rounded error line while expanded failures show all r
 		plainTheme as unknown as Theme,
 		collapsedContext,
 	);
-	assert.equal(call.render(120).join("\n").trim(), "Edit src/index.ts · failed");
+	assert.equal(call.render(120).join("\n").trim(), "󰏫 Edit src/index.ts · failed");
 	assert.equal(collapsed.render(120).join("\n").trim(), "╰─ oldText did not match exactly. Re-read the file and retry.");
 
 	const expandedContext = renderContext(args, {}, { expanded: true, isError: true });
@@ -431,7 +431,7 @@ test("failed tools add one rounded error line while expanded failures show all r
 	assert.match(expanded, /oldText did not match exactly/);
 });
 
-test("tool label color uses the themed tool title for live and restored success states", () => {
+test("tool icons use text color while labels communicate execution state", () => {
 	const tool = registeredTools().get("bash");
 	assert.ok(tool);
 	const theme = {
@@ -449,6 +449,7 @@ test("tool label color uses the themed tool title for live and restored success 
 	for (const [overrides, color] of states) {
 		const context = renderContext(args, {}, overrides);
 		const output = tool.renderCall(args, theme, context).render(200).join("\n");
+		assert.match(output, /^ <text><\/text> /);
 		assert.match(output, new RegExp(`<${color}><b>Bash<\\/b><\\/${color}>`));
 	}
 });
@@ -473,7 +474,7 @@ test("completed rows use muted targets, success results, dim separators, and war
 	);
 	assert.equal(
 		rendered.call,
-		"<toolTitle><b>Read</b></toolTitle> <muted>src/index.ts</muted>" +
+		"<text>󰈙</text> <toolTitle><b>Read</b></toolTitle> <muted>src/index.ts</muted>" +
 			"<dim> · </dim><success>3 lines</success><dim> · </dim><warning>truncated</warning>",
 	);
 });

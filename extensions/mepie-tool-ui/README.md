@@ -11,15 +11,25 @@ Tool shells have no box or background. Each row uses the same one-column left an
 - the theme's tool-title color when complete
 - error when failed
 
-The target after the label uses `muted`. Completed result summaries use `success`, while truncation and result limits use `warning`. Diff summaries keep their added and removed colors. Separators use `dim`.
+Each built-in tool label starts with a Nerd Font icon in the theme's `text` color. The icon stays the same color while the bold tool name communicates execution state. The target after the label uses `muted`. Completed result summaries use `success`, while truncation and result limits use `warning`. Diff summaries keep their added and removed colors. Separators use `dim`.
+
+```text
+󰈙 Read package.json · 42 lines
+ Bash bun run check · no output
+󰏫 Edit extensions/mepie-tool-ui/tools.ts · +8 −3
+󰆓 Write README.md · 12 lines · 640 B
+󰍉 Grep /renderCall/ in extensions · 7 results
+󰈞 Find *.ts in extensions · 14 files
+󰉋 List extensions · 9 entries
+```
 
 The extension removes Pi's leading blank line from its tool rows. Adjacent tool calls therefore render without an empty line between them.
 
 Example:
 
 ```text
-Edit extensions/mepie-tool-ui/tools.ts · +8 −3
-Edit extensions/mepie-tool-ui/tools.ts · failed
+󰏫 Edit extensions/mepie-tool-ui/tools.ts · +8 −3
+󰏫 Edit extensions/mepie-tool-ui/tools.ts · failed
 ╰─ oldText did not match exactly. Re-read the file and retry.
 ```
 
