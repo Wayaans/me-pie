@@ -98,7 +98,7 @@ function renderCompleted(
 	};
 }
 
-test("thinking text uses normal color and weight while preserving its configured italic style and trailing spacer", async () => {
+test("thinking text includes the Nerd Font icon and uses normal color and weight while preserving italic style and trailing spacing", async () => {
 	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
 	const handlers = new Map<string, EventHandler>();
 	const originalForeground = Theme.prototype.fg;
@@ -158,6 +158,7 @@ test("thinking text uses normal color and weight while preserving its configured
 		};
 		const lines = new AssistantMessageComponent(message, false, markdownTheme).render(80);
 		const renderedThinking = lines.join("\n");
+		assert.match(renderedThinking, /󰧑/);
 		assert.match(renderedThinking, /<italic>Inspecting<\/italic>/);
 		assert.doesNotMatch(renderedThinking, /<bold>Inspecting<\/bold>/);
 		assert.equal(lines.at(-1), "");

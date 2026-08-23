@@ -2,6 +2,8 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AssistantMessageComponent, Theme, type ExtensionAPI, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 
+const THINKING_ICON = "󰧑";
+
 export function registerThinkingTextStyle(pi: ExtensionAPI): void {
 	let restore: (() => void) | undefined;
 
@@ -32,7 +34,7 @@ function useThinkingRendering(): () => void {
 		message: AssistantMessage,
 		isStreaming?: boolean,
 	): void {
-		Reflect.apply(originalUpdateContent, this, [message, isStreaming]);
+		Reflect.apply(originalUpdateContent, this, [withThinkingIcons(message), isStreaming]);
 		setRegularThinkingWeight(this);
 		if (!endsWithVisibleThinking(message)) return;
 
@@ -46,6 +48,23 @@ function useThinkingRendering(): () => void {
 		if (AssistantMessageComponent.prototype.updateContent === updateContentWithThinkingStyle) {
 			AssistantMessageComponent.prototype.updateContent = originalUpdateContent;
 		}
+	};
+}
+
+function withThinkingIcons(message: AssistantMessage): AssistantMessage {
+	let needsIcon = true;
+	return {
+		...message,
+		content: message.content.map((content) => {
+			if (content.type !== "thinking") {
+				needsIcon = true;
+				return content;
+			}
+			if (!needsIcon || !content.thinking.trim()) return content;
+
+			needsIcon = false;
+			return { ...content, thinking: `${THINKING_ICON} ${content.thinking}` };
+		}),
 	};
 }
 
