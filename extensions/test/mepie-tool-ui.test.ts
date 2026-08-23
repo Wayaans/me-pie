@@ -254,6 +254,26 @@ test("collapsed successful tools render one summary line and no result row", () 
 	}
 });
 
+test("collapsed skill reads use the Nerd Font skill label and semantic text colors", () => {
+	const read = registeredTools().get("read");
+	assert.ok(read);
+	const theme = {
+		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+		bold: (text: string) => text,
+	} as unknown as Theme;
+	const context = renderContext({ path: "/tmp/unslop/SKILL.md" }, {});
+	const line = read.renderCall(context.args, theme, context).render(200)[0];
+	assert.ok(line);
+	assert.ok(line.startsWith(" "));
+	assert.ok(line.endsWith(" "));
+	const rendered = line.trim();
+
+	assert.match(rendered, /^<muted>\[<\/muted><toolTitle><\/toolTitle><muted>\]<\/muted> /);
+	assert.match(rendered, /<text>unslop<\/text>/);
+	assert.match(rendered, /<muted> \(.*to expand\)<\/muted>$/);
+	assert.doesNotMatch(rendered, /Read|lines/);
+});
+
 test("collapsed Bash rows show only the first physical script line", () => {
 	const bash = registeredTools().get("bash");
 	assert.ok(bash);

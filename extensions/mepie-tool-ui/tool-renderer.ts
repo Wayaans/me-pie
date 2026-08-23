@@ -19,6 +19,7 @@ export interface SummaryPart {
 export interface ToolView<TArgs, TDetails> {
 	readonly label: string;
 	readonly targetTruncation?: "end" | "middle";
+	compactCall?(args: TArgs, cwd: string, theme: Theme): Component | undefined;
 	target(args: TArgs, cwd: string): string;
 	summary(args: TArgs, result: AgentToolResult<TDetails>): readonly SummaryPart[];
 	expanded(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
@@ -80,6 +81,13 @@ export function withMepieToolUi<
 		...definition,
 		renderShell: "self",
 		renderCall(args, theme, context) {
+			const compactCall = context.expanded ? undefined : view.compactCall?.(args, context.cwd, theme);
+			if (compactCall) {
+				const insetCall = new HorizontalInset(compactCall);
+				mepieToolCallComponents.add(insetCall);
+				return insetCall;
+			}
+
 			const line = context.lastComponent instanceof SummaryLine
 				? context.lastComponent
 				: new SummaryLine();

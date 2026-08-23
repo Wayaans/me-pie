@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, relative } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import {
 	createBashToolDefinition,
 	createEditToolDefinition,
@@ -10,6 +10,7 @@ import {
 	createWriteToolDefinition,
 	getLanguageFromPath,
 	highlightCode,
+	keyText,
 	renderDiff,
 	type BashToolDetails,
 	type BashToolInput,
@@ -50,6 +51,13 @@ export function registerMepieToolUi(pi: ExtensionAPI, cwd: string): void {
 
 const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 	label: "Read",
+	compactCall(args, cwd, theme) {
+		const name = skillName(args.path, cwd);
+		if (!name) return undefined;
+		const label = `${theme.fg("muted", "[")}${theme.fg("toolTitle", "")}${theme.fg("muted", "]")}`;
+		const hint = theme.fg("muted", ` (${keyText("app.tools.expand")} to expand)`);
+		return new Text(`${label} ${theme.fg("text", name)}${hint}`, 0, 0);
+	},
 	target: (args, cwd) => displayPath(args.path, cwd),
 	summary(args, result) {
 		if (result.content.some((item) => item.type === "image")) return [{ text: "image" }];
@@ -190,6 +198,13 @@ const listView: ToolView<LsToolInput, LsToolDetails | undefined> = {
 		return resultText(result, theme);
 	},
 };
+
+function skillName(path: string, cwd: string): string | undefined {
+	const normalizedPath = path.startsWith("@") ? path.slice(1) : path;
+	const absolutePath = isAbsolute(normalizedPath) ? normalizedPath : resolve(cwd, normalizedPath);
+	if (basename(absolutePath) !== "SKILL.md") return undefined;
+	return basename(dirname(absolutePath)) || "SKILL.md";
+}
 
 function displayPath(path: string, cwd: string): string {
 	if (!isAbsolute(path)) return path || ".";

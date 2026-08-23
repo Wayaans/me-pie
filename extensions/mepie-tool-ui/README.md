@@ -25,6 +25,14 @@ Edit extensions/mepie-tool-ui/tools.ts · failed
 
 Collapsed Bash rows show only the script's first physical line. Long first lines still truncate to the available width, while execution and expanded output remain unchanged.
 
+Collapsed reads of `SKILL.md` use the skill directory name instead of the file path:
+
+```text
+[] skill-name (ctrl+o to expand)
+```
+
+The brackets and shortcut use `muted`, the icon uses `toolTitle`, and the skill name uses `text`. Pi supplies the configured expansion shortcut. The `` glyph requires a Nerd Font.
+
 Thinking text uses the active theme's normal `text` color and has one blank line below it. The extension does not alter italic, bold, visibility, or other thinking presentation settings managed by Pi.
 
 The extension affects TUI presentation only. Tool inputs, outputs, execution semantics, and model context remain unchanged.
