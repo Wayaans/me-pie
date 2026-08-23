@@ -55,21 +55,39 @@ function useThinkingRendering(): () => void {
 }
 
 function withThinkingIcons(message: AssistantMessage): AssistantMessage {
-	let needsIcon = true;
-	return {
-		...message,
-		content: message.content.map((content) => {
-			if (content.type !== "thinking") {
-				needsIcon = true;
-				return content;
-			}
-			if (!needsIcon || !content.thinking.trim()) return content;
+	const content: AssistantMessage["content"] = [];
 
-			needsIcon = false;
-			if (content.thinking.trimStart().startsWith(THINKING_ICON)) return content;
-			return { ...content, thinking: `${THINKING_ICON} ${content.thinking}` };
-		}),
-	};
+	for (let index = 0; index < message.content.length; index += 1) {
+		const current = message.content[index];
+		if (!current || current.type !== "thinking") {
+			if (current) content.push(current);
+			continue;
+		}
+
+		const thinkingBlocks: string[] = [];
+		let firstVisibleBlock = current;
+		for (; index < message.content.length; index += 1) {
+			const block = message.content[index];
+			if (!block || block.type !== "thinking") break;
+			const thinking = block.thinking
+				.trim()
+				.replace(/\r\n?/g, "\n")
+				.replace(/\n[\t ]*\n+/g, "\n");
+			if (!thinking) continue;
+			if (thinkingBlocks.length === 0) firstVisibleBlock = block;
+			thinkingBlocks.push(thinking);
+		}
+		index -= 1;
+
+		if (thinkingBlocks.length === 0) continue;
+		const thinking = thinkingBlocks.join("\n");
+		content.push({
+			...firstVisibleBlock,
+			thinking: thinking.startsWith(THINKING_ICON) ? thinking : `${THINKING_ICON} ${thinking}`,
+		});
+	}
+
+	return { ...message, content };
 }
 
 function setRegularThinkingWeight(component: AssistantMessageComponent): void {

@@ -135,7 +135,8 @@ test("thinking text includes the Nerd Font icon and preserves its theme color, i
 		const message: AssistantMessage = {
 			role: "assistant",
 			content: [
-				{ type: "thinking", thinking: "**Inspecting** the files" },
+				{ type: "thinking", thinking: "**Inspecting** the files\n\nPlanning the change" },
+				{ type: "thinking", thinking: "Implementing the change" },
 				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "src/index.ts" } },
 			],
 			api: "openai-codex-responses",
@@ -162,6 +163,13 @@ test("thinking text includes the Nerd Font icon and preserves its theme color, i
 		assert.match(renderedThinking, /󰧑/);
 		assert.match(renderedThinking, /<italic>Inspecting<\/italic>/);
 		assert.doesNotMatch(renderedThinking, /<bold>Inspecting<\/bold>/);
+		const inspectingLine = lines.findIndex((line) => line.includes("Inspecting"));
+		const planningLine = lines.findIndex((line) => line.includes("Planning the change"));
+		const implementingLine = lines.findIndex((line) => line.includes("Implementing the change"));
+		assert.ok(inspectingLine >= 0);
+		assert.ok(planningLine > inspectingLine);
+		assert.ok(implementingLine > planningLine);
+		assert.equal(lines.slice(inspectingLine, implementingLine).some((line) => line.trim() === ""), false);
 		assert.equal(lines.at(-1), "");
 		assert.equal(lines.filter((line) => line === "").length, 2);
 
