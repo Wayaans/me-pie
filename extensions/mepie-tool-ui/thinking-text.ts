@@ -1,13 +1,11 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { AssistantMessageComponent, Theme, type ExtensionAPI, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 
 const THINKING_ICON = "󰧑";
 const THINKING_RENDER_PATCH = Symbol.for("mepie.tool-ui.thinking-render-patch");
-const THINKING_COLOR_PATCH = Symbol.for("mepie.tool-ui.thinking-color-patch");
 
 type AssistantUpdateContent = typeof AssistantMessageComponent.prototype.updateContent;
-type ThemeForeground = typeof Theme.prototype.fg;
 
 export function registerThinkingTextStyle(pi: ExtensionAPI): void {
 	let restore: (() => void) | undefined;
@@ -24,12 +22,7 @@ export function registerThinkingTextStyle(pi: ExtensionAPI): void {
 }
 
 function useThinkingTextStyle(): () => void {
-	const restoreColor = useNormalThinkingColor();
-	const restoreRendering = useThinkingRendering();
-	return () => {
-		restoreRendering();
-		restoreColor();
-	};
+	return useThinkingRendering();
 }
 
 function useThinkingRendering(): () => void {
@@ -45,7 +38,7 @@ function useThinkingRendering(): () => void {
 	): void {
 		Reflect.apply(originalUpdateContent, this, [withThinkingIcons(message), isStreaming]);
 		setRegularThinkingWeight(this);
-		if (!endsWithVisibleThinking(message)) return;
+		if (!needsTrailingSpacer(message)) return;
 
 		const contentContainer = this.children[0];
 		if (contentContainer instanceof Container) contentContainer.addChild(new Spacer(1));
@@ -106,33 +99,21 @@ function originalPatchedFunction<T extends object>(current: T, marker: symbol): 
 	return isRecord(patch) && typeof patch.original === "function" ? patch.original as T : current;
 }
 
-function endsWithVisibleThinking(message: AssistantMessage): boolean {
+function needsTrailingSpacer(message: AssistantMessage): boolean {
 	const hasToolCalls = message.content.some((content) => content.type === "toolCall");
 	const hasTrailingStatus = message.stopReason === "length"
 		|| (!hasToolCalls && (message.stopReason === "aborted" || message.stopReason === "error"));
 	if (hasTrailingStatus) return false;
 
+	let hasToolCallAfter = false;
 	for (let index = message.content.length - 1; index >= 0; index -= 1) {
 		const content = message.content[index];
-		if (content?.type === "text" && content.text.trim()) return false;
+		if (content?.type === "toolCall") {
+			hasToolCallAfter = true;
+			continue;
+		}
+		if (content?.type === "text" && content.text.trim()) return hasToolCallAfter;
 		if (content?.type === "thinking" && content.thinking.trim()) return true;
 	}
 	return false;
-}
-
-function useNormalThinkingColor(): () => void {
-	const currentForeground = Theme.prototype.fg;
-	const originalForeground = originalPatchedFunction<ThemeForeground>(currentForeground, THINKING_COLOR_PATCH);
-	const normalThinkingForeground = function (this: Theme, color: ThemeColor, text: string): string {
-		return originalForeground.call(this, color === "thinkingText" ? "text" : color, text);
-	};
-
-	Reflect.set(normalThinkingForeground, THINKING_COLOR_PATCH, { original: originalForeground });
-	Theme.prototype.fg = normalThinkingForeground;
-
-	return () => {
-		if (Theme.prototype.fg === normalThinkingForeground) {
-			Theme.prototype.fg = originalForeground;
-		}
-	};
 }

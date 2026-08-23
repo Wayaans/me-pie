@@ -33,7 +33,7 @@ Collapsed reads of `SKILL.md` use the skill directory name instead of the file p
 
 The brackets and shortcut use `muted`, the icon uses `toolTitle`, and the skill name uses `text`. Pi supplies the configured expansion shortcut. The `` glyph requires a Nerd Font.
 
-Visible thinking text starts with the `󰧑` glyph, uses the active theme's normal `text` color, and has one blank line below it. The extension does not alter italic, bold, visibility, or other thinking presentation settings managed by Pi. The glyph requires a Nerd Font.
+Visible thinking text starts with the `󰧑` glyph, uses the active theme's `thinkingText` color and regular weight, and has one blank line below it. Assistant text followed by a tool call also has one blank line below it. The extension preserves Pi's italic and visibility settings. The glyph requires a Nerd Font.
 
 ```text
 󰧑 I need to inspect the current implementation before proposing the change.

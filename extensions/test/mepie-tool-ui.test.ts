@@ -99,7 +99,7 @@ function renderCompleted(
 	};
 }
 
-test("thinking text includes the Nerd Font icon and uses normal color and weight while preserving italic style and trailing spacing", async () => {
+test("thinking text includes the Nerd Font icon and preserves its theme color, italic style, and trailing spacing", async () => {
 	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
 	const handlers = new Map<string, EventHandler>();
 	const originalForeground = Theme.prototype.fg;
@@ -128,7 +128,7 @@ test("thinking text includes the Nerd Font icon and uses normal color and weight
 		assert.ok(shutdown);
 		await start({}, { mode: "tui" });
 		Theme.prototype.fg("thinkingText", "thinking");
-		assert.deepEqual(observedColors, ["text"]);
+		assert.deepEqual(observedColors, ["thinkingText"]);
 		assert.equal(Theme.prototype.bold, originalBold);
 		assert.equal(Theme.prototype.italic, originalItalic);
 
@@ -170,8 +170,20 @@ test("thinking text includes the Nerd Font icon and uses normal color and weight
 			content: [{ type: "text", text: "**Final** answer" }],
 			stopReason: "stop",
 		};
-		const renderedAssistant = new AssistantMessageComponent(assistantMessage, false, markdownTheme).render(80).join("\n");
-		assert.match(renderedAssistant, /<bold>Final<\/bold>/);
+		const assistantLines = new AssistantMessageComponent(assistantMessage, false, markdownTheme).render(80);
+		assert.match(assistantLines.join("\n"), /<bold>Final<\/bold>/);
+		assert.notEqual(assistantLines.at(-1), "");
+
+		const commentaryMessage: AssistantMessage = {
+			...message,
+			content: [
+				{ type: "text", text: "Explaining the next edit" },
+				{ type: "toolCall", id: "tool-2", name: "edit", arguments: { path: "src/index.ts" } },
+			],
+		};
+		const commentaryLines = new AssistantMessageComponent(commentaryMessage, false, markdownTheme).render(80);
+		assert.equal(commentaryLines.at(-1), "");
+		assert.equal(commentaryLines.filter((line) => line === "").length, 2);
 
 		await shutdown({}, { mode: "tui" });
 		assert.equal(Theme.prototype.fg, foregroundSpy);
