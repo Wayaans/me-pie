@@ -3,6 +3,7 @@ import test from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	AssistantMessageComponent,
+	getMarkdownTheme,
 	initTheme,
 	Theme,
 	ToolExecutionComponent,
@@ -97,7 +98,7 @@ function renderCompleted(
 	};
 }
 
-test("thinking text uses the normal text color without changing font styles and has one trailing spacer", async () => {
+test("thinking text uses normal color and weight while preserving its configured italic style and trailing spacer", async () => {
 	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
 	const handlers = new Map<string, EventHandler>();
 	const originalForeground = Theme.prototype.fg;
@@ -133,7 +134,7 @@ test("thinking text uses the normal text color without changing font styles and 
 		const message: AssistantMessage = {
 			role: "assistant",
 			content: [
-				{ type: "thinking", thinking: "Inspecting the files" },
+				{ type: "thinking", thinking: "**Inspecting** the files" },
 				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "src/index.ts" } },
 			],
 			api: "openai-codex-responses",
@@ -150,9 +151,25 @@ test("thinking text uses the normal text color without changing font styles and 
 			stopReason: "toolUse",
 			timestamp: Date.now(),
 		};
-		const lines = new AssistantMessageComponent(message).render(80);
+		const markdownTheme = {
+			...getMarkdownTheme(),
+			bold: (text: string) => `<bold>${text}</bold>`,
+			italic: (text: string) => `<italic>${text}</italic>`,
+		};
+		const lines = new AssistantMessageComponent(message, false, markdownTheme).render(80);
+		const renderedThinking = lines.join("\n");
+		assert.match(renderedThinking, /<italic>Inspecting<\/italic>/);
+		assert.doesNotMatch(renderedThinking, /<bold>Inspecting<\/bold>/);
 		assert.equal(lines.at(-1), "");
 		assert.equal(lines.filter((line) => line === "").length, 2);
+
+		const assistantMessage: AssistantMessage = {
+			...message,
+			content: [{ type: "text", text: "**Final** answer" }],
+			stopReason: "stop",
+		};
+		const renderedAssistant = new AssistantMessageComponent(assistantMessage, false, markdownTheme).render(80).join("\n");
+		assert.match(renderedAssistant, /<bold>Final<\/bold>/);
 
 		await shutdown({}, { mode: "tui" });
 		assert.equal(Theme.prototype.fg, foregroundSpy);

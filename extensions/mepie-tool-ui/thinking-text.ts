@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AssistantMessageComponent, Theme, type ExtensionAPI, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 
 export function registerThinkingTextStyle(pi: ExtensionAPI): void {
 	let restore: (() => void) | undefined;
@@ -17,35 +17,58 @@ export function registerThinkingTextStyle(pi: ExtensionAPI): void {
 }
 
 function useThinkingTextStyle(): () => void {
-	const restoreColor = useNormalThinkingText();
-	const restoreSpacing = useThinkingBottomSpacing();
+	const restoreColor = useNormalThinkingColor();
+	const restoreRendering = useThinkingRendering();
 	return () => {
-		restoreSpacing();
+		restoreRendering();
 		restoreColor();
 	};
 }
 
-function useThinkingBottomSpacing(): () => void {
+function useThinkingRendering(): () => void {
 	const originalUpdateContent = AssistantMessageComponent.prototype.updateContent;
-	const updateContentWithSpacing = function (
+	const updateContentWithThinkingStyle = function (
 		this: AssistantMessageComponent,
 		message: AssistantMessage,
 		isStreaming?: boolean,
 	): void {
 		Reflect.apply(originalUpdateContent, this, [message, isStreaming]);
+		setRegularThinkingWeight(this);
 		if (!endsWithVisibleThinking(message)) return;
 
 		const contentContainer = this.children[0];
 		if (contentContainer instanceof Container) contentContainer.addChild(new Spacer(1));
 	};
 
-	AssistantMessageComponent.prototype.updateContent = updateContentWithSpacing;
+	AssistantMessageComponent.prototype.updateContent = updateContentWithThinkingStyle;
 
 	return () => {
-		if (AssistantMessageComponent.prototype.updateContent === updateContentWithSpacing) {
+		if (AssistantMessageComponent.prototype.updateContent === updateContentWithThinkingStyle) {
 			AssistantMessageComponent.prototype.updateContent = originalUpdateContent;
 		}
 	};
+}
+
+function setRegularThinkingWeight(component: AssistantMessageComponent): void {
+	const contentContainer = component.children[0];
+	if (!(contentContainer instanceof Container)) return;
+
+	for (const child of contentContainer.children) {
+		if (!(child instanceof Markdown)) continue;
+
+		const defaultTextStyle: unknown = Reflect.get(child, "defaultTextStyle");
+		if (!isRecord(defaultTextStyle) || typeof defaultTextStyle.color !== "function") continue;
+
+		const markdownTheme: unknown = Reflect.get(child, "theme");
+		if (!isRecord(markdownTheme) || typeof markdownTheme.bold !== "function") continue;
+
+		Reflect.set(child, "theme", { ...markdownTheme, bold: (text: string) => text });
+		child.invalidate();
+	}
+}
+
+function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
+	return typeof value === "object" && value !== null;
 }
 
 function endsWithVisibleThinking(message: AssistantMessage): boolean {
@@ -62,7 +85,7 @@ function endsWithVisibleThinking(message: AssistantMessage): boolean {
 	return false;
 }
 
-function useNormalThinkingText(): () => void {
+function useNormalThinkingColor(): () => void {
 	const originalForeground = Theme.prototype.fg;
 	const normalThinkingForeground = function (this: Theme, color: ThemeColor, text: string): string {
 		return originalForeground.call(this, color === "thinkingText" ? "text" : color, text);
