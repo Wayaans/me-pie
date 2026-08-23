@@ -5,3 +5,4 @@ coverage/
 .pi/settings.json
 .agents/
 .pi/skills/
+.pi/
