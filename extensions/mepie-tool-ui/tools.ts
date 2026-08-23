@@ -76,7 +76,7 @@ const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 const bashView: ToolView<BashToolInput, BashToolDetails | undefined> = {
 	label: "Bash",
 	targetTruncation: "end",
-	target: (args) => args.command,
+	target: (args) => firstScriptLine(args.command),
 	summary(_args, result) {
 		const text = textContent(result);
 		const hasOutput = text.trim() !== "" && text.trim() !== "(no output)";
@@ -140,7 +140,7 @@ const grepView: ToolView<GrepToolInput, GrepToolDetails | undefined> = {
 	target: (args, cwd) => `/${args.pattern}/ in ${displayPath(args.path ?? ".", cwd)}`,
 	summary(args, result) {
 		const parts: SummaryPart[] = [];
-		if (args.glob) parts.push({ text: args.glob });
+		if (args.glob) parts.push({ text: args.glob, color: "muted" });
 		const matches = grepMatchCount(textContent(result));
 		parts.push({ text: `${matches} ${plural(matches, "result")}` });
 		if (result.details?.matchLimitReached !== undefined) parts.push({ text: "limit reached", color: "warning" });
@@ -223,6 +223,10 @@ function diffStats(diff: string): { readonly additions: number; readonly removal
 
 function grepMatchCount(text: string): number {
 	return returnedLines(text).filter((line) => /^.+:\d+:/.test(line)).length;
+}
+
+function firstScriptLine(script: string): string {
+	return script.split(/\r\n?|\n/, 1)[0] ?? "";
 }
 
 function outputLineCount(text: string): number {

@@ -1,29 +1,77 @@
-import { Theme, type ExtensionAPI, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { AssistantMessageComponent, Theme, type ExtensionAPI, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Container, Spacer } from "@earendil-works/pi-tui";
 
 export function registerThinkingTextStyle(pi: ExtensionAPI): void {
-	let restoreTheme: (() => void) | undefined;
+	let restore: (() => void) | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
-		restoreTheme?.();
-		restoreTheme = ctx.mode === "tui" ? useDimThinkingText() : undefined;
+		restore?.();
+		restore = ctx.mode === "tui" ? useThinkingTextStyle() : undefined;
 	});
 
 	pi.on("session_shutdown", () => {
-		restoreTheme?.();
-		restoreTheme = undefined;
+		restore?.();
+		restore = undefined;
 	});
 }
 
-function useDimThinkingText(): () => void {
-	const originalForeground = Theme.prototype.fg;
-	const dimThinkingForeground = function (this: Theme, color: ThemeColor, text: string): string {
-		return originalForeground.call(this, color === "thinkingText" ? "dim" : color, text);
+function useThinkingTextStyle(): () => void {
+	const restoreColor = useNormalThinkingText();
+	const restoreSpacing = useThinkingBottomSpacing();
+	return () => {
+		restoreSpacing();
+		restoreColor();
+	};
+}
+
+function useThinkingBottomSpacing(): () => void {
+	const originalUpdateContent = AssistantMessageComponent.prototype.updateContent;
+	const updateContentWithSpacing = function (
+		this: AssistantMessageComponent,
+		message: AssistantMessage,
+		isStreaming?: boolean,
+	): void {
+		Reflect.apply(originalUpdateContent, this, [message, isStreaming]);
+		if (!endsWithVisibleThinking(message)) return;
+
+		const contentContainer = this.children[0];
+		if (contentContainer instanceof Container) contentContainer.addChild(new Spacer(1));
 	};
 
-	Theme.prototype.fg = dimThinkingForeground;
+	AssistantMessageComponent.prototype.updateContent = updateContentWithSpacing;
 
 	return () => {
-		if (Theme.prototype.fg === dimThinkingForeground) {
+		if (AssistantMessageComponent.prototype.updateContent === updateContentWithSpacing) {
+			AssistantMessageComponent.prototype.updateContent = originalUpdateContent;
+		}
+	};
+}
+
+function endsWithVisibleThinking(message: AssistantMessage): boolean {
+	const hasToolCalls = message.content.some((content) => content.type === "toolCall");
+	const hasTrailingStatus = message.stopReason === "length"
+		|| (!hasToolCalls && (message.stopReason === "aborted" || message.stopReason === "error"));
+	if (hasTrailingStatus) return false;
+
+	for (let index = message.content.length - 1; index >= 0; index -= 1) {
+		const content = message.content[index];
+		if (content?.type === "text" && content.text.trim()) return false;
+		if (content?.type === "thinking" && content.thinking.trim()) return true;
+	}
+	return false;
+}
+
+function useNormalThinkingText(): () => void {
+	const originalForeground = Theme.prototype.fg;
+	const normalThinkingForeground = function (this: Theme, color: ThemeColor, text: string): string {
+		return originalForeground.call(this, color === "thinkingText" ? "text" : color, text);
+	};
+
+	Theme.prototype.fg = normalThinkingForeground;
+
+	return () => {
+		if (Theme.prototype.fg === normalThinkingForeground) {
 			Theme.prototype.fg = originalForeground;
 		}
 	};

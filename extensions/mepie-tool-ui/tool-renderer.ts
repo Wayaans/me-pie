@@ -1,9 +1,11 @@
-import type {
-	AgentToolResult,
-	Theme,
-	ThemeColor,
-	ToolDefinition,
-	ToolRenderResultOptions,
+import {
+	ToolExecutionComponent,
+	type AgentToolResult,
+	type ExtensionAPI,
+	type Theme,
+	type ThemeColor,
+	type ToolDefinition,
+	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, sliceByColumn, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
@@ -23,6 +25,13 @@ export interface ToolView<TArgs, TDetails> {
 }
 
 const HORIZONTAL_PADDING = 1;
+const mepieToolCallComponents = new WeakSet<object>();
+
+type ToolExecutionRender = (this: ToolExecutionComponent, width: number) => string[];
+
+let compactSpacingUsers = 0;
+let originalToolExecutionRender: ToolExecutionRender | undefined;
+let compactToolExecutionRender: ToolExecutionRender | undefined;
 
 interface ToolUiState {
 	finalSummary?: readonly SummaryPart[];
@@ -41,6 +50,22 @@ interface SummaryLineInput {
 	readonly theme: Theme;
 	readonly context: ToolStateContext;
 	readonly state: ToolUiState;
+}
+
+export function registerMepieToolSpacing(pi: ExtensionAPI): void {
+	let active = false;
+
+	pi.on("session_start", (_event, ctx) => {
+		if (active) deactivateCompactToolSpacing();
+		active = ctx.mode === "tui";
+		if (active) activateCompactToolSpacing();
+	});
+
+	pi.on("session_shutdown", () => {
+		if (!active) return;
+		active = false;
+		deactivateCompactToolSpacing();
+	});
 }
 
 export function withMepieToolUi<
@@ -66,6 +91,7 @@ export function withMepieToolUi<
 				context,
 				state: context.state,
 			});
+			mepieToolCallComponents.add(line);
 			return line;
 		},
 		renderResult(result, options, theme, context) {
@@ -77,6 +103,42 @@ export function withMepieToolUi<
 			return new HorizontalInset(view.expanded(context.args, result, theme));
 		},
 	};
+}
+
+function activateCompactToolSpacing(): void {
+	compactSpacingUsers += 1;
+	if (compactSpacingUsers > 1) return;
+
+	const originalRender = ToolExecutionComponent.prototype.render;
+	const compactRender: ToolExecutionRender = function (width) {
+		const lines = originalRender.call(this, width);
+		// Pi owns the leading spacer outside custom renderers, so identify our call component at runtime.
+		const callComponent = Reflect.get(this, "callRendererComponent");
+		const isMepieTool = typeof callComponent === "object"
+			&& callComponent !== null
+			&& mepieToolCallComponents.has(callComponent);
+		return isMepieTool && lines[0] === "" ? lines.slice(1) : lines;
+	};
+
+	originalToolExecutionRender = originalRender;
+	compactToolExecutionRender = compactRender;
+	ToolExecutionComponent.prototype.render = compactRender;
+}
+
+function deactivateCompactToolSpacing(): void {
+	if (compactSpacingUsers === 0) return;
+	compactSpacingUsers -= 1;
+	if (compactSpacingUsers > 0) return;
+
+	if (
+		originalToolExecutionRender
+		&& compactToolExecutionRender
+		&& ToolExecutionComponent.prototype.render === compactToolExecutionRender
+	) {
+		ToolExecutionComponent.prototype.render = originalToolExecutionRender;
+	}
+	originalToolExecutionRender = undefined;
+	compactToolExecutionRender = undefined;
 }
 
 export function textContent<TDetails>(result: AgentToolResult<TDetails>): string {
@@ -127,7 +189,7 @@ class SummaryLine implements Component {
 		const fixedWidth = visibleWidth(labelText) + visibleWidth(targetPrefix) + visibleWidth(summary);
 		const targetWidth = Math.max(0, contentWidth - fixedWidth);
 		const fittedTarget = fitTarget(target, targetWidth, targetTruncation);
-		const line = `${labelText}${fittedTarget ? `${targetPrefix}${theme.fg("text", fittedTarget)}` : ""}${summary}`;
+		const line = `${labelText}${fittedTarget ? `${targetPrefix}${theme.fg("muted", fittedTarget)}` : ""}${summary}`;
 		return insetLines([truncateToWidth(line, contentWidth, "…")], width);
 	}
 
@@ -192,11 +254,11 @@ function summaryText(
 	parts: readonly SummaryPart[] | undefined,
 	theme: Theme,
 ): string {
-	if (context.isError) return theme.fg("muted", " · ") + theme.fg("error", "failed");
+	if (context.isError) return theme.fg("dim", " · ") + theme.fg("error", "failed");
 	if (context.isPartial || !parts || parts.length === 0) return "";
 	return parts.reduce((text, part, index) => {
 		const separator = index === 0 || part.separator !== "space" ? " · " : " ";
-		return text + theme.fg("muted", separator) + theme.fg(part.color ?? "muted", part.text);
+		return text + theme.fg("dim", separator) + theme.fg(part.color ?? "success", part.text);
 	}, "");
 }
 

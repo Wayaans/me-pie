@@ -11,17 +11,20 @@ Tool shells have no box or background. Each row uses the same one-column left an
 - the theme's tool-title color when complete
 - error when failed
 
-Pi adds one blank line before every self-rendered tool row, so adjacent tools remain visually separated without extension-owned spacing.
+The target after the label uses `muted`. Completed result summaries use `success`, while truncation and result limits use `warning`. Diff summaries keep their added and removed colors. Separators use `dim`.
+
+The extension removes Pi's leading blank line from its tool rows. Adjacent tool calls therefore render without an empty line between them.
 
 Example:
 
 ```text
 Edit extensions/mepie-tool-ui/tools.ts · +8 −3
-
 Edit extensions/mepie-tool-ui/tools.ts · failed
 ╰─ oldText did not match exactly. Re-read the file and retry.
 ```
 
-Thinking text also uses the active theme's `dim` color. Pi's italic style remains unchanged, and the extension does not add bold styling.
+Collapsed Bash rows show only the script's first physical line. Long first lines still truncate to the available width, while execution and expanded output remain unchanged.
+
+Thinking text uses the active theme's normal `text` color and has one blank line below it. The extension does not alter italic, bold, visibility, or other thinking presentation settings managed by Pi.
 
 The extension affects TUI presentation only. Tool inputs, outputs, execution semantics, and model context remain unchanged.

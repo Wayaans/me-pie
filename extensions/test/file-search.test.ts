@@ -3,6 +3,7 @@ import test from "node:test";
 import { homedir } from "node:os";
 import {
 	initTheme,
+	ToolExecutionComponent,
 	type AgentToolResult,
 	type ExtensionAPI,
 	type Theme,
@@ -10,7 +11,7 @@ import {
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
-import type { Component } from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@earendil-works/pi-tui";
 import fileSearchTools, {
 	installNotifications,
 	makeBinaryInitializers,
@@ -189,6 +190,11 @@ function renderCompletedSearch(
 	args: unknown,
 	result: AgentToolResult<unknown>,
 	expanded = false,
+	theme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as unknown as Theme,
+	width = 120,
 ): { readonly call: string; readonly result: string } {
 	const context = {
 		args,
@@ -204,10 +210,6 @@ function renderCompletedSearch(
 		showImages: true,
 		isError: false,
 	};
-	const theme = {
-		fg: (_color: string, text: string) => text,
-		bold: (text: string) => text,
-	} as unknown as Theme;
 	const call = tool.renderCall(args, theme, context);
 	const renderedResult = tool.renderResult(
 		result,
@@ -216,12 +218,50 @@ function renderCompletedSearch(
 		context,
 	);
 	return {
-		call: call.render(120).join("\n").trim(),
-		result: renderedResult.render(120).join("\n").trim(),
+		call: call.render(width).join("\n").trim(),
+		result: renderedResult.render(width).join("\n").trim(),
 	};
 }
 
 initTheme();
+
+test("file-search rows omit Pi's leading tool spacer", async () => {
+	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
+	const handlers = new Map<string, EventHandler[]>();
+	const tools = new Map<string, RenderedSearchTool>();
+	const pi = {
+		on(event: string, handler: EventHandler) {
+			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+		},
+		registerTool(tool: ToolDefinition) {
+			tools.set(tool.name, tool as unknown as RenderedSearchTool);
+		},
+	};
+	fileSearchTools(pi as unknown as ExtensionAPI);
+
+	const spacingStart = handlers.get("session_start")?.[0];
+	const spacingShutdown = handlers.get("session_shutdown")?.[0];
+	assert.ok(spacingStart);
+	assert.ok(spacingShutdown);
+	await spacingStart({}, { mode: "tui" });
+
+	try {
+		const fd = tools.get("fd");
+		assert.ok(fd);
+		const component = new ToolExecutionComponent(
+			"fd",
+			"search-1",
+			{ pattern: "*.ts", path: "src" },
+			{},
+			fd as unknown as ToolDefinition,
+			{ requestRender() {} } as unknown as TUI,
+			process.cwd(),
+		);
+		assert.notEqual(component.render(120)[0], "");
+	} finally {
+		await spacingShutdown({}, { mode: "tui" });
+	}
+});
 
 test("file-search uses the compact Mepie tool renderer", () => {
 	const tools = registeredSearchTools();
@@ -255,4 +295,26 @@ test("file-search uses the compact Mepie tool renderer", () => {
 	assert.equal(rgResult.call, "Rg /renderCall/ in extensions · *.ts · 2 lines · truncated");
 	assert.match(rgResult.result, /a\.ts:1:renderCall/);
 	assert.match(rgResult.result, /b\.ts:2:renderCall/);
+
+	const taggedTheme = {
+		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+		bold: (text: string) => `<b>${text}</b>`,
+	} as unknown as Theme;
+	const styledRgResult = renderCompletedSearch(
+		rg,
+		{ pattern: "renderCall", path: "extensions", glob: "*.ts" },
+		{
+			content: [{ type: "text", text: "a.ts:1:renderCall\nb.ts:2:renderCall" }],
+			details: { binarySource: "system", outputLines: 2, truncated: true },
+		},
+		false,
+		taggedTheme,
+		300,
+	);
+	assert.equal(
+		styledRgResult.call,
+		"<toolTitle><b>Rg</b></toolTitle> <muted>/renderCall/ in extensions</muted>" +
+			"<dim> · </dim><muted>*.ts</muted><dim> · </dim><success>2 lines</success>" +
+			"<dim> · </dim><warning>truncated</warning>",
+	);
 });

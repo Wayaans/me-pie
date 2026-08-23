@@ -53,6 +53,7 @@ import {
 } from "./src/prompt.ts";
 import { discardCapturedOutput, executeSearchProcess } from "./src/process.ts";
 import {
+  registerMepieToolSpacing,
   resultText,
   withMepieToolUi,
   type SummaryPart,
@@ -125,6 +126,8 @@ function unwrapToolExit<A, E>(exit: Exit.Exit<A, E>, tool: "fd" | "rg") {
 }
 
 export default function fileSearchTools(pi: ExtensionAPI) {
+  registerMepieToolSpacing(pi);
+
   let notified = false;
 
   const binDir = repositoryBinDir();
@@ -334,8 +337,8 @@ const rgView: ToolView<Static<ReturnType<typeof rgParameters>>, RgToolDetails> =
     const details = result.details;
     const count = details?.outputLines ?? 0;
     const parts: SummaryPart[] = [];
-    if (args.glob) parts.push({ text: args.glob });
-    if (args.file_type) parts.push({ text: args.file_type });
+    if (args.glob) parts.push({ text: args.glob, color: "muted" });
+    if (args.file_type) parts.push({ text: args.file_type, color: "muted" });
     parts.push({ text: `${count} ${count === 1 ? "line" : "lines"}` });
     if (details?.truncated) {
       parts.push({ text: "truncated", color: "warning" });

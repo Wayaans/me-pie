@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
+	AssistantMessageComponent,
 	initTheme,
 	Theme,
+	ToolExecutionComponent,
 	type AgentToolResult,
 	type ExtensionAPI,
 	type ToolDefinition,
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
-import { visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import mepieToolUi from "../mepie-tool-ui/index.ts";
+import { registerMepieToolSpacing } from "../mepie-tool-ui/tool-renderer.ts";
 
 interface RegisteredTool {
 	readonly name: string;
@@ -76,14 +80,15 @@ function renderCompleted(
 	result: AgentToolResult<unknown>,
 	expanded = false,
 	width = 120,
+	theme = plainTheme as unknown as Theme,
 ): { readonly call: string; readonly result: string } {
 	const state: Record<string, unknown> = {};
 	const context = renderContext(args, state, { expanded });
-	const call = tool.renderCall(args, plainTheme as unknown as Theme, context);
+	const call = tool.renderCall(args, theme, context);
 	const renderedResult = tool.renderResult(
 		result,
 		{ expanded, isPartial: false },
-		plainTheme as unknown as Theme,
+		theme,
 		context,
 	);
 	return {
@@ -92,10 +97,11 @@ function renderCompleted(
 	};
 }
 
-test("thinking text uses the dim theme color without changing font styles", async () => {
+test("thinking text uses the normal text color without changing font styles and has one trailing spacer", async () => {
 	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
 	const handlers = new Map<string, EventHandler>();
 	const originalForeground = Theme.prototype.fg;
+	const originalUpdateContent = AssistantMessageComponent.prototype.updateContent;
 	const originalBold = Theme.prototype.bold;
 	const originalItalic = Theme.prototype.italic;
 	const observedColors: string[] = [];
@@ -120,14 +126,40 @@ test("thinking text uses the dim theme color without changing font styles", asyn
 		assert.ok(shutdown);
 		await start({}, { mode: "tui" });
 		Theme.prototype.fg("thinkingText", "thinking");
-		assert.deepEqual(observedColors, ["dim"]);
+		assert.deepEqual(observedColors, ["text"]);
 		assert.equal(Theme.prototype.bold, originalBold);
 		assert.equal(Theme.prototype.italic, originalItalic);
 
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "Inspecting the files" },
+				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "src/index.ts" } },
+			],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5.4-mini",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		const lines = new AssistantMessageComponent(message).render(80);
+		assert.equal(lines.at(-1), "");
+		assert.equal(lines.filter((line) => line === "").length, 2);
+
 		await shutdown({}, { mode: "tui" });
 		assert.equal(Theme.prototype.fg, foregroundSpy);
+		assert.equal(AssistantMessageComponent.prototype.updateContent, originalUpdateContent);
 	} finally {
 		Theme.prototype.fg = originalForeground;
+		AssistantMessageComponent.prototype.updateContent = originalUpdateContent;
 	}
 });
 
@@ -135,6 +167,52 @@ test("mepie-tool-ui overrides every built-in tool with a self-rendered shell", (
 	const tools = registeredTools();
 	assert.deepEqual([...tools.keys()], ["read", "bash", "edit", "write", "grep", "find", "ls"]);
 	for (const tool of tools.values()) assert.equal(tool.renderShell, "self");
+});
+
+test("Mepie tool rows omit Pi's leading spacer without affecting other tools", async () => {
+	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
+	const handlers = new Map<string, EventHandler>();
+	const pi = {
+		on(event: string, handler: EventHandler) {
+			handlers.set(event, handler);
+		},
+	};
+	registerMepieToolSpacing(pi as unknown as ExtensionAPI);
+
+	const start = handlers.get("session_start");
+	const shutdown = handlers.get("session_shutdown");
+	assert.ok(start);
+	assert.ok(shutdown);
+	await start({}, { mode: "tui" });
+
+	try {
+		const bash = registeredTools().get("bash");
+		assert.ok(bash);
+		const ui = { requestRender() {} } as unknown as TUI;
+		const compact = new ToolExecutionComponent(
+			"bash",
+			"tool-1",
+			{ command: "echo done" },
+			{},
+			bash as unknown as ToolDefinition,
+			ui,
+			process.cwd(),
+		);
+		assert.notEqual(compact.render(120)[0], "");
+
+		const unrelated = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-2",
+			{},
+			{},
+			undefined,
+			ui,
+			process.cwd(),
+		);
+		assert.equal(unrelated.render(120)[0], "");
+	} finally {
+		await shutdown({}, { mode: "tui" });
+	}
 });
 
 test("collapsed successful tools render one summary line and no result row", () => {
@@ -157,6 +235,17 @@ test("collapsed successful tools render one summary line and no result row", () 
 		assert.equal(rendered.call.split("\n").length, 1);
 		assert.equal(rendered.result, "");
 	}
+});
+
+test("collapsed Bash rows show only the first physical script line", () => {
+	const bash = registeredTools().get("bash");
+	assert.ok(bash);
+	const rendered = renderCompleted(
+		bash,
+		{ command: "set -e\nbun test\nbun run check" },
+		{ content: [{ type: "text", text: "(no output)" }], details: undefined },
+	);
+	assert.equal(rendered.call, "Bash set -e · no output");
 });
 
 test("bash summaries do not count a trailing line terminator as output", () => {
@@ -244,6 +333,31 @@ test("tool label color uses the themed tool title for live and restored success 
 		const output = tool.renderCall(args, theme, context).render(200).join("\n");
 		assert.match(output, new RegExp(`<${color}><b>Bash<\\/b><\\/${color}>`));
 	}
+});
+
+test("completed rows use muted targets, success results, dim separators, and warning exceptions", () => {
+	const read = registeredTools().get("read");
+	assert.ok(read);
+	const theme = {
+		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+		bold: (text: string) => `<b>${text}</b>`,
+	} as unknown as Theme;
+	const rendered = renderCompleted(
+		read,
+		{ path: "src/index.ts" },
+		{
+			content: [{ type: "text", text: "one\ntwo\nthree" }],
+			details: { truncation: { truncated: true, outputLines: 3 } },
+		},
+		false,
+		200,
+		theme,
+	);
+	assert.equal(
+		rendered.call,
+		"<toolTitle><b>Read</b></toolTitle> <muted>src/index.ts</muted>" +
+			"<dim> · </dim><success>3 lines</success><dim> · </dim><warning>truncated</warning>",
+	);
 });
 
 test("expanded tools show all returned or submitted content", () => {
