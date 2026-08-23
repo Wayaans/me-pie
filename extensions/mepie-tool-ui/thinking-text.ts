@@ -3,6 +3,11 @@ import { AssistantMessageComponent, Theme, type ExtensionAPI, type ThemeColor } 
 import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 
 const THINKING_ICON = "󰧑";
+const THINKING_RENDER_PATCH = Symbol.for("mepie.tool-ui.thinking-render-patch");
+const THINKING_COLOR_PATCH = Symbol.for("mepie.tool-ui.thinking-color-patch");
+
+type AssistantUpdateContent = typeof AssistantMessageComponent.prototype.updateContent;
+type ThemeForeground = typeof Theme.prototype.fg;
 
 export function registerThinkingTextStyle(pi: ExtensionAPI): void {
 	let restore: (() => void) | undefined;
@@ -28,7 +33,11 @@ function useThinkingTextStyle(): () => void {
 }
 
 function useThinkingRendering(): () => void {
-	const originalUpdateContent = AssistantMessageComponent.prototype.updateContent;
+	const currentUpdateContent = AssistantMessageComponent.prototype.updateContent;
+	const originalUpdateContent = originalPatchedFunction<AssistantUpdateContent>(
+		currentUpdateContent,
+		THINKING_RENDER_PATCH,
+	);
 	const updateContentWithThinkingStyle = function (
 		this: AssistantMessageComponent,
 		message: AssistantMessage,
@@ -42,6 +51,7 @@ function useThinkingRendering(): () => void {
 		if (contentContainer instanceof Container) contentContainer.addChild(new Spacer(1));
 	};
 
+	Reflect.set(updateContentWithThinkingStyle, THINKING_RENDER_PATCH, { original: originalUpdateContent });
 	AssistantMessageComponent.prototype.updateContent = updateContentWithThinkingStyle;
 
 	return () => {
@@ -63,6 +73,7 @@ function withThinkingIcons(message: AssistantMessage): AssistantMessage {
 			if (!needsIcon || !content.thinking.trim()) return content;
 
 			needsIcon = false;
+			if (content.thinking.trimStart().startsWith(THINKING_ICON)) return content;
 			return { ...content, thinking: `${THINKING_ICON} ${content.thinking}` };
 		}),
 	};
@@ -90,6 +101,11 @@ function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+function originalPatchedFunction<T extends object>(current: T, marker: symbol): T {
+	const patch: unknown = Reflect.get(current, marker);
+	return isRecord(patch) && typeof patch.original === "function" ? patch.original as T : current;
+}
+
 function endsWithVisibleThinking(message: AssistantMessage): boolean {
 	const hasToolCalls = message.content.some((content) => content.type === "toolCall");
 	const hasTrailingStatus = message.stopReason === "length"
@@ -105,11 +121,13 @@ function endsWithVisibleThinking(message: AssistantMessage): boolean {
 }
 
 function useNormalThinkingColor(): () => void {
-	const originalForeground = Theme.prototype.fg;
+	const currentForeground = Theme.prototype.fg;
+	const originalForeground = originalPatchedFunction<ThemeForeground>(currentForeground, THINKING_COLOR_PATCH);
 	const normalThinkingForeground = function (this: Theme, color: ThemeColor, text: string): string {
 		return originalForeground.call(this, color === "thinkingText" ? "text" : color, text);
 	};
 
+	Reflect.set(normalThinkingForeground, THINKING_COLOR_PATCH, { original: originalForeground });
 	Theme.prototype.fg = normalThinkingForeground;
 
 	return () => {

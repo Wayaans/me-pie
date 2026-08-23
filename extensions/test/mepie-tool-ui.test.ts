@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import mepieToolUi from "../mepie-tool-ui/index.ts";
+import { registerThinkingTextStyle } from "../mepie-tool-ui/thinking-text.ts";
 import { registerMepieToolSpacing } from "../mepie-tool-ui/tool-renderer.ts";
 
 interface RegisteredTool {
@@ -174,6 +175,65 @@ test("thinking text includes the Nerd Font icon and uses normal color and weight
 
 		await shutdown({}, { mode: "tui" });
 		assert.equal(Theme.prototype.fg, foregroundSpy);
+		assert.equal(AssistantMessageComponent.prototype.updateContent, originalUpdateContent);
+	} finally {
+		Theme.prototype.fg = originalForeground;
+		AssistantMessageComponent.prototype.updateContent = originalUpdateContent;
+	}
+});
+
+test("thinking rendering remains single and restores cleanly across extension reload", async () => {
+	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
+	const originalForeground = Theme.prototype.fg;
+	const originalUpdateContent = AssistantMessageComponent.prototype.updateContent;
+	const extensionHandlers: Array<Map<string, EventHandler>> = [];
+
+	try {
+		for (let instance = 0; instance < 2; instance += 1) {
+			const handlers = new Map<string, EventHandler>();
+			registerThinkingTextStyle({
+				on(event: string, handler: EventHandler) {
+					handlers.set(event, handler);
+				},
+			} as unknown as ExtensionAPI);
+			extensionHandlers.push(handlers);
+		}
+
+		const firstStart = extensionHandlers[0]?.get("session_start");
+		const firstShutdown = extensionHandlers[0]?.get("session_shutdown");
+		const secondStart = extensionHandlers[1]?.get("session_start");
+		const secondShutdown = extensionHandlers[1]?.get("session_shutdown");
+		assert.ok(firstStart);
+		assert.ok(firstShutdown);
+		assert.ok(secondStart);
+		assert.ok(secondShutdown);
+
+		await firstStart({}, { mode: "tui" });
+		await secondStart({}, { mode: "tui" });
+		await firstShutdown({}, { mode: "tui" });
+
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "Inspecting the files" }],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5.4-mini",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const rendered = new AssistantMessageComponent(message).render(80).join("\n");
+		assert.equal(rendered.match(/󰧑/gu)?.length, 1);
+
+		await secondShutdown({}, { mode: "tui" });
+		assert.equal(Theme.prototype.fg, originalForeground);
 		assert.equal(AssistantMessageComponent.prototype.updateContent, originalUpdateContent);
 	} finally {
 		Theme.prototype.fg = originalForeground;
