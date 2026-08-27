@@ -1,105 +1,122 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Effect } from "effect";
-import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	defineTool,
 	formatSize,
+	isToolCallEventType,
 	truncateHead,
-	withFileMutationQueue,
+	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-
-const DEFAULT_CTX7_TIMEOUT_MS = 60_000;
-
-const FindDocsParams = Type.Object({
-	query: Type.String({ description: "Documentation question or search query" }),
-	library: Type.Optional(Type.String({ description: "Library/framework/package name, e.g. react, nextjs, prisma" })),
-	libraryId: Type.Optional(Type.String({ description: "Optional Context7 library ID like /facebook/react" })),
-});
-
-type FindDocsToolParams = {
-	query: string;
-	library?: string;
-	libraryId?: string;
-};
-
+import { Text } from "@earendil-works/pi-tui";
+import { Effect } from "effect";
+import { Type } from "typebox";
 import {
-	extractContext7LibraryId,
+	findDocumentation,
+	type FindDocsInput,
+	type FindDocsOutcome,
+} from "./context7.ts";
+import {
 	formatFindDocsSummary,
 	formatFindDocsTarget,
 	isCtx7Bash,
 	type FindDocsDetails,
 } from "./utils.ts";
 
+const FindDocsParams = Type.Object({
+	query: Type.String({
+		description: "Documentation question or search query",
+		minLength: 1,
+		maxLength: 500,
+	}),
+	library: Type.Optional(Type.String({
+		description: "Library, framework, SDK, or CLI name, for example react, nextjs, or prisma",
+		minLength: 1,
+		maxLength: 500,
+	})),
+	libraryId: Type.Optional(Type.String({
+		description: "Context7 library ID in /owner/project or /owner/project/version form",
+		minLength: 3,
+		maxLength: 500,
+	})),
+});
+
 function renderTextResult(result: { content: Array<{ type: string; text?: string }> }) {
 	const text = result.content.find((content) => content.type === "text");
 	return new Text(text?.type === "text" ? (text.text ?? "") : "", 0, 0);
 }
 
-async function makeTextToolResult(text: string, details: Record<string, unknown>) {
+function outcomeText(outcome: FindDocsOutcome): string {
+	switch (outcome.status) {
+		case "found":
+			return `${outcome.resolvedLibrary ? "Resolved library" : "Library"}: ${outcome.libraryId}\n\n${outcome.docs}`;
+		case "library-not-found":
+			return `No Context7 library found for: ${outcome.library}`;
+		case "docs-not-found":
+			return `No Context7 documentation found for "${outcome.query}" in ${outcome.libraryId}.`;
+	}
+}
+
+function outcomeDetails(outcome: FindDocsOutcome): FindDocsDetails {
+	return {
+		status: outcome.status,
+		query: outcome.query,
+		...(outcome.library ? { library: outcome.library } : {}),
+		...("libraryId" in outcome ? { libraryId: outcome.libraryId } : {}),
+	};
+}
+
+async function makeTextToolResult(
+	text: string,
+	details: FindDocsDetails,
+	temporaryDirectories: Set<string>,
+) {
 	const truncation = truncateHead(text, {
 		maxLines: DEFAULT_MAX_LINES,
 		maxBytes: DEFAULT_MAX_BYTES,
 	});
-
-	const resultDetails: Record<string, unknown> = { ...details };
-	let resultText = truncation.content;
-
-	if (truncation.truncated) {
-		const tempDir = await mkdtemp(path.join(tmpdir(), "find-docs-"));
-		const tempFile = path.join(tempDir, "output.txt");
-		await withFileMutationQueue(tempFile, async () => {
-			await writeFile(tempFile, text, "utf8");
-		});
-		resultDetails.truncation = truncation;
-		resultDetails.fullOutputPath = tempFile;
-		resultText += `\n\n[Output truncated to ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). Full output saved to: ${tempFile}]`;
+	if (!truncation.truncated) {
+		return {
+			content: [{ type: "text" as const, text: truncation.content || "No output" }],
+			details,
+		};
 	}
 
+	const tempDir = await mkdtemp(path.join(tmpdir(), "find-docs-"));
+	const tempFile = path.join(tempDir, "output.txt");
+	try {
+		await writeFile(tempFile, text, { encoding: "utf8", mode: 0o600 });
+		temporaryDirectories.add(tempDir);
+	} catch (error) {
+		await rm(tempDir, { recursive: true, force: true });
+		throw error;
+	}
+
+	const resultText = `${truncation.content}\n\n[Output truncated to ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). Full output saved to: ${tempFile}]`;
 	return {
-		content: [{ type: "text" as const, text: resultText || "No output" }],
-		details: resultDetails,
+		content: [{ type: "text" as const, text: resultText }],
+		details: {
+			...details,
+			truncated: true,
+			fullOutputPath: tempFile,
+		},
 	};
 }
 
-async function runCtx7(pi: ExtensionAPI, args: string[], signal?: AbortSignal): Promise<string> {
-	try {
-		const direct = await pi.exec("ctx7", args, {
-			...(signal ? { signal } : {}),
-			timeout: DEFAULT_CTX7_TIMEOUT_MS,
-		});
-		if (direct.code === 0 && direct.stdout.trim()) {
-			return direct.stdout.trim();
-		}
-	} catch {
-		// Fall through to bunx when ctx7 is not installed.
-	}
-
-	const fallback = await pi.exec("bunx", ["--bun", "ctx7@latest", ...args], {
-		...(signal ? { signal } : {}),
-		timeout: DEFAULT_CTX7_TIMEOUT_MS * 2,
-	});
-	const output = [fallback.stdout, fallback.stderr].filter(Boolean).join("\n").trim();
-	if (fallback.code !== 0) {
-		if (/quota|monthly quota reached|quota exceeded/i.test(output)) {
-			throw new Error(`Context7 quota exhausted. Run ctx7 login for higher limits.\n\n${output}`);
-		}
-		throw new Error(output || "ctx7 command failed");
-	}
-	return output;
+async function removeTemporaryDirectories(temporaryDirectories: Set<string>): Promise<void> {
+	const directories = [...temporaryDirectories];
+	temporaryDirectories.clear();
+	await Promise.allSettled(directories.map((directory) => rm(directory, { recursive: true, force: true })));
 }
 
-const findDocsTool = (pi: ExtensionAPI) =>
+const findDocsTool = (pi: ExtensionAPI, temporaryDirectories: Set<string>) =>
 	defineTool({
 		name: "find_docs",
-		label: "find_docs",
+		label: "Find Docs",
 		description:
-			"Find current documentation for a framework or library using Context7 (ctx7). Resolves the library ID first, then fetches relevant docs.",
+			"Find current documentation for a library, framework, SDK, or CLI with Context7. Resolves a library name before querying docs. Output is limited to 50 KB or 2,000 lines.",
 		promptSnippet: "Find current framework and library documentation through Context7",
 		promptGuidelines: [
 			"Use find_docs whenever a task depends on current library, framework, SDK, or CLI documentation.",
@@ -107,41 +124,15 @@ const findDocsTool = (pi: ExtensionAPI) =>
 		parameters: FindDocsParams,
 
 		async execute(_toolCallId, params, signal) {
-			return Effect.runPromise(
-				Effect.tryPromise({
-					try: async () => {
-						const input = params as FindDocsToolParams;
-						const libraryId = input.libraryId?.trim();
-						let resolvedLibraryId = libraryId?.startsWith("/") ? libraryId : undefined;
-						let libraryOutput = "";
-
-						if (!resolvedLibraryId) {
-							if (!input.library) throw new Error("find_docs requires either library or libraryId");
-							libraryOutput = await runCtx7(pi, ["library", input.library, input.query], signal);
-							resolvedLibraryId = extractContext7LibraryId(libraryOutput);
-							if (!resolvedLibraryId) {
-								return makeTextToolResult(libraryOutput || "No matching Context7 library found", {
-									library: input.library,
-									query: input.query,
-									resolved: false,
-								});
-							}
-						}
-
-						const docsOutput = await runCtx7(pi, ["docs", resolvedLibraryId, input.query], signal);
-						const text = libraryOutput
-							? `Resolved library: ${resolvedLibraryId}\n\n${docsOutput}`
-							: `Library: ${resolvedLibraryId}\n\n${docsOutput}`;
-						return makeTextToolResult(text, {
-							library: input.library,
-							libraryId: resolvedLibraryId,
-							query: input.query,
-						});
-					},
-					catch: (error) => error instanceof Error ? error : new Error(String(error)),
-				}),
-				{ signal },
+			const input: FindDocsInput = params;
+			const workflow = findDocumentation(
+				input,
+				(command, args, options) => pi.exec(command, args, options),
+			).pipe(
+				Effect.mapError((error) => new Error(error.message, { cause: error })),
 			);
+			const outcome = await Effect.runPromise(workflow, { signal });
+			return makeTextToolResult(outcomeText(outcome), outcomeDetails(outcome), temporaryDirectories);
 		},
 
 		renderCall(args, theme) {
@@ -163,15 +154,17 @@ const findDocsTool = (pi: ExtensionAPI) =>
 	});
 
 export default function (pi: ExtensionAPI): void {
-	pi.registerTool(findDocsTool(pi));
+	const temporaryDirectories = new Set<string>();
+	pi.registerTool(findDocsTool(pi, temporaryDirectories));
+
+	pi.on("session_shutdown", async () => {
+		await removeTemporaryDirectories(temporaryDirectories);
+	});
 
 	pi.on("tool_call", async (event) => {
-		if (event.toolName !== "bash") return;
-		const command = String(event.input.command ?? "").trim();
-		if (!isCtx7Bash(command)) return;
-
-		const availableTools = new Set(pi.getAllTools().map((tool) => tool.name));
-		if (!availableTools.has("find_docs")) return;
+		if (!isToolCallEventType("bash", event)) return;
+		if (!isCtx7Bash(event.input.command)) return;
+		if (!pi.getActiveTools().includes("find_docs")) return;
 
 		return {
 			block: true,

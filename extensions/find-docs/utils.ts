@@ -16,30 +16,28 @@ export function formatFindDocsTarget(args: { library?: unknown; libraryId?: unkn
 }
 
 export type FindDocsDetails = {
-	library?: string;
-	libraryId?: string;
-	query?: string;
-	resolved?: boolean;
-	fullOutputPath?: string;
+	readonly status: "found" | "library-not-found" | "docs-not-found";
+	readonly library?: string;
+	readonly libraryId?: string;
+	readonly query: string;
+	readonly truncated?: boolean;
+	readonly fullOutputPath?: string;
 };
 
 export function formatFindDocsSummary(details: FindDocsDetails | undefined): string {
 	if (!details) return "";
-	if (details.resolved === false) {
-		const library = details.library?.trim() || "library lookup";
-		return summarizeText(`${library} • no Context7 match`, 88);
+	if (details.status === "library-not-found") {
+		return summarizeText(`${details.library ?? "library"} • no Context7 match`, 88);
 	}
 
 	const library = details.libraryId?.trim() || details.library?.trim() || "docs";
-	const query = details.query?.trim() ? summarizeText(details.query, 56) : undefined;
+	if (details.status === "docs-not-found") {
+		return summarizeText(`${library} • no matching docs`, 88);
+	}
+	const query = details.query.trim() ? summarizeText(details.query, 56) : undefined;
 	return [library, query].filter(Boolean).join(" • ");
 }
 
-export function extractContext7LibraryId(output: string): string | undefined {
-	const match = output.match(/\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?/);
-	return match?.[0];
-}
-
 export function isCtx7Bash(command: string): boolean {
-	return /^(ctx7|bunx\s+ctx7|bunx\s+ctx7@latest|npx\s+ctx7|npx\s+ctx7@latest)\b/.test(command.trim());
+	return /^(?:command\s+)?(?:ctx7|bunx\s+(?:--bun\s+)?ctx7(?:@latest)?|npx\s+(?:--yes\s+)?ctx7(?:@latest)?)\b/.test(command.trim());
 }

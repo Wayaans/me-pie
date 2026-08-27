@@ -1,20 +1,27 @@
 # find-docs
 
-Look up current library and framework documentation through a dedicated Context7 tool.
+Look up current library, framework, SDK, and CLI documentation through Context7.
 
 ## Tool
 
-- **`find_docs`** — resolves a Context7 library ID, then fetches documentation relevant to the query.
+`find_docs` accepts:
 
-Parameters: `query`, optional `library`, optional `libraryId`.
+- `query`, a specific documentation question
+- `library`, a package or product name to resolve
+- `libraryId`, a Context7 ID such as `/facebook/react`
+
+Provide either `library` or `libraryId`. A supplied ID must use `/owner/project` or `/owner/project/version` form.
 
 ## Behavior
 
-- Adds Pi tool guidance that prefers `find_docs` for current library, framework, SDK, and CLI documentation.
-- Blocks direct `ctx7`, `bunx ctx7`, and `npx ctx7` shell invocations while the tool is available.
-- Truncates output to Pi's 50 KB or 2,000-line limits and saves complete oversized output to a temporary file.
-- Runs an installed `ctx7` first, then falls back to `bunx --bun ctx7@latest`.
+- Resolves library names through `ctx7 library ... --json`, then queries the selected ID.
+- Uses an installed `ctx7` command when available.
+- Falls back to `bunx --bun ctx7@latest` only when the installed command is unavailable.
+- Preserves cancellation and classifies command, quota, timeout, input, and response failures.
+- Reports empty library and documentation searches without repeating the request.
+- Limits output to Pi's 50 KB or 2,000-line bounds. Complete oversized output is stored in a private temporary file until session shutdown.
+- Blocks direct Context7 shell lookups while `find_docs` is active.
 
 ## Requirements
 
-Install `ctx7`, or provide Bun and network access for the fallback.
+Install `ctx7`, or provide Bun and network access for the fallback. Run `ctx7 login` for higher Context7 rate limits.
