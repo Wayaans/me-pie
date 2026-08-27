@@ -28,7 +28,7 @@ import {
 	type ToolDefinition,
 	type WriteToolInput,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Text, truncateToWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
 	countLines,
@@ -83,7 +83,7 @@ const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 	compactCall(args, cwd, theme) {
 		const name = skillName(args.path, cwd);
 		if (!name) return undefined;
-		const label = `${theme.fg("muted", "[")}${theme.fg("toolTitle", "")}${theme.fg("muted", "]")}`;
+		const label = theme.fg("toolTitle", "󰚩");
 		const hint = theme.fg("muted", ` (${keyText("app.tools.expand")} to expand)`);
 		return new Text(`${label} ${theme.fg("text", name)}${hint}`, 0, 0);
 	},
@@ -113,13 +113,13 @@ const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 const bashView: ToolView<MepieBashInput, BashToolDetails | undefined> = {
 	icon: TOOL_ICONS.terminal,
 	label: "Bash",
+	targetColor: "text",
 	targetTruncation: "end",
 	target: (args) => `· ${bashPurpose(args)}`,
-	summary(args, result) {
-		const lineCount = scriptLines(args.command).length;
-		const parts: SummaryPart[] = [{ text: `${lineCount} ${plural(lineCount, "line")}` }];
-		if (result.details?.truncation?.truncated) parts.push({ text: "output truncated", color: "warning" });
-		return parts;
+	summary(_args, result) {
+		return result.details?.truncation?.truncated
+			? [{ text: "output truncated", color: "warning" }]
+			: [];
 	},
 	collapsed(args, _result, theme) {
 		return new BashScriptTree(args.command, false, theme);
@@ -243,15 +243,17 @@ class BashScriptTree implements Component {
 		if (width <= 0) return [];
 		const lines = scriptLines(this.script);
 		if (lines.length === 0) return [];
-		const highlighted = highlightCode(lines.join("\n"), "bash");
+		const displayLines = this.expanded
+			? highlightCode(lines.join("\n"), "bash")
+			: lines.map((line) => this.theme.fg("muted", line));
 		const visibleCount = this.expanded ? lines.length : Math.min(2, lines.length);
 		const rendered: string[] = [];
 
 		for (let index = 0; index < visibleCount; index += 1) {
 			const isLast = index === lines.length - 1;
-			const prefix = isLast ? "╰─ " : "├─ ";
-			const continuation = isLast ? "   " : "│  ";
-			const content = highlighted[index] ?? lines[index] ?? "";
+			const prefix = this.theme.fg("dim", isLast ? "╰─ " : "├─ ");
+			const continuation = this.theme.fg("dim", isLast ? "   " : "│  ");
+			const content = displayLines[index] ?? lines[index] ?? "";
 			rendered.push(...renderScriptLine(content.replaceAll("\t", "   "), prefix, continuation, width, this.expanded));
 		}
 
@@ -273,8 +275,9 @@ function renderScriptLine(
 	width: number,
 	expanded: boolean,
 ): string[] {
-	if (width <= prefix.length) return [truncateToWidth(prefix, width, "")];
-	const contentWidth = width - prefix.length;
+	const prefixWidth = visibleWidth(prefix);
+	if (width <= prefixWidth) return [truncateToWidth(prefix, width, "")];
+	const contentWidth = width - prefixWidth;
 	if (!expanded) return [`${prefix}${truncateToWidth(content, contentWidth, "…")}`];
 	return wrapTextWithAnsi(content, contentWidth)
 		.map((line, index) => `${index === 0 ? prefix : continuation}${line}`);

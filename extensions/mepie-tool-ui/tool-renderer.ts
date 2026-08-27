@@ -20,6 +20,7 @@ export interface SummaryPart {
 export interface ToolView<TArgs, TDetails> {
 	readonly icon: string;
 	readonly label: string;
+	readonly targetColor?: ThemeColor;
 	readonly targetTruncation?: "end" | "middle";
 	compactCall?(args: TArgs, cwd: string, theme: Theme): Component | undefined;
 	target(args: TArgs, cwd: string): string;
@@ -58,6 +59,7 @@ interface SummaryLineInput {
 	readonly icon: string;
 	readonly label: string;
 	readonly target: string;
+	readonly targetColor: ThemeColor;
 	readonly targetTruncation: "end" | "middle";
 	readonly theme: Theme;
 	readonly context: ToolStateContext;
@@ -138,6 +140,7 @@ export function withMepieToolUi<
 				icon: view.icon,
 				label: view.label,
 				target: sanitizeInline(view.target(args, context.cwd)),
+				targetColor: view.targetColor ?? "muted",
 				targetTruncation: view.targetTruncation ?? "middle",
 				theme,
 				context,
@@ -314,14 +317,14 @@ class SummaryLine implements Component {
 	render(width: number): string[] {
 		if (!this.input || width <= 0) return [];
 		const contentWidth = insetContentWidth(width);
-		const { context, icon, label, state, target, targetTruncation, theme } = this.input;
+		const { context, icon, label, state, target, targetColor, targetTruncation, theme } = this.input;
 		const heading = `${theme.fg("text", icon)} ${theme.fg(toolTone(context), theme.bold(label))}`;
 		const summary = summaryText(context, state.finalSummary, theme);
 		const targetPrefix = target ? " " : "";
 		const fixedWidth = visibleWidth(heading) + visibleWidth(targetPrefix) + visibleWidth(summary);
 		const targetWidth = Math.max(0, contentWidth - fixedWidth);
 		const fittedTarget = fitTarget(target, targetWidth, targetTruncation);
-		const line = `${heading}${fittedTarget ? `${targetPrefix}${theme.fg("muted", fittedTarget)}` : ""}${summary}`;
+		const line = `${heading}${fittedTarget ? `${targetPrefix}${theme.fg(targetColor, fittedTarget)}` : ""}${summary}`;
 		return insetLines([truncateToWidth(line, contentWidth, "…")], width);
 	}
 

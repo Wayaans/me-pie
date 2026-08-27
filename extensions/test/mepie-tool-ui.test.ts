@@ -511,7 +511,7 @@ test("collapsed skill reads use the Nerd Font skill label and semantic text colo
 	assert.ok(line.endsWith(" "));
 	const rendered = line.trim();
 
-	assert.match(rendered, /^<muted>\[<\/muted><toolTitle><\/toolTitle><muted>\]<\/muted> /);
+	assert.match(rendered, /^<toolTitle>󰚩<\/toolTitle> <text>unslop<\/text>/);
 	assert.match(rendered, /<text>unslop<\/text>/);
 	assert.match(rendered, /<muted> \(.*to expand\)<\/muted>$/);
 	assert.doesNotMatch(rendered, /Read|lines/);
@@ -525,7 +525,7 @@ test("Bash exposes an optional purpose title", () => {
 	assert.match(parameters.properties?.purpose?.description ?? "", /title describing what the command does/i);
 });
 
-test("collapsed Bash rows show the purpose and first two physical script lines", () => {
+test("collapsed Bash rows emphasize the purpose and show two muted physical script lines", () => {
 	const bash = registeredTools().get("bash");
 	assert.ok(bash);
 	const rendered = renderCompleted(
@@ -536,11 +536,26 @@ test("collapsed Bash rows show the purpose and first two physical script lines",
 		},
 		{ content: [{ type: "text", text: "(no output)" }], details: undefined },
 	);
-	assert.equal(rendered.call, " Bash · Commit changes · 3 lines");
+	assert.equal(rendered.call, " Bash · Commit changes");
 	assert.equal(
 		unstyledLines(rendered.result),
 		"├─ git add .\n├─ git commit -m \"Improve Bash rendering\"\n╰─ … 1 more line",
 	);
+
+	const theme = {
+		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+		bold: (text: string) => `<b>${text}</b>`,
+	} as unknown as Theme;
+	const semantic = renderCompleted(
+		bash,
+		{ purpose: "Commit changes", command: "git add .\ngit status --short" },
+		{ content: [{ type: "text", text: "(no output)" }], details: undefined },
+		false,
+		120,
+		theme,
+	);
+	assert.match(semantic.call, /<text>· Commit changes<\/text>$/);
+	assert.match(semantic.result, /<dim>├─ <\/dim><muted>git add \.<\/muted>/);
 });
 
 test("expanded Bash rows show the complete script before its output", () => {
@@ -552,7 +567,7 @@ test("expanded Bash rows show the complete script before its output", () => {
 		{ content: [{ type: "text", text: "[main abc123] Improve Bash rendering" }], details: undefined },
 		true,
 	);
-	assert.equal(rendered.call, " Bash · Commit changes · 3 lines");
+	assert.equal(rendered.call, " Bash · Commit changes");
 	assert.equal(
 		unstyledLines(rendered.result),
 		"├─ git add .\n├─ git commit -m \"Improve Bash rendering\"\n╰─ git status --short\n\n[main abc123] Improve Bash rendering",
@@ -582,7 +597,7 @@ test("Bash falls back to a generic purpose and ignores one trailing script termi
 			content: [{ type: "text", text: "done\n" }],
 			details: undefined,
 		}).call,
-		" Bash · Run shell command · 1 line",
+		" Bash · Run shell command",
 	);
 });
 
