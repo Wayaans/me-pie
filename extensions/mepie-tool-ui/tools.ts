@@ -13,7 +13,6 @@ import {
 	keyText,
 	renderDiff,
 	type BashToolDetails,
-	type BashToolInput,
 	type EditToolDetails,
 	type EditToolInput,
 	type ExtensionAPI,
@@ -26,9 +25,11 @@ import {
 	type ReadToolDetails,
 	type ReadToolInput,
 	type Theme,
+	type ToolDefinition,
 	type WriteToolInput,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Container, Text, truncateToWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import { Type, type Static } from "typebox";
 import {
 	countLines,
 	resultText,
@@ -40,14 +41,40 @@ import {
 } from "./tool-renderer.ts";
 import { TOOL_ICONS } from "./tool-icons.ts";
 
+const MepieBashParams = Type.Object({
+	purpose: Type.Optional(Type.String({
+		description: "Short human-readable title describing what the command does",
+		minLength: 1,
+		maxLength: 80,
+	})),
+	command: Type.String({ description: "Bash command to execute" }),
+	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+});
+
+type MepieBashInput = Static<typeof MepieBashParams>;
+
 export function registerMepieToolUi(pi: ExtensionAPI, cwd: string): void {
 	pi.registerTool(withMepieToolUi(createReadToolDefinition(cwd), readView));
-	pi.registerTool(withMepieToolUi(createBashToolDefinition(cwd), bashView));
+	pi.registerTool(withMepieToolUi(createMepieBashDefinition(cwd), bashView));
 	pi.registerTool(withMepieToolUi(createEditToolDefinition(cwd), editView));
 	pi.registerTool(withMepieToolUi(createWriteToolDefinition(cwd), writeView));
 	pi.registerTool(withMepieToolUi(createGrepToolDefinition(cwd), grepView));
 	pi.registerTool(withMepieToolUi(createFindToolDefinition(cwd), findView));
 	pi.registerTool(withMepieToolUi(createLsToolDefinition(cwd), listView));
+}
+
+function createMepieBashDefinition(
+	cwd: string,
+): ToolDefinition<typeof MepieBashParams, BashToolDetails | undefined> {
+	const definition = createBashToolDefinition(cwd);
+	return {
+		...definition,
+		description: `${definition.description} Optionally set purpose to a short title describing the command.`,
+		parameters: MepieBashParams,
+		execute(toolCallId, args, signal, onUpdate, context) {
+			return definition.execute(toolCallId, args, signal, onUpdate, context);
+		},
+	};
 }
 
 const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
@@ -83,31 +110,29 @@ const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 	},
 };
 
-const bashView: ToolView<BashToolInput, BashToolDetails | undefined> = {
+const bashView: ToolView<MepieBashInput, BashToolDetails | undefined> = {
 	icon: TOOL_ICONS.terminal,
 	label: "Bash",
 	targetTruncation: "end",
-	target: (args) => firstScriptLine(args.command),
-	summary(_args, result) {
-		const text = textContent(result);
-		const hasOutput = text.trim() !== "" && text.trim() !== "(no output)";
-		const lineCount = hasOutput
-			? result.details?.truncation?.outputLines ?? outputLineCount(text)
-			: 0;
-		const parts: SummaryPart[] = [
-			{ text: hasOutput ? `${lineCount} ${plural(lineCount, "line")}` : "no output" },
-		];
-		if (result.details?.truncation?.truncated) parts.push({ text: "truncated", color: "warning" });
+	target: (args) => `· ${bashPurpose(args)}`,
+	summary(args, result) {
+		const lineCount = scriptLines(args.command).length;
+		const parts: SummaryPart[] = [{ text: `${lineCount} ${plural(lineCount, "line")}` }];
+		if (result.details?.truncation?.truncated) parts.push({ text: "output truncated", color: "warning" });
 		return parts;
 	},
-	expanded(_args, result, theme) {
+	collapsed(args, _result, theme) {
+		return new BashScriptTree(args.command, false, theme);
+	},
+	expanded(args, result, theme) {
 		const component = new Container();
+		component.addChild(new BashScriptTree(args.command, true, theme));
 		const text = textContent(result);
 		if (text && text.trim() !== "(no output)") {
-			component.addChild(new Text(theme.fg("toolOutput", text), 0, 0));
+			component.addChild(new Text(`\n${theme.fg("toolOutput", text)}`, 0, 0));
 		}
 		if (result.details?.fullOutputPath) {
-			component.addChild(new Text(theme.fg("dim", `Full output: ${result.details.fullOutputPath}`), 0, 0));
+			component.addChild(new Text(`\n${theme.fg("dim", `Full output: ${result.details.fullOutputPath}`)}`, 0, 0));
 		}
 		return component;
 	},
@@ -207,6 +232,65 @@ const listView: ToolView<LsToolInput, LsToolDetails | undefined> = {
 	},
 };
 
+class BashScriptTree implements Component {
+	constructor(
+		private readonly script: string,
+		private readonly expanded: boolean,
+		private readonly theme: Theme,
+	) {}
+
+	render(width: number): string[] {
+		if (width <= 0) return [];
+		const lines = scriptLines(this.script);
+		if (lines.length === 0) return [];
+		const highlighted = highlightCode(lines.join("\n"), "bash");
+		const visibleCount = this.expanded ? lines.length : Math.min(2, lines.length);
+		const rendered: string[] = [];
+
+		for (let index = 0; index < visibleCount; index += 1) {
+			const isLast = index === lines.length - 1;
+			const prefix = isLast ? "╰─ " : "├─ ";
+			const continuation = isLast ? "   " : "│  ";
+			const content = highlighted[index] ?? lines[index] ?? "";
+			rendered.push(...renderScriptLine(content.replaceAll("\t", "   "), prefix, continuation, width, this.expanded));
+		}
+
+		const omitted = lines.length - visibleCount;
+		if (omitted > 0) {
+			const message = this.theme.fg("dim", `╰─ … ${omitted} more ${plural(omitted, "line")}`);
+			rendered.push(truncateToWidth(message, width, "…"));
+		}
+		return rendered;
+	}
+
+	invalidate(): void {}
+}
+
+function renderScriptLine(
+	content: string,
+	prefix: string,
+	continuation: string,
+	width: number,
+	expanded: boolean,
+): string[] {
+	if (width <= prefix.length) return [truncateToWidth(prefix, width, "")];
+	const contentWidth = width - prefix.length;
+	if (!expanded) return [`${prefix}${truncateToWidth(content, contentWidth, "…")}`];
+	return wrapTextWithAnsi(content, contentWidth)
+		.map((line, index) => `${index === 0 ? prefix : continuation}${line}`);
+}
+
+function scriptLines(script: string): string[] {
+	if (script.length === 0) return [];
+	const lines = script.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+	if (lines.at(-1) === "") lines.pop();
+	return lines;
+}
+
+function bashPurpose(args: MepieBashInput): string {
+	return args.purpose?.trim() || "Run shell command";
+}
+
 function skillName(path: string, cwd: string): string | undefined {
 	const normalizedPath = path.startsWith("@") ? path.slice(1) : path;
 	const absolutePath = isAbsolute(normalizedPath) ? normalizedPath : resolve(cwd, normalizedPath);
@@ -246,16 +330,6 @@ function diffStats(diff: string): { readonly additions: number; readonly removal
 
 function grepMatchCount(text: string): number {
 	return returnedLines(text).filter((line) => /^.+:\d+:/.test(line)).length;
-}
-
-function firstScriptLine(script: string): string {
-	return script.split(/\r\n?|\n/, 1)[0] ?? "";
-}
-
-function outputLineCount(text: string): number {
-	if (!text) return 0;
-	const withoutFinalNewline = text.endsWith("\n") ? text.slice(0, -1) : text;
-	return countLines(withoutFinalNewline);
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {

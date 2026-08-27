@@ -2,6 +2,7 @@ import {
 	ToolExecutionComponent,
 	type AgentToolResult,
 	type ExtensionAPI,
+	type SessionEntry,
 	type Theme,
 	type ThemeColor,
 	type ToolDefinition,
@@ -23,17 +24,25 @@ export interface ToolView<TArgs, TDetails> {
 	compactCall?(args: TArgs, cwd: string, theme: Theme): Component | undefined;
 	target(args: TArgs, cwd: string): string;
 	summary(args: TArgs, result: AgentToolResult<TDetails>): readonly SummaryPart[];
+	collapsed?(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
 	expanded(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
 }
 
 const HORIZONTAL_PADDING = 1;
-const mepieToolCallComponents = new WeakSet<object>();
+const MEPIE_TOOL_SPACING_STATE = Symbol.for("mepie.tool-ui.spacing-state");
 
 type ToolExecutionRender = (this: ToolExecutionComponent, width: number) => string[];
 
-let compactSpacingUsers = 0;
-let originalToolExecutionRender: ToolExecutionRender | undefined;
-let compactToolExecutionRender: ToolExecutionRender | undefined;
+interface MepieToolSpacingState {
+	readonly toolNames: Set<string>;
+	readonly callComponents: WeakSet<object>;
+	readonly compactToolCallIds: Set<string>;
+	users: number;
+	originalRender: ToolExecutionRender | undefined;
+	patchedRender: ToolExecutionRender | undefined;
+}
+
+const mepieToolSpacing = sharedMepieToolSpacingState();
 
 interface ToolUiState {
 	finalSummary?: readonly SummaryPart[];
@@ -55,13 +64,44 @@ interface SummaryLineInput {
 	readonly state: ToolUiState;
 }
 
+function sharedMepieToolSpacingState(): MepieToolSpacingState {
+	const existing: unknown = Reflect.get(globalThis, MEPIE_TOOL_SPACING_STATE);
+	if (isMepieToolSpacingState(existing)) return existing;
+
+	const state: MepieToolSpacingState = {
+		toolNames: new Set<string>(),
+		callComponents: new WeakSet<object>(),
+		compactToolCallIds: new Set<string>(),
+		users: 0,
+		originalRender: undefined,
+		patchedRender: undefined,
+	};
+	Reflect.set(globalThis, MEPIE_TOOL_SPACING_STATE, state);
+	return state;
+}
+
+function isMepieToolSpacingState(value: unknown): value is MepieToolSpacingState {
+	if (typeof value !== "object" || value === null) return false;
+	return Reflect.get(value, "toolNames") instanceof Set
+		&& Reflect.get(value, "callComponents") instanceof WeakSet
+		&& Reflect.get(value, "compactToolCallIds") instanceof Set
+		&& typeof Reflect.get(value, "users") === "number";
+}
+
 export function registerMepieToolSpacing(pi: ExtensionAPI): void {
 	let active = false;
 
 	pi.on("session_start", (_event, ctx) => {
 		if (active) deactivateCompactToolSpacing();
 		active = ctx.mode === "tui";
-		if (active) activateCompactToolSpacing();
+		if (!active) return;
+		rebuildCompactMepieToolCalls(ctx.sessionManager?.getBranch?.() ?? []);
+		activateCompactToolSpacing();
+	});
+
+	pi.on("message_end", (event, ctx) => {
+		if (!active || event.message.role !== "assistant") return;
+		rebuildCompactMepieToolCalls(ctx.sessionManager?.getBranch?.() ?? [], event.message);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -79,6 +119,7 @@ export function withMepieToolUi<
 	definition: ToolDefinition<TParams, TDetails, TOriginalState>,
 	view: ToolView<Static<TParams>, TDetails>,
 ): ToolDefinition<TParams, TDetails, ToolUiState> {
+	mepieToolSpacing.toolNames.add(definition.name);
 	return {
 		...definition,
 		renderShell: "self",
@@ -86,7 +127,7 @@ export function withMepieToolUi<
 			const compactCall = context.expanded ? undefined : view.compactCall?.(args, context.cwd, theme);
 			if (compactCall) {
 				const insetCall = new HorizontalInset(compactCall);
-				mepieToolCallComponents.add(insetCall);
+				mepieToolSpacing.callComponents.add(insetCall);
 				return insetCall;
 			}
 
@@ -102,7 +143,7 @@ export function withMepieToolUi<
 				context,
 				state: context.state,
 			});
-			mepieToolCallComponents.add(line);
+			mepieToolSpacing.callComponents.add(line);
 			return line;
 		},
 		renderResult(result, options, theme, context) {
@@ -110,46 +151,126 @@ export function withMepieToolUi<
 				context.state.finalSummary = view.summary(context.args, result);
 			}
 			if (context.isError) return renderErrorResult(result, options, theme);
-			if (!options.expanded) return new Container();
+			if (!options.expanded) {
+				const collapsed = view.collapsed?.(context.args, result, theme);
+				return collapsed ? new HorizontalInset(collapsed) : new Container();
+			}
 			return new HorizontalInset(view.expanded(context.args, result, theme));
 		},
 	};
 }
 
 function activateCompactToolSpacing(): void {
-	compactSpacingUsers += 1;
-	if (compactSpacingUsers > 1) return;
+	mepieToolSpacing.users += 1;
+	if (mepieToolSpacing.users > 1) return;
 
 	const originalRender = ToolExecutionComponent.prototype.render;
 	const compactRender: ToolExecutionRender = function (width) {
 		const lines = originalRender.call(this, width);
 		// Pi owns the leading spacer outside custom renderers, so identify our call component at runtime.
 		const callComponent = Reflect.get(this, "callRendererComponent");
-		const isMepieTool = typeof callComponent === "object"
+		const toolCallId = Reflect.get(this, "toolCallId");
+		const isCompactMepieTool = typeof callComponent === "object"
 			&& callComponent !== null
-			&& mepieToolCallComponents.has(callComponent);
-		return isMepieTool && lines[0] === "" ? lines.slice(1) : lines;
+			&& mepieToolSpacing.callComponents.has(callComponent)
+			&& typeof toolCallId === "string"
+			&& mepieToolSpacing.compactToolCallIds.has(toolCallId);
+		return isCompactMepieTool && lines[0] === "" ? lines.slice(1) : lines;
 	};
 
-	originalToolExecutionRender = originalRender;
-	compactToolExecutionRender = compactRender;
+	mepieToolSpacing.originalRender = originalRender;
+	mepieToolSpacing.patchedRender = compactRender;
 	ToolExecutionComponent.prototype.render = compactRender;
 }
 
 function deactivateCompactToolSpacing(): void {
-	if (compactSpacingUsers === 0) return;
-	compactSpacingUsers -= 1;
-	if (compactSpacingUsers > 0) return;
+	if (mepieToolSpacing.users === 0) return;
+	mepieToolSpacing.users -= 1;
+	if (mepieToolSpacing.users > 0) return;
 
 	if (
-		originalToolExecutionRender
-		&& compactToolExecutionRender
-		&& ToolExecutionComponent.prototype.render === compactToolExecutionRender
+		mepieToolSpacing.originalRender
+		&& mepieToolSpacing.patchedRender
+		&& ToolExecutionComponent.prototype.render === mepieToolSpacing.patchedRender
 	) {
-		ToolExecutionComponent.prototype.render = originalToolExecutionRender;
+		ToolExecutionComponent.prototype.render = mepieToolSpacing.originalRender;
 	}
-	originalToolExecutionRender = undefined;
-	compactToolExecutionRender = undefined;
+	mepieToolSpacing.originalRender = undefined;
+	mepieToolSpacing.patchedRender = undefined;
+	mepieToolSpacing.compactToolCallIds.clear();
+}
+
+function rebuildCompactMepieToolCalls(
+	entries: readonly SessionEntry[],
+	pendingAssistant?: Extract<SessionEntry, { type: "message" }>["message"],
+): void {
+	const nextCompactIds = new Set<string>();
+	let previousVisibleItemIsMepieTool = false;
+
+	for (const entry of entries) {
+		if (entry.type === "message") {
+			previousVisibleItemIsMepieTool = indexMessageTools(
+				entry.message,
+				previousVisibleItemIsMepieTool,
+				nextCompactIds,
+			);
+			continue;
+		}
+		if (entry.type === "custom_message" && !entry.display) continue;
+		if (entry.type === "thinking_level_change" || entry.type === "model_change" || entry.type === "label") continue;
+		previousVisibleItemIsMepieTool = false;
+	}
+
+	if (pendingAssistant && !entriesContainMessage(entries, pendingAssistant)) {
+		indexMessageTools(pendingAssistant, previousVisibleItemIsMepieTool, nextCompactIds);
+	}
+
+	mepieToolSpacing.compactToolCallIds.clear();
+	for (const toolCallId of nextCompactIds) mepieToolSpacing.compactToolCallIds.add(toolCallId);
+}
+
+function entriesContainMessage(
+	entries: readonly SessionEntry[],
+	message: Extract<SessionEntry, { type: "message" }>["message"],
+): boolean {
+	if (message.role !== "assistant") return false;
+	const toolCallIds = message.content
+		.filter((content) => content.type === "toolCall")
+		.map((content) => content.id);
+	if (toolCallIds.length === 0) return false;
+
+	return entries.some((entry) => {
+		if (entry.type !== "message" || entry.message.role !== "assistant") return false;
+		const entryToolCallIds = entry.message.content
+			.filter((content) => content.type === "toolCall")
+			.map((content) => content.id);
+		return entryToolCallIds.length === toolCallIds.length
+			&& entryToolCallIds.every((toolCallId, index) => toolCallId === toolCallIds[index]);
+	});
+}
+
+function indexMessageTools(
+	message: Extract<SessionEntry, { type: "message" }>["message"],
+	previousVisibleItemIsMepieTool: boolean,
+	compactIds: Set<string>,
+): boolean {
+	if (message.role === "toolResult") return previousVisibleItemIsMepieTool;
+	if (message.role !== "assistant") return false;
+
+	if (message.content.some((content) =>
+		(content.type === "text" && content.text.trim())
+		|| (content.type === "thinking" && content.thinking.trim())
+	)) {
+		previousVisibleItemIsMepieTool = false;
+	}
+
+	for (const content of message.content) {
+		if (content.type !== "toolCall") continue;
+		const isMepieTool = mepieToolSpacing.toolNames.has(content.name);
+		if (isMepieTool && previousVisibleItemIsMepieTool) compactIds.add(content.id);
+		previousVisibleItemIsMepieTool = isMepieTool;
+	}
+	return previousVisibleItemIsMepieTool;
 }
 
 export function textContent<TDetails>(result: AgentToolResult<TDetails>): string {

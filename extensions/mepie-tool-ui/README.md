@@ -23,7 +23,7 @@ Each built-in tool label starts with a Nerd Font icon in the theme's `text` colo
 󰉋 List extensions · 9 entries
 ```
 
-The extension removes Pi's leading blank line from its tool rows. Adjacent tool calls therefore render without an empty line between them.
+The first Mepie tool after thinking, assistant text, a user message, or a non-Mepie tool keeps Pi's leading blank line. Consecutive Mepie tools form a compact group with no blank lines between them. The file-search extension's `fd` and `rg` rows belong to the same group, so transitions such as `Read` to `Fd` and `Rg` to `Read` stay compact.
 
 Example:
 
@@ -43,7 +43,7 @@ Collapsed reads of `SKILL.md` use the skill directory name instead of the file p
 
 The brackets and shortcut use `muted`, the icon uses `toolTitle`, and the skill name uses `text`. Pi supplies the configured expansion shortcut. The `` glyph requires a Nerd Font.
 
-Visible thinking text starts with the `󰧑` glyph, uses the active theme's `thinkingText` color and regular weight, and has one blank line below it. Assistant text followed by a tool call also has one blank line below it. The extension preserves Pi's italic and visibility settings. The glyph requires a Nerd Font.
+Visible thinking text starts with the `󰧑` glyph and uses the active theme's `thinkingText` color and regular weight. Thinking does not append trailing space. A following Mepie tool owns the single blank line between the thinking text and tool group. The extension preserves Pi's italic and visibility settings. The glyph requires a Nerd Font.
 
 ```text
 󰧑 I need to inspect the current implementation before proposing the change.

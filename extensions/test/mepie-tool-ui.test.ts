@@ -9,6 +9,7 @@ import {
 	ToolExecutionComponent,
 	type AgentToolResult,
 	type ExtensionAPI,
+	type SessionEntry,
 	type ToolDefinition,
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
@@ -19,6 +20,8 @@ import { registerMepieToolSpacing } from "../mepie-tool-ui/tool-renderer.ts";
 
 interface RegisteredTool {
 	readonly name: string;
+	readonly description: string;
+	readonly parameters: unknown;
 	readonly renderShell?: "default" | "self";
 	renderCall(args: unknown, theme: Theme, context: unknown): Component;
 	renderResult(
@@ -99,7 +102,35 @@ function renderCompleted(
 	};
 }
 
-test("thinking text includes the Nerd Font icon and preserves its theme color, italic style, and trailing spacing", async () => {
+function unstyledLines(value: string): string {
+	return value
+		.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+		.split("\n")
+		.map((line) => line.trim())
+		.join("\n");
+}
+
+function assistantMessage(content: AssistantMessage["content"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		model: "gpt-5.4-mini",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+}
+
+test("thinking text includes the Nerd Font icon and preserves its styling without trailing spacing", async () => {
 	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
 	const handlers = new Map<string, EventHandler>();
 	const originalForeground = Theme.prototype.fg;
@@ -170,8 +201,8 @@ test("thinking text includes the Nerd Font icon and preserves its theme color, i
 		assert.ok(planningLine > inspectingLine);
 		assert.ok(implementingLine > planningLine);
 		assert.equal(lines.slice(inspectingLine, implementingLine).some((line) => line.trim() === ""), false);
-		assert.equal(lines.at(-1), "");
-		assert.equal(lines.filter((line) => line === "").length, 2);
+		assert.notEqual(lines.at(-1), "");
+		assert.equal(lines.filter((line) => line === "").length, 1);
 
 		const assistantMessage: AssistantMessage = {
 			...message,
@@ -190,8 +221,8 @@ test("thinking text includes the Nerd Font icon and preserves its theme color, i
 			],
 		};
 		const commentaryLines = new AssistantMessageComponent(commentaryMessage, false, markdownTheme).render(80);
-		assert.equal(commentaryLines.at(-1), "");
-		assert.equal(commentaryLines.filter((line) => line === "").length, 2);
+		assert.notEqual(commentaryLines.at(-1), "");
+		assert.equal(commentaryLines.filter((line) => line === "").length, 1);
 
 		await shutdown({}, { mode: "tui" });
 		assert.equal(Theme.prototype.fg, foregroundSpy);
@@ -267,40 +298,134 @@ test("mepie-tool-ui overrides every built-in tool with a self-rendered shell", (
 	for (const tool of tools.values()) assert.equal(tool.renderShell, "self");
 });
 
-test("Mepie tool rows omit Pi's leading spacer without affecting other tools", async () => {
-	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
+test("Mepie tool rows omit spacing only when another Mepie tool immediately precedes them", async () => {
+	type EventContext = {
+		readonly mode: string;
+		readonly sessionManager: { getBranch(): SessionEntry[] };
+	};
+	type EventHandler = (event: unknown, context: EventContext) => unknown;
 	const handlers = new Map<string, EventHandler>();
 	const pi = {
 		on(event: string, handler: EventHandler) {
 			handlers.set(event, handler);
 		},
 	};
+	const originalRender = ToolExecutionComponent.prototype.render;
 	registerMepieToolSpacing(pi as unknown as ExtensionAPI);
 
 	const start = handlers.get("session_start");
+	const messageEnd = handlers.get("message_end");
 	const shutdown = handlers.get("session_shutdown");
 	assert.ok(start);
+	assert.ok(messageEnd);
 	assert.ok(shutdown);
-	await start({}, { mode: "tui" });
+	let branch: SessionEntry[] = [];
+	const context: EventContext = { mode: "tui", sessionManager: { getBranch: () => branch } };
+	await start({}, context);
 
 	try {
-		const bash = registeredTools().get("bash");
+		const tools = registeredTools();
+		const read = tools.get("read");
+		const bash = tools.get("bash");
+		assert.ok(read);
 		assert.ok(bash);
 		const ui = { requestRender() {} } as unknown as TUI;
-		const compact = new ToolExecutionComponent(
-			"bash",
+		const first = new ToolExecutionComponent(
+			"read",
 			"tool-1",
-			{ command: "echo done" },
+			{ path: "README.md" },
+			{},
+			read as unknown as ToolDefinition,
+			ui,
+			process.cwd(),
+		);
+		assert.equal(first.render(120)[0], "");
+
+		await messageEnd({
+			message: assistantMessage([
+				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "README.md" } },
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: { command: "bun test" } },
+			]),
+		}, context);
+		const consecutive = new ToolExecutionComponent(
+			"bash",
+			"tool-2",
+			{ command: "bun test" },
 			{},
 			bash as unknown as ToolDefinition,
 			ui,
 			process.cwd(),
 		);
-		assert.notEqual(compact.render(120)[0], "");
+		assert.notEqual(consecutive.render(120)[0], "");
+
+		await messageEnd({
+			message: assistantMessage([
+				{ type: "toolCall", id: "tool-3", name: "custom_tool", arguments: {} },
+				{ type: "toolCall", id: "tool-4", name: "read", arguments: { path: "README.md" } },
+			]),
+		}, context);
+		const afterUnrelated = new ToolExecutionComponent(
+			"read",
+			"tool-4",
+			{ path: "README.md" },
+			{},
+			read as unknown as ToolDefinition,
+			ui,
+			process.cwd(),
+		);
+		assert.equal(afterUnrelated.render(120)[0], "");
+
+		const alreadyPersisted = assistantMessage([
+			{ type: "toolCall", id: "persisted-1", name: "read", arguments: { path: "README.md" } },
+			{ type: "toolCall", id: "persisted-2", name: "bash", arguments: { command: "bun test" } },
+		]);
+		branch = [{
+			type: "message",
+			id: "persisted-entry",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: alreadyPersisted,
+		}];
+		await messageEnd({ message: alreadyPersisted }, context);
+		const persistedFirst = new ToolExecutionComponent(
+			"read",
+			"persisted-1",
+			{ path: "README.md" },
+			{},
+			read as unknown as ToolDefinition,
+			ui,
+			process.cwd(),
+		);
+		assert.equal(persistedFirst.render(120)[0], "");
+
+		branch = [{
+			type: "message",
+			id: "entry-1",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: assistantMessage([
+				{ type: "toolCall", id: "tool-4", name: "read", arguments: { path: "README.md" } },
+			]),
+		}];
+		await messageEnd({
+			message: assistantMessage([
+				{ type: "toolCall", id: "tool-5", name: "bash", arguments: { command: "bun test" } },
+			]),
+		}, context);
+		const nextTurn = new ToolExecutionComponent(
+			"bash",
+			"tool-5",
+			{ command: "bun test" },
+			{},
+			bash as unknown as ToolDefinition,
+			ui,
+			process.cwd(),
+		);
+		assert.notEqual(nextTurn.render(120)[0], "");
 
 		const unrelated = new ToolExecutionComponent(
 			"custom_tool",
-			"tool-2",
+			"tool-6",
 			{},
 			{},
 			undefined,
@@ -309,15 +434,52 @@ test("Mepie tool rows omit Pi's leading spacer without affecting other tools", a
 		);
 		assert.equal(unrelated.render(120)[0], "");
 	} finally {
-		await shutdown({}, { mode: "tui" });
+		await shutdown({}, context);
 	}
+	assert.equal(ToolExecutionComponent.prototype.render, originalRender);
+});
+
+test("Mepie spacing stays active until every sharing extension shuts down", async () => {
+	type EventHandler = (event: unknown, context: {
+		readonly mode: string;
+		readonly sessionManager: { getBranch(): [] };
+	}) => unknown;
+	const originalRender = ToolExecutionComponent.prototype.render;
+	const extensionHandlers: Array<Map<string, EventHandler>> = [];
+
+	for (let index = 0; index < 2; index += 1) {
+		const handlers = new Map<string, EventHandler>();
+		registerMepieToolSpacing({
+			on(event: string, handler: EventHandler) {
+				handlers.set(event, handler);
+			},
+		} as unknown as ExtensionAPI);
+		extensionHandlers.push(handlers);
+	}
+
+	const context = { mode: "tui", sessionManager: { getBranch: () => [] as [] } };
+	const firstStart = extensionHandlers[0]?.get("session_start");
+	const firstShutdown = extensionHandlers[0]?.get("session_shutdown");
+	const secondStart = extensionHandlers[1]?.get("session_start");
+	const secondShutdown = extensionHandlers[1]?.get("session_shutdown");
+	assert.ok(firstStart);
+	assert.ok(firstShutdown);
+	assert.ok(secondStart);
+	assert.ok(secondShutdown);
+
+	await firstStart({}, context);
+	await secondStart({}, context);
+	assert.notEqual(ToolExecutionComponent.prototype.render, originalRender);
+	await firstShutdown({}, context);
+	assert.notEqual(ToolExecutionComponent.prototype.render, originalRender);
+	await secondShutdown({}, context);
+	assert.equal(ToolExecutionComponent.prototype.render, originalRender);
 });
 
 test("collapsed successful tools render one summary line and no result row", () => {
 	const tools = registeredTools();
 	const cases: readonly [string, unknown, AgentToolResult<unknown>, RegExp][] = [
 		["read", { path: "src/index.ts" }, { content: [{ type: "text", text: "one\ntwo\nthree" }], details: undefined }, /^󰈙 Read src\/index\.ts · 3 lines$/],
-		["bash", { command: "bun run check" }, { content: [{ type: "text", text: "(no output)" }], details: undefined }, /^ Bash bun run check · no output$/],
 		["edit", { path: "src/index.ts", edits: [] }, { content: [{ type: "text", text: "Updated" }], details: { diff: " context\n-old\n+new", patch: "" } }, /^󰏫 Edit src\/index\.ts · \+1 −1$/],
 		["write", { path: "README.md", content: "a\nb" }, { content: [{ type: "text", text: "Wrote README.md" }], details: undefined }, /^󰆓 Write README\.md · 2 lines · 3 B$/],
 		["grep", { pattern: "renderCall", path: "src" }, { content: [{ type: "text", text: "a.ts:1: renderCall\nb.ts:2: renderCall" }], details: undefined }, /^󰍉 Grep \/renderCall\/ in src · 2 results$/],
@@ -355,26 +517,72 @@ test("collapsed skill reads use the Nerd Font skill label and semantic text colo
 	assert.doesNotMatch(rendered, /Read|lines/);
 });
 
-test("collapsed Bash rows show only the first physical script line", () => {
+test("Bash exposes an optional purpose title", () => {
+	const bash = registeredTools().get("bash");
+	assert.ok(bash);
+	const parameters = bash.parameters as { readonly properties?: { readonly purpose?: { readonly description?: string } } };
+	assert.match(bash.description, /set purpose to a short title/i);
+	assert.match(parameters.properties?.purpose?.description ?? "", /title describing what the command does/i);
+});
+
+test("collapsed Bash rows show the purpose and first two physical script lines", () => {
 	const bash = registeredTools().get("bash");
 	assert.ok(bash);
 	const rendered = renderCompleted(
 		bash,
-		{ command: "set -e\nbun test\nbun run check" },
+		{
+			purpose: "Commit changes",
+			command: "git add .\ngit commit -m \"Improve Bash rendering\"\ngit status --short",
+		},
 		{ content: [{ type: "text", text: "(no output)" }], details: undefined },
 	);
-	assert.equal(rendered.call, " Bash set -e · no output");
+	assert.equal(rendered.call, " Bash · Commit changes · 3 lines");
+	assert.equal(
+		unstyledLines(rendered.result),
+		"├─ git add .\n├─ git commit -m \"Improve Bash rendering\"\n╰─ … 1 more line",
+	);
 });
 
-test("bash summaries do not count a trailing line terminator as output", () => {
+test("expanded Bash rows show the complete script before its output", () => {
+	const bash = registeredTools().get("bash");
+	assert.ok(bash);
+	const rendered = renderCompleted(
+		bash,
+		{ purpose: "Commit changes", command: "git add .\ngit commit -m \"Improve Bash rendering\"\ngit status --short" },
+		{ content: [{ type: "text", text: "[main abc123] Improve Bash rendering" }], details: undefined },
+		true,
+	);
+	assert.equal(rendered.call, " Bash · Commit changes · 3 lines");
+	assert.equal(
+		unstyledLines(rendered.result),
+		"├─ git add .\n├─ git commit -m \"Improve Bash rendering\"\n╰─ git status --short\n\n[main abc123] Improve Bash rendering",
+	);
+});
+
+test("Bash script previews truncate when collapsed and wrap when expanded", () => {
+	const bash = registeredTools().get("bash");
+	assert.ok(bash);
+	const args = {
+		purpose: "Commit changes",
+		command: `git add ${"long-path/".repeat(8)}file.ts\ngit commit -m "Improve Bash rendering"`,
+	};
+	const result = { content: [{ type: "text" as const, text: "(no output)" }], details: undefined };
+	const collapsed = renderCompleted(bash, args, result, false, 36).result.split("\n");
+	const expanded = renderCompleted(bash, args, result, true, 36).result.split("\n");
+	assert.equal(collapsed.length, 2);
+	assert.ok(expanded.length > 2);
+	for (const line of [...collapsed, ...expanded]) assert.ok(visibleWidth(line) <= 36);
+});
+
+test("Bash falls back to a generic purpose and ignores one trailing script terminator", () => {
 	const bash = registeredTools().get("bash");
 	assert.ok(bash);
 	assert.equal(
-		renderCompleted(bash, { command: "printf 'done\\n'" }, {
+		renderCompleted(bash, { command: "printf done\n" }, {
 			content: [{ type: "text", text: "done\n" }],
 			details: undefined,
 		}).call,
-		" Bash printf 'done\\n' · 1 line",
+		" Bash · Run shell command · 1 line",
 	);
 });
 

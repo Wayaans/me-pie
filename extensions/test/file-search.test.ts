@@ -32,6 +32,7 @@ import {
 	type ResolvedBinary,
 } from "../file-search/src/binaries.ts";
 import { formatOutput } from "../file-search/src/output.ts";
+import { registerMepieToolUi } from "../mepie-tool-ui/tools.ts";
 
 function makeEnvironment(options: { available?: string[]; failInstall?: boolean } = {}) {
 	const installed = new Set<string>();
@@ -225,8 +226,11 @@ function renderCompletedSearch(
 
 initTheme();
 
-test("file-search rows omit Pi's leading tool spacer", async () => {
-	type EventHandler = (event: unknown, context: { readonly mode: string }) => unknown;
+test("file-search tools share Mepie tool-group spacing", async () => {
+	type EventHandler = (event: unknown, context: {
+		readonly mode: string;
+		readonly sessionManager: { getBranch(): [] };
+	}) => unknown;
 	const handlers = new Map<string, EventHandler[]>();
 	const tools = new Map<string, RenderedSearchTool>();
 	const pi = {
@@ -237,13 +241,17 @@ test("file-search rows omit Pi's leading tool spacer", async () => {
 			tools.set(tool.name, tool as unknown as RenderedSearchTool);
 		},
 	};
+	registerMepieToolUi(pi as unknown as ExtensionAPI, process.cwd());
 	fileSearchTools(pi as unknown as ExtensionAPI);
 
 	const spacingStart = handlers.get("session_start")?.[0];
+	const messageEnd = handlers.get("message_end")?.[0];
 	const spacingShutdown = handlers.get("session_shutdown")?.[0];
 	assert.ok(spacingStart);
+	assert.ok(messageEnd);
 	assert.ok(spacingShutdown);
-	await spacingStart({}, { mode: "tui" });
+	const context = { mode: "tui", sessionManager: { getBranch: () => [] as [] } };
+	await spacingStart({}, context);
 
 	try {
 		const fd = tools.get("fd");
@@ -257,9 +265,51 @@ test("file-search rows omit Pi's leading tool spacer", async () => {
 			{ requestRender() {} } as unknown as TUI,
 			process.cwd(),
 		);
-		assert.notEqual(component.render(120)[0], "");
+		assert.equal(component.render(120)[0], "");
+
+		await messageEnd({
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "README.md" } },
+					{ type: "toolCall", id: "search-2", name: "fd", arguments: { pattern: "*.ts" } },
+				],
+			},
+		}, context);
+		const afterBuiltIn = new ToolExecutionComponent(
+			"fd",
+			"search-2",
+			{ pattern: "*.ts", path: "src" },
+			{},
+			fd as unknown as ToolDefinition,
+			{ requestRender() {} } as unknown as TUI,
+			process.cwd(),
+		);
+		assert.notEqual(afterBuiltIn.render(120)[0], "");
+
+		await messageEnd({
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "search-3", name: "rg", arguments: { pattern: "renderCall" } },
+					{ type: "toolCall", id: "read-4", name: "read", arguments: { path: "README.md" } },
+				],
+			},
+		}, context);
+		const read = tools.get("read");
+		assert.ok(read);
+		const afterFileSearch = new ToolExecutionComponent(
+			"read",
+			"read-4",
+			{ path: "README.md" },
+			{},
+			read as unknown as ToolDefinition,
+			{ requestRender() {} } as unknown as TUI,
+			process.cwd(),
+		);
+		assert.notEqual(afterFileSearch.render(120)[0], "");
 	} finally {
-		await spacingShutdown({}, { mode: "tui" });
+		await spacingShutdown({}, context);
 	}
 });
 

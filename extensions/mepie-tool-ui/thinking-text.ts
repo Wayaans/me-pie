@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AssistantMessageComponent, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
+import { Container, Markdown } from "@earendil-works/pi-tui";
 
 const THINKING_ICON = "󰧑";
 const THINKING_RENDER_PATCH = Symbol.for("mepie.tool-ui.thinking-render-patch");
@@ -38,10 +38,6 @@ function useThinkingRendering(): () => void {
 	): void {
 		Reflect.apply(originalUpdateContent, this, [withThinkingIcons(message), isStreaming]);
 		setRegularThinkingWeight(this);
-		if (!needsTrailingSpacer(message)) return;
-
-		const contentContainer = this.children[0];
-		if (contentContainer instanceof Container) contentContainer.addChild(new Spacer(1));
 	};
 
 	Reflect.set(updateContentWithThinkingStyle, THINKING_RENDER_PATCH, { original: originalUpdateContent });
@@ -115,23 +111,4 @@ function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
 function originalPatchedFunction<T extends object>(current: T, marker: symbol): T {
 	const patch: unknown = Reflect.get(current, marker);
 	return isRecord(patch) && typeof patch.original === "function" ? patch.original as T : current;
-}
-
-function needsTrailingSpacer(message: AssistantMessage): boolean {
-	const hasToolCalls = message.content.some((content) => content.type === "toolCall");
-	const hasTrailingStatus = message.stopReason === "length"
-		|| (!hasToolCalls && (message.stopReason === "aborted" || message.stopReason === "error"));
-	if (hasTrailingStatus) return false;
-
-	let hasToolCallAfter = false;
-	for (let index = message.content.length - 1; index >= 0; index -= 1) {
-		const content = message.content[index];
-		if (content?.type === "toolCall") {
-			hasToolCallAfter = true;
-			continue;
-		}
-		if (content?.type === "text" && content.text.trim()) return hasToolCallAfter;
-		if (content?.type === "thinking" && content.thinking.trim()) return true;
-	}
-	return false;
 }
