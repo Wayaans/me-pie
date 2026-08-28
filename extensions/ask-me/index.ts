@@ -292,7 +292,7 @@ export default function askMe(pi: ExtensionAPI): void {
 				const answer = answerById.get(question.id);
 				lines.push(theme.fg("toolTitle", theme.bold(`? Question ${index + 1}:`)), question.question);
 				if (question.detail) lines.push(theme.fg("muted", question.detail));
-				lines.push("", theme.fg("toolTitle", theme.bold("↳ Answer:")));
+				lines.push(theme.fg("toolTitle", theme.bold("↳ Answer:")));
 				lines.push(answer
 					? `${theme.fg("success", "✓")} ${answer.label}`
 					: `${theme.fg("dim", "○")} Not answered`);

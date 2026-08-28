@@ -364,8 +364,10 @@ test("ask-me renderer shows the complete questionnaire result", () => {
 	assert.match(header.render(120).join("\n"), /ask-me · questionnaire · ✓ 2 of 2 answered/);
 	assert.match(result.render(120).join("\n"), /Deployment choices/);
 	assert.match(result.render(120).join("\n"), /\? Question 1:[\s\S]*Which database/);
-	assert.match(result.render(120).join("\n"), /✓ PostgreSQL[\s\S]*Supports concurrent writes\./);
-	assert.match(result.render(120).join("\n"), /↳ Answer:[\s\S]*✓ Yes/);
+	const renderedResult = result.render(120).join("\n");
+	assert.match(renderedResult, /✓ PostgreSQL[\s\S]*Supports concurrent writes\./);
+	assert.match(renderedResult, /↳ Answer:[\s\S]*✓ Yes/);
+	assert.doesNotMatch(renderedResult, /This affects production deployment\.\n\n↳ Answer:/);
 	assert.match(result.render(120).join("\n"), /≡ Overall response:[\s\S]*○ Not answered/);
 });
 
