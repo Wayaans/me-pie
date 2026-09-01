@@ -101,6 +101,7 @@ test("ask-me cancellation prints partial and unanswered results without inferrin
 
 interface CapturedTool {
 	executionMode?: string;
+	promptGuidelines?: string[];
 	renderShell?: string;
 	execute: (...args: unknown[]) => Promise<unknown>;
 	renderCall: (args: unknown, theme: unknown, context: unknown) => Component;
@@ -136,11 +137,19 @@ function renderContext() {
 	};
 }
 
+test("ask-me guidance keeps long-context handling specific to confirmations", () => {
+	const tool = captureTool();
+	const guidance = tool.promptGuidelines?.join("\n") ?? "";
+	assert.match(guidance, /confirmation questions/);
+	assert.match(guidance, /assistant response before calling ask_me/);
+	assert.doesNotMatch(guidance, /free-form questions whose supporting context is long/);
+});
+
 test("ask-me questionnaire never renders lines wider than the terminal", () => {
 	const request = normalizeAskMeRequest(mixedInput);
 	const component = new AskMeQuestionnaire(
 		request,
-		{ requestRender() {} } as never,
+		{ terminal: { rows: 100 }, requestRender() {} } as never,
 		plainTheme as never,
 		{ matches: () => false } as never,
 		() => {},
@@ -149,6 +158,33 @@ test("ask-me questionnaire never renders lines wider than the terminal", () => {
 	for (const width of [1, 12, 40, 100]) {
 		for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width);
 	}
+});
+
+test("ask-me keeps confirmation choices visible while long context scrolls", () => {
+	const request = normalizeAskMeRequest({
+		questions: [{
+			id: "deploy",
+			type: "confirmation",
+			question: "Approve this deployment?",
+			detail: Array.from({ length: 30 }, (_, index) => `Context line ${index + 1}`).join("\n"),
+		}],
+	});
+	const component = new AskMeQuestionnaire(
+		request,
+		{ terminal: { rows: 24 }, requestRender() {} } as never,
+		plainTheme as never,
+		{ matches: () => false } as never,
+		() => {},
+	);
+
+	const firstPage = component.render(80).join("\n");
+	assert.ok(component.render(80).length <= 22);
+	assert.match(firstPage, /Context 1–\d+ of 31/);
+	assert.match(firstPage, /Yes[\s\S]*No[\s\S]*Write another answer/);
+	assert.match(firstPage, /Shift\+↑\/↓ scroll context/);
+
+	component.handleInput("\u001b[1;2B");
+	assert.match(component.render(80).join("\n"), /Context 2–\d+ of 31/);
 });
 
 test("ask-me confirmation questions include a custom written answer option", () => {
@@ -161,7 +197,7 @@ test("ask-me confirmation questions include a custom written answer option", () 
 	});
 	const component = new AskMeQuestionnaire(
 		request,
-		{ requestRender() {} } as never,
+		{ terminal: { rows: 100 }, requestRender() {} } as never,
 		plainTheme as never,
 		{ matches: () => false } as never,
 		() => {},
@@ -190,7 +226,7 @@ test("ask-me recommendation shortcut fills without submitting and requires expli
 	};
 	const component = new AskMeQuestionnaire(
 		request,
-		{ requestRender() {} } as never,
+		{ terminal: { rows: 100 }, requestRender() {} } as never,
 		plainTheme as never,
 		keybindings as never,
 		(result) => { completed.push(result); },

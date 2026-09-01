@@ -240,6 +240,7 @@ export default function askMe(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use ask_me whenever progress requires user input, clarification, selection, interviewing, or confirmation instead of asking only in prose.",
 			"Group related questions into one ask_me call, use detail for decision context, and include a recommendation only when its reason can be explained.",
+			"For confirmation questions with long supporting context, explain that context in the assistant response before calling ask_me. Keep the confirmation question concise, and keep detail to a short summary of the action, target, and consequence instead of repeating the full context.",
 			"Treat a cancelled ask_me result as no decision; never infer approval or silently use a recommendation.",
 		],
 		parameters: AskMeParams,

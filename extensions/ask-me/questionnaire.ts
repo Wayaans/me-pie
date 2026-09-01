@@ -34,7 +34,11 @@ export class AskMeQuestionnaire implements Focusable {
 	private overallResponse: string | undefined;
 	private customInput = false;
 	private validationMessage: string | undefined;
+	private contextScrollOffset = 0;
+	private contextLineCount = 0;
+	private contextViewportHeight = 0;
 	private cachedWidth: number | undefined;
+	private cachedRows: number | undefined;
 	private cachedLines: string[] | undefined;
 	private _focused = false;
 
@@ -72,6 +76,7 @@ export class AskMeQuestionnaire implements Focusable {
 
 	invalidate(): void {
 		this.cachedWidth = undefined;
+		this.cachedRows = undefined;
 		this.cachedLines = undefined;
 		this.editor.invalidate();
 	}
@@ -184,6 +189,7 @@ export class AskMeQuestionnaire implements Focusable {
 			}
 		}
 		this.currentIndex = index;
+		this.contextScrollOffset = 0;
 		this.customInput = false;
 		this.validationMessage = undefined;
 		this.loadCurrentEditor();
@@ -278,6 +284,51 @@ export class AskMeQuestionnaire implements Focusable {
 		return this.allRequiredAnswered() || Boolean(this.overallResponse);
 	}
 
+	private scrollContext(delta: number): void {
+		if (this.contextLineCount <= this.contextViewportHeight) return;
+		const maximumOffset = this.contextLineCount - this.contextViewportHeight;
+		const nextOffset = Math.min(maximumOffset, Math.max(0, this.contextScrollOffset + delta));
+		if (nextOffset === this.contextScrollOffset) return;
+		this.contextScrollOffset = nextOffset;
+		this.refresh();
+	}
+
+	private fitContextToTerminal(
+		lines: string[],
+		contextStart: number,
+		contextEnd: number,
+		width: number,
+	): string[] {
+		const contextLines = lines.slice(contextStart, contextEnd);
+		const maximumLines = Math.max(1, this.tui.terminal.rows - 2);
+		const fixedLineCount = lines.length - contextLines.length;
+		const availableLines = maximumLines - fixedLineCount;
+		this.contextLineCount = contextLines.length;
+
+		if (contextLines.length <= availableLines) {
+			this.contextScrollOffset = 0;
+			this.contextViewportHeight = contextLines.length;
+			return lines;
+		}
+
+		const viewportHeight = Math.max(1, availableLines - 1);
+		const maximumOffset = Math.max(0, contextLines.length - viewportHeight);
+		this.contextScrollOffset = Math.min(this.contextScrollOffset, maximumOffset);
+		this.contextViewportHeight = viewportHeight;
+		const visibleEnd = Math.min(contextLines.length, this.contextScrollOffset + viewportHeight);
+		const indicator = truncateToWidth(this.theme.fg(
+			"dim",
+			` Context ${this.contextScrollOffset + 1}–${visibleEnd} of ${contextLines.length} · Shift+↑/↓ scroll context`,
+		), width, "");
+
+		return [
+			...lines.slice(0, contextStart),
+			...contextLines.slice(this.contextScrollOffset, visibleEnd),
+			indicator,
+			...lines.slice(contextEnd),
+		];
+	}
+
 	private submitAll(): void {
 		if (this.request.displayType === "questionnaire") {
 			this.overallResponse = this.editor.getText().trim() || undefined;
@@ -298,6 +349,15 @@ export class AskMeQuestionnaire implements Focusable {
 	}
 
 	handleInput(data: string): void {
+		if (matchesKey(data, Key.shift("up"))) {
+			this.scrollContext(-1);
+			return;
+		}
+		if (matchesKey(data, Key.shift("down"))) {
+			this.scrollContext(1);
+			return;
+		}
+
 		if (this.keybindings.matches(data, "tui.select.cancel")) {
 			if (this.customInput) {
 				this.customInput = false;
@@ -379,9 +439,14 @@ export class AskMeQuestionnaire implements Focusable {
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+		const terminalRows = this.tui.terminal.rows;
+		if (this.cachedLines && this.cachedWidth === width && this.cachedRows === terminalRows) {
+			return this.cachedLines;
+		}
 		const renderWidth = Math.max(1, width);
 		const lines: string[] = [];
+		let contextStart: number | undefined;
+		let contextEnd: number | undefined;
 		const add = (text: string, prefix = " ") => {
 			const prefixWidth = visibleWidth(prefix);
 			if (prefixWidth >= renderWidth) {
@@ -429,6 +494,7 @@ export class AskMeQuestionnaire implements Focusable {
 				? this.theme.fg("success", "Press Enter to submit all answers.")
 				: this.theme.fg("warning", "Answer required questions or provide an Overall response."));
 		} else {
+			contextStart = lines.length;
 			add(this.theme.bold(question.question));
 			if (question.detail) add(this.theme.fg("muted", question.detail));
 			if (question.recommendation) {
@@ -436,6 +502,7 @@ export class AskMeQuestionnaire implements Focusable {
 				add(`${this.theme.fg("warning", "Recommended:")} ${question.recommendation.answer}`);
 				add(this.theme.fg("muted", question.recommendation.reason));
 			}
+			contextEnd = lines.length;
 			lines.push("");
 
 			if (question.type === "question" || this.customInput) {
@@ -469,8 +536,12 @@ export class AskMeQuestionnaire implements Focusable {
 		add(this.theme.fg("dim", truncateToWidth(controls, Math.max(1, renderWidth - 1))));
 		lines.push(this.theme.fg("accent", "─".repeat(renderWidth)));
 
+		const visibleLines = contextStart !== undefined && contextEnd !== undefined
+			? this.fitContextToTerminal(lines, contextStart, contextEnd, renderWidth)
+			: lines;
 		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
+		this.cachedRows = terminalRows;
+		this.cachedLines = visibleLines;
+		return visibleLines;
 	}
 }

@@ -11,6 +11,8 @@
 
 Each question can include decision context and a recommendation with a reason. In the TUI, **Ctrl+R** applies a recommendation only when the question has no answer. It never submits automatically or overwrites an answer.
 
+For confirmations with long supporting context, the LLM should explain the full context in its assistant response before opening `ask_me`. The confirmation should contain a concise question and a short summary of the action, target, and consequence. This guidance applies only to confirmation questions.
+
 ## Conversation display
 
 While active, the tool uses a compact status row:
@@ -43,6 +45,7 @@ The completed transcript includes the interview title, so round names and other 
 - **Enter / Tab** — save and open the next question
 - **Shift+Tab** — previous question
 - **Arrow keys** — move through selection options
+- **Shift+Up / Shift+Down** — scroll long question context
 - **Shift+Enter** — newline in a text answer
 - **Ctrl+R** — use the recommendation when unanswered
 - **Esc** — return from custom input or cancel the questionnaire
