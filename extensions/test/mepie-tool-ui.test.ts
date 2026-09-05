@@ -439,6 +439,77 @@ test("Mepie tool rows omit spacing only when another Mepie tool immediately prec
 	assert.equal(ToolExecutionComponent.prototype.render, originalRender);
 });
 
+test("Mepie tool rows omit spacing while the next tool call is still streaming", async () => {
+	type EventContext = {
+		readonly mode: string;
+		readonly sessionManager: { getBranch(): SessionEntry[] };
+	};
+	type EventHandler = (event: unknown, context: EventContext) => unknown;
+	const originalRender = ToolExecutionComponent.prototype.render;
+	const handlers = new Map<string, EventHandler>();
+	registerMepieToolSpacing({
+		on(event: string, handler: EventHandler) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI);
+
+	const start = handlers.get("session_start");
+	const messageUpdate = handlers.get("message_update");
+	const shutdown = handlers.get("session_shutdown");
+	assert.ok(start);
+	assert.ok(messageUpdate);
+	assert.ok(shutdown);
+	let branch: SessionEntry[] = [];
+	const context: EventContext = { mode: "tui", sessionManager: { getBranch: () => branch } };
+	await start({}, context);
+
+	try {
+		const tools = registeredTools();
+		const bash = tools.get("bash");
+		assert.ok(bash);
+		const ui = { requestRender() {} } as unknown as TUI;
+
+		branch = [{
+			type: "message",
+			id: "entry-1",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: assistantMessage([
+				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "README.md" } },
+			]),
+		}];
+
+		// While the tool call streams, its id must already count as compact.
+		await messageUpdate({
+			message: assistantMessage([
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: {} },
+			]),
+		}, context);
+		const streaming = new ToolExecutionComponent(
+			"bash",
+			"tool-2",
+			{ command: "bun test" },
+			{},
+			bash as unknown as ToolDefinition,
+			ui,
+			process.cwd(),
+		);
+		assert.notEqual(streaming.render(120)[0], "");
+
+		// Visible text before the tool call restores the leading blank line.
+		await messageUpdate({
+			message: assistantMessage([
+				{ type: "text", text: "Running the tests now." },
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: { command: "bun test" } },
+			]),
+		}, context);
+		assert.equal(streaming.render(120)[0], "");
+	} finally {
+		await shutdown({}, context);
+	}
+	assert.equal(ToolExecutionComponent.prototype.render, originalRender);
+});
+
 test("Mepie spacing stays active until every sharing extension shuts down", async () => {
 	type EventHandler = (event: unknown, context: {
 		readonly mode: string;

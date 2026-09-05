@@ -9,6 +9,7 @@ import {
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, sliceByColumn, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 
 export interface SummaryPart {
@@ -92,17 +93,35 @@ function isMepieToolSpacingState(value: unknown): value is MepieToolSpacingState
 
 export function registerMepieToolSpacing(pi: ExtensionAPI): void {
 	let active = false;
+	let lastStreamingMessage: AssistantMessage | undefined;
+	let lastStreamingSignature: string | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
 		if (active) deactivateCompactToolSpacing();
 		active = ctx.mode === "tui";
+		lastStreamingMessage = undefined;
+		lastStreamingSignature = undefined;
 		if (!active) return;
 		rebuildCompactMepieToolCalls(ctx.sessionManager?.getBranch?.() ?? []);
 		activateCompactToolSpacing();
 	});
 
+	// Compact ids are only rebuilt at message_end, so a tool call still streaming is not
+	// in the set yet and keeps Pi's leading blank line. Rebuild during streaming too;
+	// the signature memo skips deltas that cannot change compactness.
+	pi.on("message_update", (event, ctx) => {
+		if (!active || event.message.role !== "assistant") return;
+		const signature = compactSignature(event.message);
+		if (event.message === lastStreamingMessage && signature === lastStreamingSignature) return;
+		lastStreamingMessage = event.message;
+		lastStreamingSignature = signature;
+		rebuildCompactMepieToolCalls(ctx.sessionManager?.getBranch?.() ?? [], event.message);
+	});
+
 	pi.on("message_end", (event, ctx) => {
 		if (!active || event.message.role !== "assistant") return;
+		lastStreamingMessage = undefined;
+		lastStreamingSignature = undefined;
 		rebuildCompactMepieToolCalls(ctx.sessionManager?.getBranch?.() ?? [], event.message);
 	});
 
@@ -126,7 +145,14 @@ export function withMepieToolUi<
 		...definition,
 		renderShell: "self",
 		renderCall(args, theme, context) {
-			const compactCall = context.expanded ? undefined : view.compactCall?.(args, context.cwd, theme);
+			// While the model streams tool arguments, args are partial ({}, then key by key).
+			// View functions assume complete args (e.g. displayPath(args.path)) and would throw,
+			// which makes Pi fall back to rendering the bare tool name. Render icon + label only
+			// until argsComplete, matching the eventual line shape.
+			const complete = context.argsComplete && args !== undefined;
+			const compactCall = complete && !context.expanded
+				? tryOrUndefined(() => view.compactCall?.(args, context.cwd, theme))
+				: undefined;
 			if (compactCall) {
 				const insetCall = new HorizontalInset(compactCall);
 				mepieToolSpacing.callComponents.add(insetCall);
@@ -139,7 +165,7 @@ export function withMepieToolUi<
 			line.update({
 				icon: view.icon,
 				label: view.label,
-				target: sanitizeInline(view.target(args, context.cwd)),
+				target: complete ? tryOrEmpty(() => sanitizeInline(view.target(args, context.cwd))) : "",
 				targetColor: view.targetColor ?? "muted",
 				targetTruncation: view.targetTruncation ?? "middle",
 				theme,
@@ -230,6 +256,16 @@ function rebuildCompactMepieToolCalls(
 
 	mepieToolSpacing.compactToolCallIds.clear();
 	for (const toolCallId of nextCompactIds) mepieToolSpacing.compactToolCallIds.add(toolCallId);
+}
+
+/** Compactness only depends on tool call ids and whether text/thinking became visible. */
+function compactSignature(message: AssistantMessage): string {
+	return message.content.map((content) => {
+		if (content.type === "toolCall") return `call:${content.id}`;
+		if (content.type === "text") return content.text.trim() ? "text" : "text-empty";
+		if (content.type === "thinking") return content.thinking.trim() ? "thinking" : "thinking-empty";
+		return "";
+	}).join("|");
 }
 
 function entriesContainMessage(
@@ -413,6 +449,22 @@ function fitTarget(text: string, width: number, mode: "end" | "middle"): string 
 	const headWidth = contentWidth - tailWidth;
 	const totalWidth = visibleWidth(text);
 	return `${sliceByColumn(text, 0, headWidth, true)}…${sliceByColumn(text, totalWidth - tailWidth, tailWidth, true)}`;
+}
+
+function tryOrUndefined(value: () => Component | undefined): Component | undefined {
+	try {
+		return value();
+	} catch {
+		return undefined;
+	}
+}
+
+function tryOrEmpty(value: () => string): string {
+	try {
+		return value();
+	} catch {
+		return "";
+	}
 }
 
 function sanitizeInline(value: string): string {
