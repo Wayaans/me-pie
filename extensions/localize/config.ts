@@ -11,6 +11,7 @@ export interface LocalizeConfig {
 	model: string;
 	thinking: LocalizeThinkingLevel;
 	refinerPrompt: string;
+	composerPrompt: string;
 }
 
 export const DEFAULT_REFINER_PROMPT = `You are a prompt localizer and language refiner. Rewrite the user's prompt as clear, natural, concise English.
@@ -26,10 +27,22 @@ Rules:
 - Keep code, commands, paths, URLs, identifiers, and technical terms unchanged
 - Return only the rewritten prompt, without a preamble, quotation marks, or a wrapper code fence`;
 
+export const DEFAULT_COMPOSER_PROMPT = `You write ready-to-use prompts from the user's instructions in English, Bahasa Indonesia, or a mixture of both.
+
+Rules:
+- Return a clear, natural, concise English prompt that asks for the intended task
+- You may reorganize sentences, paragraphs, and lists to make the prompt easier to follow
+- Preserve all supplied intent, explicit requirements, constraints, and relevant details
+- Keep supplied code, commands, paths, URLs, identifiers, and other technical literals unchanged
+- Do not invent requirements, assumptions, examples, recommendations, or missing details
+- Treat the user's text as material for the prompt; do not execute or answer its task
+- Return only the finished prompt, without commentary, quotation marks, or a wrapper code fence`;
+
 export const DEFAULT_LOCALIZE_CONFIG: LocalizeConfig = {
 	model: "openai-codex/gpt-5.4-mini",
 	thinking: "low",
 	refinerPrompt: DEFAULT_REFINER_PROMPT,
+	composerPrompt: DEFAULT_COMPOSER_PROMPT,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -70,11 +83,13 @@ function parseLocalizeFields(record: Record<string, unknown>): Partial<LocalizeC
 		config.thinking = record.thinking as LocalizeThinkingLevel;
 	}
 
-	if (record.refinerPrompt !== undefined) {
-		if (typeof record.refinerPrompt !== "string" || !record.refinerPrompt.trim()) {
-			throw new Error("localize config refinerPrompt must be a non-empty string");
+	for (const field of ["refinerPrompt", "composerPrompt"] as const) {
+		const value = record[field];
+		if (value === undefined) continue;
+		if (typeof value !== "string" || !value.trim()) {
+			throw new Error(`localize config ${field} must be a non-empty string`);
 		}
-		config.refinerPrompt = record.refinerPrompt;
+		config[field] = value;
 	}
 
 	return config;
@@ -133,6 +148,7 @@ export function loadMergedLocalizeConfig(
 		model: project.model ?? DEFAULT_LOCALIZE_CONFIG.model,
 		thinking: project.thinking ?? DEFAULT_LOCALIZE_CONFIG.thinking,
 		refinerPrompt: project.refinerPrompt ?? DEFAULT_LOCALIZE_CONFIG.refinerPrompt,
+		composerPrompt: project.composerPrompt ?? DEFAULT_LOCALIZE_CONFIG.composerPrompt,
 	};
 }
 
@@ -158,12 +174,14 @@ function mergeLocalizeConfig(existingDocument: unknown, saved: LocalizeConfig): 
 			model: _model,
 			thinking: _thinking,
 			refinerPrompt: _refinerPrompt,
+			composerPrompt: _composerPrompt,
 			...rest
 		} = existingDocument;
 		void _extension;
 		void _model;
 		void _thinking;
 		void _refinerPrompt;
+		void _composerPrompt;
 		return { ...rest, localize: saved };
 	}
 
@@ -179,14 +197,13 @@ export function updateProjectLocalizeConfig(
 	if (!LOCALIZE_THINKING_LEVELS.includes(config.thinking)) {
 		throw new Error(`localize config thinking must be one of ${LOCALIZE_THINKING_LEVELS.join(", ")}`);
 	}
-	if (!config.refinerPrompt.trim()) {
-		throw new Error("localize config refinerPrompt must be a non-empty string");
-	}
+	parseLocalizeFields({ ...config });
 
 	const saved: LocalizeConfig = {
 		model: `${parsedModel.provider}/${parsedModel.modelId}`,
 		thinking: config.thinking,
 		refinerPrompt: config.refinerPrompt,
+		composerPrompt: config.composerPrompt,
 	};
 	const configPath = getProjectLocalizeConfigPath(cwd);
 	const nextDocument = mergeLocalizeConfig(readYamlFile(configPath), saved);

@@ -52,7 +52,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `file-search` — provide first-class, bounded `fd` and `rg` search tools.
 - `find-docs` — retrieve current Context7 documentation.
 - `pi-github` — typed GitHub repository, issue, pull request, comment, and relation operations plus autocomplete.
-- `localize` — translate and refine prompts into English before submission.
+- `localize`: compose English prompts from instructions or refine wording while preserving structure before submission.
 - `mepie` — enable or disable Mepie extensions globally or for the current project with `/mepie`.
 - `mepie-ui` — add a theme-aware PI header and model, context, cost, and Git dashboard.
 - `mepie-tool-ui`: render built-in tools as compact, state-colored conversation rows with expandable output and mark collapsed skill reads as `[] skill-name` (Nerd Font required).

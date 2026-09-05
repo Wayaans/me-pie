@@ -21,6 +21,25 @@ import {
 } from "./config.ts";
 
 type CompleteSimple = typeof completeSimple;
+type LocalizeMode = "compose" | "refine";
+type LocalizeCommand = { mode: LocalizeMode; source: string } | { mode: "config" };
+
+const USAGE = "Usage: /localize compose <instructions> | /localize refine <prompt> | /localize config";
+
+export function parseLocalizeCommand(args: string): LocalizeCommand | undefined {
+	const match = /^(\S+)(?:\r\n|\s)?([\s\S]*)$/.exec(args);
+	if (!match) return undefined;
+	const [, mode, source = ""] = match;
+	if (mode === "config") return source.trim() ? undefined : { mode };
+	if ((mode === "compose" || mode === "refine") && source.trim()) return { mode, source };
+	return undefined;
+}
+
+const SUBCOMMANDS = [
+	{ value: "compose", label: "compose", description: "Create an English prompt from instructions" },
+	{ value: "refine", label: "refine", description: "Refine English wording while preserving structure" },
+	{ value: "config", label: "config", description: "Edit the shared model, thinking, and prompts" },
+];
 
 export interface StructureValidationResult {
 	ok: boolean;
@@ -119,6 +138,7 @@ function requireInteractiveTui(ctx: ExtensionContext, command: string): boolean 
 }
 
 export async function requestLocalizedPrompt(
+	mode: LocalizeMode,
 	source: string,
 	config: LocalizeConfig,
 	ctx: Pick<ExtensionContext, "modelRegistry"> & Partial<Pick<ExtensionContext, "model">>,
@@ -151,7 +171,7 @@ export async function requestLocalizedPrompt(
 			const resolvedThinking = clampThinkingLevel(model, config.thinking);
 			response = await complete(
 				model,
-				{ systemPrompt: config.refinerPrompt, messages: [userMessage] },
+				{ systemPrompt: mode === "compose" ? config.composerPrompt : config.refinerPrompt, messages: [userMessage] },
 				{
 					apiKey: auth.apiKey ?? "",
 					...(auth.headers ? { headers: auth.headers } : {}),
@@ -180,16 +200,18 @@ export async function requestLocalizedPrompt(
 		.join("\n");
 	if (!localized.trim()) throw new Error("The localization model returned no text");
 
-	const validation = validateLocalizedStructure(source, localized);
-	if (!validation.ok) {
-		throw new Error(`The localization model changed the prompt structure: ${validation.reason}`);
+	if (mode === "refine") {
+		const validation = validateLocalizedStructure(source, localized);
+		if (!validation.ok) {
+			throw new Error(`The localization model changed the prompt structure: ${validation.reason}`);
+		}
 	}
 
 	return localized;
 }
 
 async function showLocalizeConfig(ctx: ExtensionContext): Promise<void> {
-	if (!requireInteractiveTui(ctx, "localize-config")) return;
+	if (!requireInteractiveTui(ctx, "localize config")) return;
 	if (!isProjectTrusted(ctx)) {
 		ctx.ui.notify("Trust this project before saving localize configuration", "error");
 		return;
@@ -240,6 +262,13 @@ async function showLocalizeConfig(ctx: ExtensionContext): Promise<void> {
 	);
 	if (!selectedThinking) return;
 
+	const composerPrompt = await ctx.ui.editor("Edit localize composer prompt", currentConfig.composerPrompt);
+	if (composerPrompt === undefined) return;
+	if (!composerPrompt.trim()) {
+		ctx.ui.notify("Localize composer prompt cannot be empty", "error");
+		return;
+	}
+
 	const refinerPrompt = await ctx.ui.editor("Edit localize refiner prompt", currentConfig.refinerPrompt);
 	if (refinerPrompt === undefined) return;
 	if (!refinerPrompt.trim()) {
@@ -259,6 +288,7 @@ async function showLocalizeConfig(ctx: ExtensionContext): Promise<void> {
 			model: selectedModelRef,
 			thinking: selectedThinking as LocalizeThinkingLevel,
 			refinerPrompt,
+			composerPrompt,
 		});
 		ctx.ui.notify(`Localize configuration saved to ${configPath}`, "info");
 	} catch (error) {
@@ -267,7 +297,7 @@ async function showLocalizeConfig(ctx: ExtensionContext): Promise<void> {
 }
 
 export function registerLocalizeExtension(
-	pi: ExtensionAPI,
+	pi: Pick<ExtensionAPI, "registerCommand">,
 	complete: CompleteSimple = completeSimple,
 ): void {
 	const runWorkflow = <A>(workflow: () => Promise<A>, signal?: AbortSignal): Promise<A> =>
@@ -280,13 +310,23 @@ export function registerLocalizeExtension(
 		);
 
 	pi.registerCommand("localize", {
-		description: "Translate and refine a prompt into English, then prefill the editor",
+		description: "Compose or refine an English prompt for editor review, or configure localize",
+		getArgumentCompletions: (prefix) => {
+			const items = SUBCOMMANDS.filter((item) => item.value.startsWith(prefix));
+			return items.length ? items : null;
+		},
 		handler: (args, ctx) => runWorkflow(async () => {
 			if (!requireInteractiveTui(ctx, "localize")) return;
-			if (!args.trim()) {
-				ctx.ui.notify("Usage: /localize <prompt>", "error");
+			const command = parseLocalizeCommand(args);
+			if (!command) {
+				ctx.ui.notify(USAGE, "error");
 				return;
 			}
+			if (command.mode === "config") {
+				await showLocalizeConfig(ctx);
+				return;
+			}
+			const { mode, source } = command;
 
 			let config: LocalizeConfig;
 			try {
@@ -294,7 +334,7 @@ export function registerLocalizeExtension(
 					includeProject: isProjectTrusted(ctx),
 				});
 			} catch (error) {
-				ctx.ui.setEditorText(args);
+				ctx.ui.setEditorText(source);
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				return;
 			}
@@ -308,7 +348,7 @@ export function registerLocalizeExtension(
 					done(null);
 				};
 
-				requestLocalizedPrompt(args, config, ctx, loader.signal, complete)
+				requestLocalizedPrompt(mode, source, config, ctx, loader.signal, complete)
 					.then(done)
 					.catch((error) => {
 						operationError = error;
@@ -319,7 +359,7 @@ export function registerLocalizeExtension(
 			});
 
 			if (localized === null) {
-				ctx.ui.setEditorText(args);
+				ctx.ui.setEditorText(source);
 				if (operationError) {
 					ctx.ui.notify(
 						`Localization failed: ${operationError instanceof Error ? operationError.message : String(operationError)}`,
@@ -334,11 +374,6 @@ export function registerLocalizeExtension(
 			ctx.ui.setEditorText(localized);
 			ctx.ui.notify("Localized prompt loaded. Review and submit when ready.", "info");
 		}, ctx.signal),
-	});
-
-	pi.registerCommand("localize-config", {
-		description: "Configure the project-specific localize model, thinking, and refiner prompt",
-		handler: (_args, ctx) => runWorkflow(() => showLocalizeConfig(ctx), ctx.signal),
 	});
 }
 
