@@ -13,6 +13,8 @@ export interface CachedSource {
 	readonly url: string;
 	readonly title: string;
 	readonly content: string;
+	readonly contentKind?: "fetched-page" | "search-snippet" | "unavailable";
+	readonly fetchedUrl?: string;
 }
 
 export interface CacheEntry {
@@ -63,6 +65,8 @@ function deserialize(raw: string, fileName: string): CacheEntry | null {
 					url: item.url,
 					title: typeof item.title === "string" ? item.title : item.url,
 					content: item.content,
+					...(item.contentKind === "fetched-page" || item.contentKind === "search-snippet" || item.contentKind === "unavailable" ? { contentKind: item.contentKind } : {}),
+					...(typeof item.fetchedUrl === "string" ? { fetchedUrl: item.fetchedUrl } : {}),
 				}];
 			}),
 		};
@@ -141,6 +145,8 @@ export function storeSources(
 }
 
 export interface PassageMatch {
+	readonly contentKind?: CachedSource["contentKind"];
+	readonly fetchedUrl?: string;
 	readonly url: string;
 	readonly excerpt: string;
 }
@@ -164,7 +170,7 @@ export function findPassages(
 				const start = Math.max(0, index - context);
 				const end = Math.min(source.content.length, index + term.length + context);
 				const excerpt = `${start > 0 ? "..." : ""}${source.content.slice(start, end)}${end < source.content.length ? "..." : ""}`;
-				matches.push({ url: source.url, excerpt });
+				matches.push({ url: source.url, excerpt, contentKind: source.contentKind, ...(source.fetchedUrl ? { fetchedUrl: source.fetchedUrl } : {}) });
 				used += excerpt.length;
 				index = haystack.indexOf(term, index + term.length);
 			}

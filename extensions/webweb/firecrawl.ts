@@ -1,11 +1,9 @@
 import { Effect, Schedule } from "effect";
-import {
-	FIRECRAWL_DEFAULT_BASE_URL,
-	FIRECRAWL_FALLBACK_BASE_URL,
-	SCRAPE_TIMEOUT_MS,
-	SEARCH_TIMEOUT_MS,
-} from "./config.ts";
-import { FirecrawlError, isTransientStatus, redact, type Provider } from "./errors.ts";
+import { SCRAPE_TIMEOUT_MS, SEARCH_TIMEOUT_MS } from "./config.ts";
+import { FirecrawlError, SsrfBlockedError, isTransientStatus, redact, type Provider } from "./errors.ts";
+import { awaitResponse, BodyLimitError, PROVIDER_BODY_LIMIT, readText, withAbort } from "./network.ts";
+import { validateRemoteUrl, type LookupFunction } from "./ssrf.ts";
+import { parseDomainFilters, type DomainFilters } from "./filters.ts";
 
 export interface WebResult {
 	readonly url: string;
@@ -13,13 +11,25 @@ export interface WebResult {
 	readonly snippet: string;
 }
 
+export interface AnswerCitation {
+	readonly url: string;
+	readonly title: string;
+	/** Offsets in the generated answer, never in source content. Null if invalid. */
+	readonly startIndex: number | null;
+	readonly endIndex: number | null;
+}
+
 export interface SearchOutcome {
 	readonly provider: Provider;
 	readonly answer: string;
+	readonly answerKind: "generated-answer" | "snippet-summary";
+	readonly citations: ReadonlyArray<AnswerCitation>;
+	/** All returned consulted and cited sources, deduplicated by exact URL. */
 	readonly results: ReadonlyArray<WebResult>;
 }
 
 export interface PageContent {
+	readonly requestedUrl?: string;
 	readonly url: string;
 	readonly title: string;
 	readonly content: string;
@@ -27,7 +37,7 @@ export interface PageContent {
 
 export type FetchLike = (
 	url: string | URL,
-	init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
+	init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; redirect?: RequestRedirect },
 ) => Promise<Response>;
 
 export function asRecord(value: unknown): Record<string, unknown> | null {
@@ -99,23 +109,30 @@ function postJson(options: {
 }): Effect.Effect<unknown, FirecrawlError> {
 	return Effect.tryPromise({
 		try: async (signal) => {
-			const response = await options.fetchLike(options.url, {
+			const combined = AbortSignal.any([AbortSignal.timeout(options.timeoutMs), signal, ...(options.signal ? [options.signal] : [])]);
+			combined.throwIfAborted();
+			const response = await awaitResponse(options.fetchLike(options.url, {
+				redirect: "manual",
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${options.apiKey}`,
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify(options.body),
-				signal: AbortSignal.any([AbortSignal.timeout(options.timeoutMs), signal]),
-			});
-			const text = await response.text();
+				signal: combined,
+			}), combined);
+			if (response.status >= 300 && response.status < 400) {
+				void response.body?.cancel().catch(() => {});
+				throw new FirecrawlError({ message: "Firecrawl redirect blocked", retryable: false, network: false, terminal: true });
+			}
+			const text = await readText(response, PROVIDER_BODY_LIMIT, combined);
 			if (!response.ok) {
 				const parsed = asRecord(safeJson(text));
 				const detail = parsed
-					? (firstString(parsed.error, parsed.message) ?? redact(text.slice(0, 300), [options.apiKey]))
-					: redact(text.slice(0, 300), [options.apiKey]);
+					? (firstString(parsed.error, parsed.message) ?? text)
+					: text;
 				throw new FirecrawlError({
-					message: `Firecrawl request failed: ${detail || `HTTP ${response.status}`}`,
+					message: `Firecrawl request failed: ${redact(detail || `HTTP ${response.status}`, [options.apiKey]).slice(0, 300)}`,
 					status: response.status,
 					retryable: isTransientStatus(response.status),
 					network: false,
@@ -127,7 +144,7 @@ function postJson(options: {
 			}
 			if (parsed.success === false) {
 				throw new FirecrawlError({
-					message: `Firecrawl request unsuccessful: ${firstString(parsed.error) ?? "unknown error"}`,
+					message: `Firecrawl request unsuccessful: ${redact(firstString(parsed.error, parsed.message) ?? "unknown error", [options.apiKey]).slice(0, 300)}`,
 					retryable: false,
 					network: false,
 				});
@@ -136,12 +153,19 @@ function postJson(options: {
 		},
 		catch: (error) => error instanceof FirecrawlError
 			? error
-			: new FirecrawlError({ message: `Firecrawl request failed: ${String(error)}`, retryable: true, network: true }),
+			: new FirecrawlError({
+				message: `Firecrawl request failed: ${redact(String(error), [options.apiKey]).slice(0, 300)}`,
+				retryable: !(error instanceof BodyLimitError) && !options.signal?.aborted,
+				network: !(error instanceof BodyLimitError),
+				terminal: error instanceof BodyLimitError || options.signal?.aborted === true,
+			}),
 	}).pipe(
 		Effect.timeout(options.timeoutMs),
 		Effect.catchTag("TimeoutError", () =>
 			Effect.fail(new FirecrawlError({ message: "Firecrawl request timed out", retryable: false, network: true }))),
 		Effect.retry(retryOptions),
+		Effect.mapError((error) => new FirecrawlError({ ...error, message: redact(error.message, [options.apiKey]).slice(0, 400) })),
+		(effect) => withAbort(effect, options.signal),
 	);
 }
 
@@ -150,41 +174,7 @@ export interface FirecrawlDeps {
 	readonly apiVersion: "v1" | "v2";
 	readonly baseUrl: string;
 	readonly fetchLike?: FetchLike | undefined;
-}
-
-function sameHost(a: string, b: string): boolean {
-	try {
-		return new URL(a).host === new URL(b).host;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Run a request against the configured base URL. On a connect-level failure
- * (DNS/TLS, no HTTP response), retry once against the alternate Firecrawl
- * host, which serves the same API.
- */
-function withHostFallback(
-	deps: FirecrawlDeps,
-	build: (baseUrl: string) => Effect.Effect<unknown, FirecrawlError>,
-): Effect.Effect<unknown, FirecrawlError> {
-	const primary = build(deps.baseUrl);
-	if (sameHost(deps.baseUrl, FIRECRAWL_FALLBACK_BASE_URL)) return primary;
-	return primary.pipe(
-		Effect.catchIf(
-			(error) => error.network,
-			(fallbackReason) =>
-				build(FIRECRAWL_FALLBACK_BASE_URL).pipe(
-					Effect.mapError((error) => new FirecrawlError({
-						message: `${fallbackReason.message} | fallback host also failed: ${error.message}`,
-						status: error.status,
-						retryable: error.retryable,
-						network: error.network,
-					})),
-				),
-		),
-	);
+	readonly lookup?: LookupFunction | undefined;
 }
 
 function recencyToTbs(filter: string): string | undefined {
@@ -219,30 +209,35 @@ export function firecrawlSearch(
 		limit: options.numResults,
 		sources: ["web"],
 	};
-	const include: Array<string> = [];
-	const exclude: Array<string> = [];
-	for (const filter of options.domainFilter ?? []) {
-		if (filter.startsWith("-")) exclude.push(filter.slice(1));
-		else include.push(filter);
+	let domains: DomainFilters;
+	try {
+		domains = parseDomainFilters(options.domainFilter);
+	} catch (error) {
+		return Effect.fail(new FirecrawlError({ message: String(error), retryable: false, network: false, terminal: true }));
 	}
-	if (include.length > 0) body.includeDomains = include;
-	else if (exclude.length > 0) body.excludeDomains = exclude;
+	if (deps.apiVersion !== "v2" && (domains.include.length || domains.exclude.length || options.recencyFilter)) {
+		return Effect.fail(new FirecrawlError({ message: "Constrained Firecrawl search requires API v2; v1 filter support is not guaranteed.", retryable: false, network: false, terminal: true }));
+	}
+	if (domains.include.length > 0) body.includeDomains = domains.include;
+	if (domains.exclude.length > 0) body.excludeDomains = domains.exclude;
 	const tbs = options.recencyFilter ? recencyToTbs(options.recencyFilter) : undefined;
+	if (options.recencyFilter && !tbs) return Effect.fail(new FirecrawlError({ message: "Unsupported recencyFilter", retryable: false, network: false, terminal: true }));
 	if (tbs) body.tbs = tbs;
 
-	return withHostFallback(deps, (baseUrl) =>
-		postJson({
-			url: `${baseUrl}/${deps.apiVersion}/search`,
-			apiKey: deps.apiKey,
-			body,
-			timeoutMs: SEARCH_TIMEOUT_MS,
-			signal,
-			fetchLike: deps.fetchLike ?? fetch,
-		})).pipe(Effect.map((data) => {
+	return postJson({
+		url: `${deps.baseUrl}/${deps.apiVersion}/search`,
+		apiKey: deps.apiKey,
+		body,
+		timeoutMs: SEARCH_TIMEOUT_MS,
+		signal,
+		fetchLike: deps.fetchLike ?? fetch,
+	}).pipe(Effect.map((data) => {
 		const results = mapSearchResults(data, options.numResults);
 		return {
 			provider: "firecrawl" as const,
 			answer: buildSnippetAnswer(query, results),
+			answerKind: "snippet-summary" as const,
+			citations: [],
 			results,
 		};
 	}));
@@ -253,15 +248,19 @@ export function firecrawlScrape(
 	deps: FirecrawlDeps,
 	signal?: AbortSignal | undefined,
 ): Effect.Effect<PageContent, FirecrawlError> {
-	return withHostFallback(deps, (baseUrl) =>
-		postJson({
-			url: `${baseUrl}/${deps.apiVersion}/scrape`,
+	const validate = Effect.tryPromise({
+		try: (runtimeSignal) => validateRemoteUrl(url, { lookup: deps.lookup, signal: AbortSignal.any([runtimeSignal, AbortSignal.timeout(SCRAPE_TIMEOUT_MS), ...(signal ? [signal] : [])]) }),
+		catch: (error) => new FirecrawlError({ message: error instanceof SsrfBlockedError ? error.message : "Page validation failed", retryable: false, network: false, terminal: true }),
+	});
+	return validate.pipe(
+		Effect.flatMap(() => postJson({
+			url: `${deps.baseUrl}/${deps.apiVersion}/scrape`,
 			apiKey: deps.apiKey,
 			body: { url, formats: ["markdown"], onlyMainContent: true },
 			timeoutMs: SCRAPE_TIMEOUT_MS,
 			signal,
 			fetchLike: deps.fetchLike ?? fetch,
-		})).pipe(
+		})),
 		Effect.flatMap((data) => {
 			const content = mapScrape(data, url);
 			if (!content) {
@@ -273,5 +272,7 @@ export function firecrawlScrape(
 			}
 			return Effect.succeed(content);
 		}),
+		Effect.mapError((error) => new FirecrawlError({ ...error, message: redact(error.message, [deps.apiKey]).slice(0, 400) })),
+		(effect) => withAbort(effect, signal),
 	);
 }

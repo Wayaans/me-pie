@@ -12,6 +12,8 @@ import { openaiSearch } from "./openai.ts";
 import { httpExtract } from "./extract.ts";
 import { cacheStore, storeSources, type CachedSource } from "./cache.ts";
 import { buildVerifyArtifact, type VerifyArtifact } from "./verify.ts";
+import { settle, withAbort } from "./network.ts";
+import type { LookupFunction } from "./ssrf.ts";
 
 export interface SearchInput {
 	readonly query?: string | undefined;
@@ -39,6 +41,7 @@ export interface SearchRunResult {
 export interface SearchDeps {
 	readonly signal?: AbortSignal | undefined;
 	readonly fetchLike?: FetchLike | undefined;
+	readonly lookup?: LookupFunction | undefined;
 	readonly config?: WebwebConfig | undefined;
 	readonly store?: ReturnType<typeof cacheStore> | undefined;
 }
@@ -61,15 +64,16 @@ export function fetchPage(
 	deps: SearchDeps,
 	config: WebwebConfig,
 ): Effect.Effect<PageContent, Error> {
-	const httpFallback = Effect.mapError(httpExtract(url, { signal: deps.signal }), (error) => new Error(errorMessage(error)));
+	const httpFallback = Effect.mapError(httpExtract(url, { signal: deps.signal, lookup: deps.lookup }), (error) => new Error(errorMessage(error)));
 	if (config.firecrawlApiKey) {
 		return firecrawlScrape(url, {
 			apiKey: config.firecrawlApiKey,
 			apiVersion: config.firecrawlApiVersion,
-				baseUrl: config.firecrawlBaseUrl,
+			baseUrl: config.firecrawlBaseUrl,
 			fetchLike: deps.fetchLike,
+			lookup: deps.lookup,
 		}, deps.signal).pipe(
-			Effect.catchIf(() => true, (firecrawlError) =>
+			Effect.catchIf((error) => !error.terminal && !deps.signal?.aborted, (firecrawlError) =>
 				Effect.mapError(httpFallback, (httpError) => new Error(
 					`firecrawl: ${firecrawlError.message} | http fallback: ${httpError.message}`,
 				))),
@@ -78,7 +82,7 @@ export function fetchPage(
 	return httpFallback;
 }
 
-/** Fetch full page content for the top sources; individual failures are dropped, not fatal. */
+/** Fetch readable page text for the top sources; individual failures are counted, not fatal. */
 export function fetchTopPages(
 	results: ReadonlyArray<{ url: string }>,
 	deps: SearchDeps,
@@ -86,11 +90,12 @@ export function fetchTopPages(
 	limit = INCLUDE_CONTENT_LIMIT,
 ): Effect.Effect<{ pages: Array<PageContent>; failures: number }, never> {
 	return Effect.forEach(results.slice(0, limit), (target) =>
-		Effect.exit(fetchPage(target.url, deps, config))).pipe(
+		settle(withAbort(Effect.map(fetchPage(target.url, deps, config), (page) => ({ ...page, requestedUrl: target.url })), deps.signal))).pipe(
 		Effect.map((exits) => ({
 			pages: exits.flatMap((exit) => Exit.isSuccess(exit) ? [exit.value] : []),
 			failures: exits.filter((exit) => !Exit.isSuccess(exit)).length,
 		})),
+		(effect) => withAbort(effect, deps.signal),
 	);
 }
 
@@ -119,7 +124,7 @@ export function searchOneQuery(
 			}, deps.signal)
 		: null;
 	const openai = config.openaiApiKey
-		? openaiSearch(query, { numResults }, {
+		? openaiSearch(query, { numResults, domainFilter: input.domainFilter, recencyFilter: input.recencyFilter }, {
 				apiKey: config.openaiApiKey,
 				model: config.openaiSearchModel,
 				fetchLike: deps.fetchLike,
@@ -135,7 +140,7 @@ export function searchOneQuery(
 	if (firecrawl && openai) {
 		return firecrawl.pipe(
 			Effect.map((outcome): QueryOutcome => ({ query, outcome, primaryError: null })),
-			Effect.catchIf(() => true, (firecrawlError) =>
+			Effect.catchIf((error) => !error.terminal && !deps.signal?.aborted, (firecrawlError) =>
 				openai.pipe(
 					Effect.map((outcome): QueryOutcome => ({
 						query,
@@ -149,7 +154,6 @@ export function searchOneQuery(
 		);
 	}
 
-	const only = firecrawl ?? openai;
 	if (openai && !firecrawl) {
 		return Effect.mapError(
 			Effect.map(openai, (outcome): QueryOutcome => ({ query, outcome, primaryError: null })),
@@ -165,6 +169,19 @@ export function searchOneQuery(
 	);
 }
 
+function cacheSearchSources(results: ReadonlyArray<{ url: string; title: string; snippet: string }>, pages: ReadonlyArray<PageContent>): Array<CachedSource> {
+	const byRequestedUrl = new Map(pages.map((page) => [page.requestedUrl ?? page.url, page]));
+	return results.map((result) => {
+		const page = byRequestedUrl.get(result.url);
+		return {
+			url: result.url, title: result.title,
+			content: page?.content || result.snippet,
+			contentKind: page?.content ? "fetched-page" : result.snippet ? "search-snippet" : "unavailable",
+			...(page?.content ? { fetchedUrl: page.url } : {}),
+		};
+	});
+}
+
 export function runSearch(input: SearchInput, deps: SearchDeps = {}): Effect.Effect<SearchRunResult, Error> {
 	const { queries, numResults } = normalize(input);
 	if (queries.length === 0) {
@@ -177,38 +194,34 @@ export function runSearch(input: SearchInput, deps: SearchDeps = {}): Effect.Eff
 			outcomes.push(yield* searchOneQuery(query, input, numResults, deps, config));
 		}
 
-		let includeContentError: string | null = null;
+		let includeContentFailures = 0;
 		const sources: Array<CachedSource> = [];
 		for (const { outcome } of outcomes) {
-			let contentByUrl = new Map<string, string>();
+			let pages: Array<PageContent> = [];
 			if (input.includeContent && outcome.results.length > 0) {
-				const { pages, failures } = yield* fetchTopPages(outcome.results, deps, config);
-				if (failures > 0) includeContentError = `${failures} source page(s) could not be fetched`;
-				contentByUrl = new Map(pages.map((page) => [page.url, page.content]));
+				const fetched = yield* fetchTopPages(outcome.results, deps, config);
+				pages = fetched.pages;
+				includeContentFailures += fetched.failures;
 			}
-			for (const result of outcome.results) {
-				sources.push({
-					url: result.url,
-					title: result.title,
-					content: contentByUrl.get(result.url) ?? result.snippet,
-				});
-			}
+			sources.push(...cacheSearchSources(outcome.results, pages));
 		}
 
 		const storedId = sources.length > 0
 			? yield* Effect.map(
-					Effect.exit(storeSources("search", sources, deps.store ?? cacheStore())),
+					settle(storeSources("search", sources, deps.store ?? cacheStore())),
 					(exit) => Exit.isSuccess(exit) ? exit.value : null,
 				)
 			: null;
 
 		const provider = outcomes[0]?.outcome.provider ?? null;
-		return { outcomes, responseId: storedId, provider, includeContentError };
-	});
+		return { outcomes, responseId: storedId, provider,
+			includeContentError: includeContentFailures > 0 ? `${includeContentFailures} source page(s) could not be fetched` : null };
+	}).pipe((effect) => withAbort(effect, deps.signal));
 }
 
 export interface VerifyInput {
 	readonly claim: string;
+	readonly recencyFilter?: SearchInput["recencyFilter"];
 	readonly domainFilter?: Array<string> | undefined;
 	readonly fetchContent?: boolean | undefined;
 	readonly numResults?: number | undefined;
@@ -218,12 +231,10 @@ export interface VerifyRunResult {
 	readonly artifact: VerifyArtifact;
 	readonly responseId: string | null;
 	readonly primaryError: string | null;
+	readonly fetchFailures: number;
 }
 
-/**
- * Verify a claim: search for evidence (Firecrawl → OpenAI), optionally fetch
- * the top source pages, then assess the claim against extracted passages.
- */
+/** Collect evidence for caller assessment without assigning a factual verdict. */
 export function runVerify(input: VerifyInput, deps: SearchDeps = {}): Effect.Effect<VerifyRunResult, Error> {
 	const claim = input.claim.trim();
 	if (!claim) {
@@ -233,34 +244,31 @@ export function runVerify(input: VerifyInput, deps: SearchDeps = {}): Effect.Eff
 		const config = deps.config ?? loadConfig();
 		const search = yield* searchOneQuery(
 			claim,
-			{ domainFilter: input.domainFilter },
+			{ domainFilter: input.domainFilter, recencyFilter: input.recencyFilter },
 			input.numResults ?? 8,
 			deps,
 			config,
 		);
 
 		let fetched: Array<PageContent> = [];
+		let fetchFailures = 0;
 		if (input.fetchContent && search.outcome.results.length > 0) {
-			fetched = (yield* fetchTopPages(search.outcome.results, deps, config)).pages;
+			const pages = yield* fetchTopPages(search.outcome.results, deps, config);
+			fetched = pages.pages;
+			fetchFailures = pages.failures;
 		}
 
-		const artifact = buildVerifyArtifact(claim, search.outcome.results, fetched);
+		const artifact = buildVerifyArtifact(claim, search.outcome.results, fetched,
+			search.outcome.answerKind === "generated-answer" ? search.outcome.answer : null, search.outcome.citations);
 
-		const cachedSources: Array<CachedSource> = [
-			...artifact.passages.map((passage) => ({
-				url: passage.sourceUrl,
-				title: `passage ${passage.passageId}`,
-				content: passage.text,
-			})),
-			...fetched.map((page) => ({ url: page.url, title: page.title, content: page.content })),
-		];
+		const cachedSources = cacheSearchSources(search.outcome.results, fetched);
 		const responseId = cachedSources.length > 0
 			? yield* Effect.map(
-					Effect.exit(storeSources("verify", cachedSources, deps.store ?? cacheStore())),
+					settle(storeSources("verify", cachedSources, deps.store ?? cacheStore())),
 					(exit) => Exit.isSuccess(exit) ? exit.value : null,
 				)
 			: null;
 
-		return { artifact, responseId, primaryError: search.primaryError };
-	});
+		return { artifact, responseId, primaryError: search.primaryError, fetchFailures };
+	}).pipe((effect) => withAbort(effect, deps.signal));
 }

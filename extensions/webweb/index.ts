@@ -18,8 +18,10 @@ import { createGitHubSession, cleanupGitHubSession, type GitHubSession } from ".
 import { formatFetchResult, formatReadResult, formatSearchResult, wordCount, type WebwebDetails } from "./output.ts";
 import { runFetch, type FetchDeps, type FetchRunResult } from "./fetch.ts";
 import { runRead } from "./read.ts";
-import { runSearch, runVerify, type SearchDeps, type SearchRunResult, type VerifyRunResult } from "./search.ts";
+import { runSearch, runVerify, type SearchDeps, type SearchRunResult } from "./search.ts";
 import { formatVerifyArtifact } from "./verify.ts";
+import { terminalText } from "./terminal.ts";
+import { displayUrl } from "./url.ts";
 
 interface Session {
 	readonly temporaryDirectories: Set<string>;
@@ -108,7 +110,7 @@ const SearchParams = Type.Object({
 		maxItems: 4,
 	})),
 	numResults: Type.Optional(Type.Integer({
-		description: "Results per query (default: 5, max: 20)",
+		description: "Requested results per query (default: 5, max: 20). OpenAI may return more consulted/cited sources; all are retained",
 		minimum: 1,
 		maximum: 20,
 	})),
@@ -117,17 +119,17 @@ const SearchParams = Type.Object({
 		Type.Literal("week"),
 		Type.Literal("month"),
 		Type.Literal("year"),
-	], { description: "Filter by recency" })),
+	], { description: "Filter by recency. Requires Firecrawl; OpenAI fallback is refused when it cannot honor this constraint" })),
 	domainFilter: Type.Optional(Type.Array(Type.String(), {
-		description: "Limit to domains (prefix with - to exclude)",
+		description: "Hostnames only, prefix with - to exclude. Do not mix included and excluded domains; max 100",
 	})),
 	includeContent: Type.Optional(Type.Boolean({
-		description: "Fetch full page content from the top sources in the background",
+		description: "Fetch readable page content for up to 5 sources before returning; failures leave labeled snippets or metadata only",
 	})),
 	mode: Type.Optional(Type.Union([
 		Type.Literal("search"),
 		Type.Literal("verify"),
-	], { description: "search (default) returns a synthesized answer; verify fact-checks the claim parameter" })),
+	], { description: "search returns snippets or a labeled generated answer; verify collects evidence for caller assessment without a factual verdict" })),
 	claim: Type.Optional(Type.String({
 		description: "The assertion to check (required when mode is verify)",
 		minLength: 1,
@@ -143,11 +145,12 @@ const searchTool = (session: Session) =>
 		name: "ww_search",
 		label: "WW Search",
 		description:
-			"Search the web with a synthesized answer and source citations. Firecrawl is the primary provider, OpenAI the fallback. mode 'verify' fact-checks a claim and returns supported/contradicted/unclear/missing-evidence with passage citations.",
-		promptSnippet: "Search the web or fact-check a claim (Firecrawl primary, OpenAI fallback)",
+			"Use ww_search for general web research, current information, finding sources, and claim evidence. Prefer find_docs for library and API documentation. Firecrawl returns search snippets; OpenAI fallback returns a labeled generated answer and citation metadata, not source quotations. mode 'verify' collects labeled evidence for caller assessment, without factual verdicts or confidence scores. Mixed domain include/exclude filters are rejected. Recency requires Firecrawl; fallback never silently drops constraints. Output is limited to 50 KB or 2,000 lines.",
+		promptSnippet: "Research the web, find current information and sources, or collect claim evidence",
 		promptGuidelines: [
-			"For research, prefer queries (plural) with 2-4 varied angles over a single query.",
-			"Use mode verify with the claim parameter to check a specific assertion against web sources.",
+			"Prefer ww_search for general web research, current information, finding sources, and claim evidence. Prefer find_docs over ww_search for library and API documentation.",
+			"For ww_search research, prefer queries (plural) with 2-4 varied angles over a single query.",
+			"Use ww_search mode verify to collect evidence for an assertion. Assess the claim yourself; snippets and generated answers are not source quotations.",
 		],
 		parameters: SearchParams,
 
@@ -160,13 +163,18 @@ const searchTool = (session: Session) =>
 				const run = await Effect.runPromise(runVerify({
 					claim: params.claim,
 					domainFilter: params.domainFilter,
+					recencyFilter: params.recencyFilter,
 					numResults: params.numResults,
 					fetchContent: params.fetchContent,
-				}, deps));
-				const text = formatVerifyArtifact(run.artifact);
+				}, deps), { signal });
+				const text = [formatVerifyArtifact(run.artifact),
+					run.primaryError ? `Note: fallback used (${run.primaryError})` : "",
+					run.fetchFailures ? `Note: ${run.fetchFailures} source page(s) could not be fetched.` : "",
+					run.responseId ? `Source records stored under responseId "${run.responseId}". Use ww_read; content provenance is labeled.` : "",
+				].filter(Boolean).join("\n\n");
 				const details: WebwebDetails = {
 					tool: "verify",
-					status: run.artifact.assessment.status,
+					status: run.artifact.status,
 					responseId: run.responseId,
 					sourceCount: run.artifact.sources.length,
 					passageCount: run.artifact.passages.length,
@@ -180,7 +188,7 @@ const searchTool = (session: Session) =>
 				recencyFilter: params.recencyFilter,
 				domainFilter: params.domainFilter,
 				includeContent: params.includeContent,
-			}, deps));
+			}, deps), { signal });
 			const text = formatSearchResult(run);
 			const details: WebwebDetails = {
 				tool: "search",
@@ -200,7 +208,7 @@ const searchTool = (session: Session) =>
 				: (args.query ?? queries.join(" | "));
 			const truncated = subject.length > 70 ? `${subject.slice(0, 69)}…` : subject;
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("⚡ ww_search"))} ${truncated}`,
+				`${theme.fg("toolTitle", theme.bold("⚡ ww_search"))} ${terminalText(truncated)}`,
 				0, 0,
 			);
 		},
@@ -212,7 +220,7 @@ const searchTool = (session: Session) =>
 				return new Text(summary ? theme.fg("dim", `↳ ${summary}`) : "", 0, 0);
 			}
 			const full = result.content.find((content) => content.type === "text");
-			return new Text(full?.type === "text" ? full.text : "", 0, 0);
+			return new Text(full?.type === "text" ? terminalText(full.text) : "", 0, 0);
 		},
 	});
 
@@ -229,9 +237,9 @@ const FetchParams = Type.Object({
 	mode: Type.Optional(Type.Union([
 		Type.Literal("readable"),
 		Type.Literal("raw"),
-	], { description: "readable (default) extracts markdown; raw returns the exact textual HTTP body" })),
+	], { description: "readable (default) extracts markdown; raw returns the textual HTTP body. GitHub URLs return commit-labeled repository or file previews in either mode" })),
 	forceClone: Type.Optional(Type.Boolean({
-		description: "Clone GitHub repos that exceed the 350MB size threshold",
+		description: "Allow GitHub root/tree checkouts above the 350MB size threshold. Does not affect direct /blob/ file downloads",
 	})),
 });
 
@@ -240,8 +248,12 @@ const fetchTool = (session: Session, pi: ExtensionAPI) =>
 		name: "ww_fetch",
 		label: "WW Fetch",
 		description:
-			"Fetch URL(s) as readable markdown (Firecrawl scrape primary, keyless HTTP extraction fallback). GitHub URLs are cloned locally: root returns tree + README, /tree/ paths return listings, /blob/ paths return file contents. raw mode returns the exact textual HTTP body.",
-		promptSnippet: "Fetch URL content as markdown; clones GitHub repos for real file access",
+			"Use ww_fetch to read a supplied URL or a source found by ww_search, including GitHub repositories, directories, and files. Web pages use Firecrawl with keyless HTTP extraction fallback; raw mode returns the textual HTTP body. GitHub /blob/ URLs fetch only the requested file directly at an immutable commit, without cloning, in either mode. GitHub root and /tree/ URLs use local checkouts for README/tree previews. GitHub previews include commit identity and cap file text at 50 KiB; direct bodies cap at 5 MiB and provider responses at 10 MiB. Checkout symlinks are not followed; raw symlinks remain link text. Named refs, including slash refs, require git resolution; full 40-character SHA files need no git. Invalid refs/files fail without fallback. Private raw files requiring authentication are unsupported.",
+		promptSnippet: "Read supplied URLs or search sources, including GitHub repositories, directories, and single files",
+		promptGuidelines: [
+			"Use ww_fetch to read a supplied URL or a source found by ww_search, including GitHub repository, directory, and file URLs.",
+			"Before repeating ww_fetch, use ww_read with an existing responseId to inspect cached content. Use ww_fetch again if the cache is missing, expired, or fresh content is needed.",
+		],
 		parameters: FetchParams,
 
 		async execute(_toolCallId, params, signal) {
@@ -253,7 +265,7 @@ const fetchTool = (session: Session, pi: ExtensionAPI) =>
 			}, fetchDeps(session, signal, (command, args, options) => pi.exec(command, args, {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeout !== undefined ? { timeout: options.timeout } : {}),
-			}))));
+			}))), { signal });
 			const text = formatFetchResult(run);
 			const fetched = run.items.filter((item) => item.status !== "failed");
 			const words = run.items.reduce((sum, item) => sum + (item.content ? wordCount(item.content) : 0), 0);
@@ -273,10 +285,10 @@ const fetchTool = (session: Session, pi: ExtensionAPI) =>
 
 		renderCall(args, theme) {
 			const urls = args.urls ?? [];
-			const subject = args.url ?? `${urls.length} urls`;
+			const subject = args.url ? displayUrl(args.url) : `${urls.length} urls`;
 			const truncated = subject.length > 70 ? `${subject.slice(0, 69)}…` : subject;
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("⚡ ww_fetch"))} ${truncated}`,
+				`${theme.fg("toolTitle", theme.bold("⚡ ww_fetch"))} ${terminalText(truncated)}`,
 				0, 0,
 			);
 		},
@@ -288,7 +300,7 @@ const fetchTool = (session: Session, pi: ExtensionAPI) =>
 				return new Text(summary ? theme.fg("dim", `↳ ${summary}`) : "", 0, 0);
 			}
 			const full = result.content.find((content) => content.type === "text");
-			return new Text(full?.type === "text" ? full.text : "", 0, 0);
+			return new Text(full?.type === "text" ? terminalText(full.text) : "", 0, 0);
 		},
 	});
 
@@ -320,16 +332,19 @@ const ReadParams = Type.Object({
 	})),
 });
 
-const readTool = () =>
+const readTool = (session: Session) =>
 	defineTool({
 		name: "ww_read",
 		label: "WW Read",
 		description:
-			"Retrieve stored content from a previous ww_search or ww_fetch via its responseId. Use findText to locate passages without paging through the full content, or offset/limit for intentional slices. Cache lifetime is 1 hour.",
-		promptSnippet: "Retrieve stored web content by responseId; supports passage lookup",
+			"Use ww_read with an existing responseId to reuse cached source content before fetching it again. Retrieve stored source records from ww_search, verify, or ww_fetch. Content is labeled as fetched page text, search snippet, unavailable, or legacy provenance unknown. Generated answers are not stored as source text. Use findText to locate passages, or offset/limit for slices. Cache lifetime is 1 hour.",
+		promptSnippet: "Reuse cached source content by responseId before refetching; find passages or read slices",
+		promptGuidelines: [
+			"Use ww_read with an existing responseId from ww_search or ww_fetch before refetching cached content. Use findText for passages or offset/limit for slices; check the provenance label before treating text as evidence.",
+		],
 		parameters: ReadParams,
 
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			const run = await Effect.runPromise(runRead({
 				responseId: params.responseId,
 				url: params.url,
@@ -338,7 +353,7 @@ const readTool = () =>
 				findMode: params.findMode,
 				offset: params.offset,
 				limit: params.limit,
-			}));
+			}), { signal });
 			const text = formatReadResult(run);
 			const details: WebwebDetails = {
 				tool: "read",
@@ -346,7 +361,7 @@ const readTool = () =>
 				matches: run.matches ? run.matches.length : null,
 				chars: run.slice ? run.slice.length : 0,
 			};
-			return { content: [{ type: "text" as const, text }], details };
+			return makeTextToolResult(text, details, session.temporaryDirectories);
 		},
 
 		renderCall(args, theme) {
@@ -357,7 +372,7 @@ const readTool = () =>
 			if (findText) parts.push(`find "${findText.length > 40 ? `${findText.slice(0, 39)}…` : findText}"`);
 			if (typeof args.offset === "number") parts.push(`@${args.offset}`);
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("⚡ ww_read"))} ${parts.join(" · ")}`,
+				`${theme.fg("toolTitle", theme.bold("⚡ ww_read"))} ${terminalText(parts.join(" · "))}`,
 				0, 0,
 			);
 		},
@@ -369,7 +384,7 @@ const readTool = () =>
 				return new Text(summary ? theme.fg("dim", `↳ ${summary}`) : "", 0, 0);
 			}
 			const full = result.content.find((content) => content.type === "text");
-			return new Text(full?.type === "text" ? full.text : "", 0, 0);
+			return new Text(full?.type === "text" ? terminalText(full.text) : "", 0, 0);
 		},
 	});
 
@@ -378,7 +393,7 @@ export default function webwebExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool(searchTool(session));
 	pi.registerTool(fetchTool(session, pi));
-	pi.registerTool(readTool());
+	pi.registerTool(readTool(session));
 
 	pi.registerCommand("webweb", {
 		description: "Configure webweb providers: paste API keys, view status, clear keys",

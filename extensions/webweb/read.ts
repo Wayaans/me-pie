@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { cacheStore, findPassages, sliceContent, type CacheEntry } from "./cache.ts";
+import { cacheStore, findPassages, sliceContent, type CacheEntry, type CachedSource, type PassageMatch } from "./cache.ts";
 import { Exit } from "effect";
 
 export interface ReadInput {
@@ -16,15 +16,15 @@ export interface ReadInput {
 export interface ReadRunResult {
 	readonly status: "found" | "not-found";
 	readonly entry: CacheEntry | null;
-	readonly source: { url: string; title: string; content: string } | null;
-	readonly matches: ReadonlyArray<{ url: string; excerpt: string }> | null;
+	readonly source: CachedSource | null;
+	readonly matches: ReadonlyArray<PassageMatch> | null;
 	readonly slice: string | null;
 	readonly error: string | null;
 }
 
 const DEFAULT_SLICE_LIMIT = 30_000;
 
-function selectSource(entry: CacheEntry, input: ReadInput): { url: string; title: string; content: string } | null {
+function selectSource(entry: CacheEntry, input: ReadInput): CachedSource | null {
 	if (input.url) {
 		return entry.sources.find((source) => source.url === input.url) ?? null;
 	}

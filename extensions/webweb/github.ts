@@ -1,14 +1,17 @@
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
 import { GITHUB_CLONE_TIMEOUT_MS } from "./config.ts";
 import { GitHubError } from "./errors.ts";
+import { awaitResponse, readText, withAbort } from "./network.ts";
+import { MAX_FILE_BYTES, readRepositoryFile, repositoryEntries, repositoryListing } from "./github-files.ts";
+import { guardedFetch, type LookupFunction, type RequestFunction } from "./ssrf.ts";
+import { displayUrl } from "./url.ts";
 
 const CLONE_SIZE_LIMIT_MB = 350;
 const README_NAMES = new Set(["README.md", "README.txt", "README.rst", "README"]);
 const MAX_TREE_ENTRIES = 2000;
-const MAX_FILE_BYTES = 50 * 1024;
 
 export type ExecLike = (
 	command: string,
@@ -22,17 +25,29 @@ export type GitHubRef =
 	| { kind: "blob"; owner: string; repo: string; ref: string; filePath: string };
 
 export function parseGitHubUrl(rawUrl: string): GitHubRef | null {
+	if (rawUrl.length > 2000) return null;
 	let parsed: URL;
 	try {
 		parsed = new URL(rawUrl);
 	} catch {
 		return null;
 	}
+	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+	if (parsed.username || parsed.password || parsed.port) return null;
 	if (parsed.hostname !== "github.com" && parsed.hostname !== "www.github.com") return null;
-	const segments = parsed.pathname.split("/").filter((segment) => segment !== "");
+	// Inspect before URL normalization can erase dot segments. Decode once only.
+	const rawPath = rawUrl.match(/^https?:\/\/[^/?#]+(\/[^?#]*)?/i)?.[1] ?? "";
+	if (rawUrl.includes("\\")) return null;
+	let segments: Array<string>;
+	try {
+		segments = rawPath.split("/").filter((segment) => segment !== "").map(decodeURIComponent);
+	} catch { return null; }
+	if (segments.reduce((count, segment) => count + segment.split("/").length, 0) > 64 || segments.some((segment) => /[\\\x00-\x1f\x7f]/.test(segment)
+		|| segment.split("/").some((part) => part === "." || part === ".." || part === ""))) return null;
 	const [owner, repoRaw, pathKind, ref, ...restPath] = segments;
 	if (!owner || !repoRaw) return null;
 	const repo = repoRaw.replace(/\.git$/, "");
+	if (!/^[a-z0-9][a-z0-9-]{0,38}$/i.test(owner) || !/^[a-z0-9._-]{1,100}$/i.test(repo) || repo === "." || repo === "..") return null;
 	if (!pathKind) return { kind: "repo", owner, repo };
 	if (pathKind === "tree" || pathKind === "blob") {
 		if (!ref) return null;
@@ -59,22 +74,25 @@ export async function cleanupGitHubSession(session: GitHubSession): Promise<void
 
 export interface GitHubServeResult {
 	readonly url: string;
-	readonly repoPath: string;
+	readonly repoPath: string | null;
 	readonly text: string;
 	readonly fileCount: number;
+	readonly fetchedUrl?: string;
 }
 
 async function runCommand(
 	command: string,
 	args: string[],
-	options: { signal?: AbortSignal | undefined; allowFailure?: boolean } = {},
+	options: { signal?: AbortSignal | undefined } = {},
 	execLike: ExecLike,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
+	options.signal?.throwIfAborted();
 	const result = await execLike(command, args, {
 		signal: options.signal,
 		timeout: GITHUB_CLONE_TIMEOUT_MS,
 	});
-	if (result.code !== 0 && !options.allowFailure) {
+	options.signal?.throwIfAborted();
+	if (result.code !== 0) {
 		throw new GitHubError({
 			message: `${command} failed (exit ${result.code}): ${result.stderr.trim().slice(0, 400) || result.stdout.trim().slice(0, 400)}`,
 		});
@@ -86,99 +104,171 @@ async function repoSizeMb(owner: string, repo: string, signal?: AbortSignal): Pr
 	try {
 		const signals = [AbortSignal.timeout(15_000)];
 		if (signal) signals.push(signal);
-		const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-			signal: AbortSignal.any(signals),
+		const combined = AbortSignal.any(signals);
+		combined.throwIfAborted();
+		const response = await awaitResponse(fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+			signal: combined,
+			redirect: "error",
 			headers: { Accept: "application/vnd.github+json", "User-Agent": "webweb/0.1" },
-		});
-		if (!response.ok) return null;
-		const parsed: unknown = await response.json();
+		}), combined);
+		if (!response.ok) {
+			void response.body?.cancel().catch(() => {});
+			return null;
+		}
+		const parsed: unknown = JSON.parse(await readText(response, 1024 * 1024, combined));
 		const sizeKb = parsed && typeof parsed === "object" && "size" in parsed ? parsed.size : null;
 		return typeof sizeKb === "number" ? sizeKb / 1024 : null;
 	} catch {
+		signal?.throwIfAborted();
 		return null;
 	}
 }
 
-async function countFiles(dir: string): Promise<number> {
+async function countFiles(dir: string, signal?: AbortSignal): Promise<number> {
 	let count = 0;
-	const queue = [dir];
-	while (queue.length > 0 && count < MAX_TREE_ENTRIES) {
+	let visited = 0;
+	const queue = [""];
+	while (queue.length > 0 && visited < MAX_TREE_ENTRIES) {
 		const current = queue.shift();
-		if (!current) break;
-		const entries = await readdir(current, { withFileTypes: true });
+		if (current === undefined) break;
+		const { entries } = await repositoryEntries(dir, current, signal);
 		for (const entry of entries) {
-			if (entry.name === ".git") continue;
-			if (entry.isDirectory()) queue.push(path.join(current, entry.name));
+			visited += 1;
+			if (entry.directory) queue.push(path.join(current, entry.name));
 			else count += 1;
-			if (count >= MAX_TREE_ENTRIES) return count;
+			if (visited >= MAX_TREE_ENTRIES) break;
 		}
 	}
 	return count;
 }
 
-async function topLevelListing(dir: string): Promise<string> {
-	const entries = await readdir(dir, { withFileTypes: true });
-	const visible = entries.filter((entry) => entry.name !== ".git");
-	const dirs = visible.filter((entry) => entry.isDirectory()).map((entry) => `${entry.name}/`).sort();
-	const files = visible.filter((entry) => !entry.isDirectory()).map((entry) => entry.name).sort();
-	const lines = [...dirs, ...files].map((name) => `- ${name}`);
-	return lines.length > 0 ? `Repository contents:\n${lines.join("\n")}` : "Repository is empty.";
-}
-
-async function readReadme(dir: string): Promise<string | null> {
-	const entries = await readdir(dir);
-	const readme = entries.find((name) => README_NAMES.has(name) || /^README\./i.test(name));
-	if (!readme) return null;
-	const filePath = path.join(dir, readme);
-	const info = await stat(filePath);
-	const bytes = Math.min(info.size, MAX_FILE_BYTES);
-	const handle = await readFile(filePath);
-	return handle.subarray(0, bytes).toString("utf8");
+async function readReadme(dir: string, signal?: AbortSignal): Promise<string | null> {
+	const { entries } = await repositoryEntries(dir, "", signal);
+	const readme = entries.find(({ name }) => README_NAMES.has(name) || /^README\./i.test(name));
+	return readme ? readRepositoryFile(dir, readme.name, signal) : null;
 }
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
+
+function validRefName(name: string): boolean {
+	return !/[\x00-\x20~^:?*\[\\]/.test(name) && !name.includes("..") && !name.includes("@{")
+		&& name.split("/").every((part) => part !== "" && !part.startsWith(".") && !part.endsWith(".") && !part.endsWith(".lock"));
+}
+
+interface ResolvedRevision {
+	readonly commit: string;
+	readonly filePath: string;
+}
+
+async function resolveRevision(ref: GitHubRef, remote: string, execLike: ExecLike | undefined, signal?: AbortSignal): Promise<ResolvedRevision> {
+	if (ref.kind !== "repo" && SHA_PATTERN.test(ref.ref)) return { commit: ref.ref.toLowerCase(), filePath: ref.filePath };
+	if (!execLike) throw new GitHubError({ message: "GitHub named revision resolution requires exec capability. Use a full commit SHA for a single file." });
+	const parts = ref.kind === "repo" ? [] : [ref.ref, ...ref.filePath.split("/").filter(Boolean)];
+	const candidates = parts.map((_, index) => ({ name: parts.slice(0, index + 1).join("/"), filePath: parts.slice(index + 1).join("/") }))
+		.filter(({ name }) => validRefName(name));
+	const patterns = ref.kind === "repo" ? ["HEAD"] : candidates.flatMap(({ name }) => [`refs/heads/${name}`, `refs/tags/${name}`, `refs/tags/${name}^{}`]);
+	if (!patterns.length) throw new GitHubError({ message: "Invalid requested GitHub revision" });
+	const result = await runCommand("git", ["ls-remote", "--", remote, ...patterns], { signal }, execLike);
+	// Exact matching prevents ls-remote's tail/glob semantics from choosing another ref.
+	const refs = new Map<string, string>();
+	for (const line of result.stdout.split("\n")) {
+		const [commit, name] = line.split("\t");
+		if (commit && name && SHA_PATTERN.test(commit)) refs.set(name, commit.toLowerCase());
+	}
+	if (ref.kind === "repo") {
+		const commit = refs.get("HEAD");
+		if (commit) return { commit, filePath: "" };
+	} else {
+		for (const candidate of candidates.reverse()) {
+			const branch = refs.get(`refs/heads/${candidate.name}`);
+			const tag = refs.get(`refs/tags/${candidate.name}^{}`) ?? refs.get(`refs/tags/${candidate.name}`);
+			if (branch && tag && branch !== tag) throw new GitHubError({ message: `Ambiguous branch/tag '${candidate.name}'. Use a full commit SHA.` });
+			const commit = branch ?? tag;
+			if (commit) return { commit, filePath: candidate.filePath };
+		}
+	}
+	throw new GitHubError({ message: "Requested GitHub revision was not found. No default-branch fallback was attempted." });
+}
 
 async function cloneRepo(
 	ref: GitHubRef,
 	session: GitHubSession,
 	execLike: ExecLike,
 	signal?: AbortSignal,
-): Promise<string> {
-	const repoSlug = `${ref.owner}/${ref.repo}`;
+): Promise<{ dest: string; revision: ResolvedRevision }> {
+	const remote = `https://github.com/${ref.owner}/${ref.repo}.git`;
+	const revision = await resolveRevision(ref, remote, execLike, signal);
 	const dir = await mkdtemp(path.join(tmpdir(), "webweb-gh-"));
 	session.cloneDirs.add(dir);
 	const dest = path.join(dir, ref.repo);
-	const requestedRef = ref.kind !== "repo" && !SHA_PATTERN.test(ref.ref) ? ref.ref : undefined;
+	await runCommand("git", ["init", "--", dest], { signal }, execLike);
+	await runCommand("git", ["-C", dest, "fetch", "--depth=1", "--no-tags", "--", remote, revision.commit], { signal }, execLike);
+	const fetched = await runCommand("git", ["-C", dest, "rev-parse", "--verify", "FETCH_HEAD^{commit}"], { signal }, execLike);
+	if (fetched.stdout.trim().toLowerCase() !== revision.commit) throw new GitHubError({ message: "Fetched commit does not match requested GitHub revision" });
+	await runCommand("git", ["-C", dest, "checkout", "--detach", revision.commit], { signal }, execLike);
+	const checkedOut = await runCommand("git", ["-C", dest, "rev-parse", "--verify", "HEAD^{commit}"], { signal }, execLike);
+	if (checkedOut.stdout.trim().toLowerCase() !== revision.commit) throw new GitHubError({ message: "Checked-out commit does not match requested GitHub revision" });
+	return { dest, revision };
+}
 
-	const attempts: Array<[string, string[]]> = [];
-	if (requestedRef) {
-		attempts.push(["git", ["clone", "--depth", "1", "--branch", requestedRef, `https://github.com/${repoSlug}.git`, dest]]);
-	}
-	attempts.push(["git", ["clone", "--depth", "1", `https://github.com/${repoSlug}.git`, dest]]);
-	attempts.push(["gh", ["repo", "clone", repoSlug, dest, "--", "--depth", "1"]]);
+export interface GitHubTransport {
+	readonly lookup?: LookupFunction | undefined;
+	/** Offline connector seam; production uses the SSRF-pinned native transport. */
+	readonly request?: RequestFunction | undefined;
+}
 
-	for (const [index, [command, args]] of attempts.entries()) {
-		if (index > 0) await rm(dest, { recursive: true, force: true });
-		const result = await runCommand(command, args, { signal, allowFailure: true }, execLike);
-		if (result.code === 0) return dest;
+async function fetchGitHubFile(
+	ref: Extract<GitHubRef, { kind: "blob" }>,
+	revision: ResolvedRevision,
+	transport: GitHubTransport,
+	signal: AbortSignal,
+): Promise<{ content: string; url: string }> {
+	if (!revision.filePath) throw new GitHubError({ message: "GitHub blob URL requires a file path" });
+	const rawPath = [ref.owner, ref.repo, revision.commit, ...revision.filePath.split("/")].map(encodeURIComponent).join("/");
+	// No Git credentials or provider keys are sent. Raw symlinks are link text, not local paths.
+	const url = `https://raw.githubusercontent.com/${rawPath}`;
+	const response = await guardedFetch(url, { ...transport, signal });
+	if (!response.ok) {
+		response.cancel();
+		throw new GitHubError({ message: `GitHub raw file HTTP ${response.status}. The file or revision may be unavailable; private files requiring authentication are unsupported. No fallback was attempted.` });
 	}
-	throw new GitHubError({
-		message: `Failed to clone ${repoSlug}. If it is private, make sure the gh CLI is authenticated (gh auth login).`,
-	});
+	const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+	if (/^(image\/(?!svg\+xml$)|audio\/|video\/|font\/)/.test(contentType) || /^(application\/(pdf|zip|gzip|x-gzip|x-7z-compressed|wasm))$/.test(contentType)) {
+		response.cancel();
+		throw new GitHubError({ message: "GitHub file is binary; only textual previews are supported" });
+	}
+	const bytes = new Uint8Array(await response.arrayBuffer());
+	signal.throwIfAborted();
+	let text: string;
+	try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+	catch { throw new GitHubError({ message: "GitHub file is not UTF-8 text; binary previews are unsupported" }); }
+	if (/[\x00-\x08\x0b\x0e-\x1f]/.test(text)) throw new GitHubError({ message: "GitHub file is binary; only textual previews are supported" });
+	if (bytes.length <= MAX_FILE_BYTES) return { content: text, url };
+	// Streaming decode omits any partial UTF-8 character at the preview boundary.
+	return { content: new TextDecoder().decode(bytes.subarray(0, MAX_FILE_BYTES), { stream: true }) + "\n\n[File truncated at 50KB]", url };
 }
 
 export function serveGitHub(
 	rawUrl: string,
 	session: GitHubSession,
-	execLike: ExecLike,
+	execLike: ExecLike | undefined,
 	signal?: AbortSignal,
 	forceClone = false,
+	transport: GitHubTransport = {},
 ): Effect.Effect<GitHubServeResult, GitHubError> {
 	return Effect.tryPromise({
-		try: async (abortSignal) => {
+		try: async (runtimeSignal) => {
+			const abortSignal = AbortSignal.any([runtimeSignal, ...(signal ? [signal] : [])]);
+			abortSignal.throwIfAborted();
 			const ref = parseGitHubUrl(rawUrl);
-			if (!ref) throw new GitHubError({ message: `Not a GitHub URL: ${rawUrl}` });
+			if (!ref) throw new GitHubError({ message: `Not an allowed GitHub URL: ${displayUrl(rawUrl)}` });
 			const repoSlug = `${ref.owner}/${ref.repo}`;
+			if (ref.kind === "blob") {
+				const revision = await resolveRevision(ref, `https://github.com/${repoSlug}.git`, execLike, abortSignal);
+				const file = await fetchGitHubFile(ref, revision, transport, abortSignal);
+				return { url: rawUrl, fetchedUrl: file.url, repoPath: null, text: `Commit: ${revision.commit}\nFile: ${revision.filePath}\n\n${file.content}`, fileCount: 1 };
+			}
+			if (!execLike) throw new GitHubError({ message: "GitHub repository previews require exec capability" });
 
 			const sizeMb = forceClone ? null : await repoSizeMb(ref.owner, ref.repo, abortSignal);
 			if (sizeMb !== null && sizeMb > CLONE_SIZE_LIMIT_MB) {
@@ -187,47 +277,31 @@ export function serveGitHub(
 				});
 			}
 
-			const dest = await cloneRepo(ref, session, execLike, abortSignal);
-			const fileCount = await countFiles(dest);
+			const { dest, revision } = await cloneRepo(ref, session, execLike, abortSignal);
+			const fileCount = await countFiles(dest, abortSignal);
 
 			if (ref.kind === "repo") {
-				const listing = await topLevelListing(dest);
-				const readme = await readReadme(dest);
-				const text = readme ? `${listing}\n\n--- README ---\n\n${readme}` : listing;
+				const listing = `Repository contents:\n${await repositoryListing(dest, "", abortSignal)}`;
+				const readme = await readReadme(dest, abortSignal);
+				const text = `Commit: ${revision.commit}\n${readme ? `${listing}\n\n--- README ---\n\n${readme}` : listing}`;
 				return { url: rawUrl, repoPath: dest, text, fileCount };
 			}
 
-			const target = path.join(dest, ref.filePath);
-			if (ref.kind === "blob") {
-				const info = await stat(target).catch(() => null);
-				if (!info || !info.isFile()) {
-					throw new GitHubError({ message: `File not found in ${repoSlug}@${ref.ref}: ${ref.filePath}` });
-				}
-				const bytes = Math.min(info.size, MAX_FILE_BYTES);
-				const content = (await readFile(target)).subarray(0, bytes).toString("utf8");
-				const truncated = info.size > MAX_FILE_BYTES ? "\n\n[File truncated at 50KB]" : "";
-				return { url: rawUrl, repoPath: dest, text: `File: ${ref.filePath}\n\n${content}${truncated}`, fileCount };
-			}
-
-			const info = await stat(target).catch(() => null);
-			if (!info || !info.isDirectory()) {
-				throw new GitHubError({ message: `Directory not found in ${repoSlug}@${ref.ref}: ${ref.filePath}` });
-			}
-			const entries = await readdir(target, { withFileTypes: true });
-			const lines = entries.map((entry) => `- ${entry.name}${entry.isDirectory() ? "/" : ""}`).sort();
+			const listing = await repositoryListing(dest, revision.filePath, abortSignal);
 			return {
 				url: rawUrl,
 				repoPath: dest,
-				text: lines.length > 0 ? `Contents of ${ref.filePath}:\n${lines.join("\n")}` : "Directory is empty.",
+				text: `Commit: ${revision.commit}\nContents of ${revision.filePath}:\n${listing}`,
 				fileCount,
 			};
 		},
 		catch: (error) => error instanceof GitHubError
 			? error
-			: new GitHubError({ message: `GitHub handling failed for ${rawUrl}: ${String(error)}` }),
+			: new GitHubError({ message: `GitHub handling failed for ${displayUrl(rawUrl)}: ${String(error)}` }),
 	}).pipe(
 		Effect.timeout(GITHUB_CLONE_TIMEOUT_MS),
 		Effect.catchTag("TimeoutError", () =>
-			Effect.fail(new GitHubError({ message: `GitHub clone timed out for ${rawUrl}` }))),
+			Effect.fail(new GitHubError({ message: `GitHub request timed out for ${displayUrl(rawUrl)}` }))),
+		(effect) => withAbort(effect, signal),
 	);
 }

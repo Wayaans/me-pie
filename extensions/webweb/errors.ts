@@ -12,12 +12,15 @@ export class FirecrawlError extends Data.TaggedError("FirecrawlError")<{
 	readonly retryable: boolean;
 	/** True when the request never got an HTTP response (DNS/TLS/connect failure). */
 	readonly network: boolean;
+	/** Security limits and cancellation must not trigger another provider or transport. */
+	readonly terminal?: boolean;
 }> {}
 
 export class OpenAIError extends Data.TaggedError("OpenAIError")<{
 	readonly message: string;
 	readonly status?: number;
 	readonly retryable: boolean;
+	readonly terminal?: boolean;
 }> {}
 
 export class HttpError extends Data.TaggedError("HttpError")<{

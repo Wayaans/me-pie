@@ -14,10 +14,6 @@ export interface WebwebConfig {
 export const DEFAULT_OPENAI_SEARCH_MODEL = "gpt-5-mini";
 
 export const FIRECRAWL_DEFAULT_BASE_URL = "https://api.firecrawl.dev";
-/** The legacy .app host; used as fallback when the primary host is unreachable. */
-export const FIRECRAWL_FALLBACK_BASE_URL = "https://api.firecrawl.app";
-
-export const FIRECRAWL_BASE_URL = "https://api.firecrawl.app";
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 export const SEARCH_TIMEOUT_MS = 30_000;

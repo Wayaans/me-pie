@@ -5,9 +5,8 @@ import { Effect } from "effect";
 import { SCRAPE_TIMEOUT_MS } from "./config.ts";
 import { HttpError, SsrfBlockedError } from "./errors.ts";
 import type { PageContent } from "./firecrawl.ts";
-import { guardedFetch } from "./ssrf.ts";
-
-const MAX_BYTES = 5 * 1024 * 1024;
+import { guardedFetch, type LookupFunction } from "./ssrf.ts";
+import { withAbort } from "./network.ts";
 
 const turndown = new TurndownService({
 	codeBlockStyle: "fenced",
@@ -15,6 +14,7 @@ const turndown = new TurndownService({
 
 export interface ExtractDeps {
 	readonly signal?: AbortSignal | undefined;
+	readonly lookup?: LookupFunction | undefined;
 }
 
 function htmlToMarkdown(html: string, url: string): PageContent | null {
@@ -40,26 +40,25 @@ export function httpExtract(url: string, deps: ExtractDeps = {}): Effect.Effect<
 			if (deps.signal) signals.push(deps.signal);
 			const response = await guardedFetch(url, {
 				signal: AbortSignal.any(signals),
+				lookup: deps.lookup,
 				headers: {
 					"User-Agent": "Mozilla/5.0 (compatible; webweb/0.1; pi extension)",
 					Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
 				},
 			});
 			if (!response.ok) {
+				response.cancel();
 				throw new HttpError({ message: `HTTP ${response.status} for ${url}`, status: response.status });
 			}
 			const contentType = response.headers.get("content-type") ?? "";
 			if (!/text\/html|application\/xhtml|text\/plain/.test(contentType)) {
+				response.cancel();
 				throw new HttpError({
 					message: `Unsupported content-type "${contentType.split(";")[0]}" for ${url}`,
 					status: response.status,
 				});
 			}
-			const buffer = await response.arrayBuffer();
-			if (buffer.byteLength > MAX_BYTES) {
-				throw new HttpError({ message: `Response too large for ${url} (> ${MAX_BYTES} bytes)`, status: response.status });
-			}
-			const text = new TextDecoder("utf-8", { fatal: false }).decode(buffer);
+			const text = await response.text();
 			if (/text\/plain/.test(contentType)) {
 				return { url, title: url, content: text.trim() };
 			}
@@ -77,5 +76,6 @@ export function httpExtract(url: string, deps: ExtractDeps = {}): Effect.Effect<
 		Effect.timeout(SCRAPE_TIMEOUT_MS),
 		Effect.catchTag("TimeoutError", () =>
 			Effect.fail(new HttpError({ message: `Fetch timed out for ${url}` }))),
+		(effect) => withAbort(effect, deps.signal),
 	);
 }

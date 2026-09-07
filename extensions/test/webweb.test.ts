@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Cause, Effect, Exit } from "effect";
 import { globalConfigPath, loadConfig, maskKey, setConfigValue } from "../webweb/config.ts";
-import { validateRemoteUrl } from "../webweb/ssrf.ts";
+import { validateRemoteUrl, type LookupFunction } from "../webweb/ssrf.ts";
+const publicLookup: LookupFunction = async () => [{ address: "93.184.216.34", family: 4 }];
 import { mapSearchResults, buildSnippetAnswer } from "../webweb/firecrawl.ts";
 import { runSearch, searchOneQuery, runVerify, fetchTopPages, type SearchDeps } from "../webweb/search.ts";
 import { runFetch } from "../webweb/fetch.ts";
 import { runRead } from "../webweb/read.ts";
 import { parseGitHubUrl } from "../webweb/github.ts";
 import { newResponseId, type CacheEntry } from "../webweb/cache.ts";
-import { assessClaim } from "../webweb/verify.ts";
+import { buildVerifyArtifact } from "../webweb/verify.ts";
 import { formatSearchResult, formatFetchResult, formatReadResult } from "../webweb/output.ts";
 import { handleWebwebCommand, type CommandUi } from "../webweb/command.ts";
 
@@ -317,21 +318,14 @@ describe("search pipeline", () => {
 });
 
 describe("verify pipeline", () => {
-	test("assessClaim classifies supported, contradicted, and missing evidence", () => {
-		const supported = assessClaim("effect four requires bun", [
-			{ passageId: "p-1-0", sourceUrl: "https://a.dev", sourceRank: 1, text: "It is confirmed that effect four requires bun according to the docs." },
-		]);
-		expect(supported.status).toBe("supported");
-
-		const contradicted = assessClaim("effect four requires bun", [
-			{ passageId: "p-1-0", sourceUrl: "https://a.dev", sourceRank: 1, text: "This is false: effect four does not require bun, it is incorrect to say effect four requires bun." },
-		]);
-		expect(contradicted.status).toBe("contradicted");
-
-		const missing = assessClaim("effect four requires bun", [
-			{ passageId: "p-1-0", sourceUrl: "https://a.dev", sourceRank: 1, text: "Today the weather is nice." },
-		]);
-		expect(missing.status).toBe("missing-evidence");
+	test("evidence collection assigns neither factual verdict nor confidence", () => {
+		for (const claim of ["effect four requires bun", "effect four does not require bun"]) {
+			const artifact = buildVerifyArtifact(claim, [{ url: "https://a.dev", title: "A", snippet: "It is confirmed that effect four requires bun." }], []);
+			expect(artifact.status).toBe("not-assessed");
+			expect(artifact).not.toHaveProperty("assessment");
+			expect(artifact).not.toHaveProperty("confidence");
+			expect(artifact.passages[0]?.provenance).toBe("search-snippet");
+		}
 	});
 
 	test("runVerify produces an artifact with sources, passages, and a responseId", async () => {
@@ -344,7 +338,7 @@ describe("verify pipeline", () => {
 		const run = await Effect.runPromise(
 			runVerify({ claim: "effect four requires bun" }, { config: CONFIG, fetchLike, store }),
 		);
-		expect(run.artifact.assessment.status).toBe("supported");
+		expect(run.artifact.status).toBe("not-assessed");
 		expect(run.artifact.sources).toHaveLength(1);
 		expect(run.responseId).toMatch(/^[0-9a-f]{8}$/);
 	});
@@ -355,7 +349,7 @@ describe("fetch pipeline", () => {
 		const { calls, fetchLike } = fakeFetch([firecrawlScrapeRoute("# Hello")]);
 		const store = memoryStore();
 		const run = await Effect.runPromise(
-			runFetch({ url: "https://example.dev/post" }, { config: CONFIG, fetchLike, store }),
+			runFetch({ url: "https://example.dev/post" }, { config: CONFIG, fetchLike, store, lookup: publicLookup }),
 		);
 		expect(run.items[0]?.status).toBe("fetched");
 		expect(run.items[0]?.provider).toBe("firecrawl");
@@ -364,7 +358,7 @@ describe("fetch pipeline", () => {
 		expect(run.responseId).toMatch(/^[0-9a-f]{8}$/);
 	});
 
-	test("runFetch records a failure instead of throwing when both paths fail", async () => {
+	test("runFetch records a terminal failure for blocked targets", async () => {
 		const { fetchLike } = fakeFetch([
 			{ match: (url) => url.includes("firecrawl"), status: 500, body: { error: "boom" } },
 			{ match: () => true, status: 403, body: "forbidden" },
@@ -374,8 +368,7 @@ describe("fetch pipeline", () => {
 			runFetch({ url: "https://192.0.2.1/post" }, { config: CONFIG, fetchLike }),
 		);
 		expect(run.items[0]?.status).toBe("failed");
-		expect(run.items[0]?.error).toContain("firecrawl");
-		expect(run.items[0]?.error).toContain("http fallback");
+		expect(run.items[0]?.error).toContain("private or reserved");
 	});
 
 	test("runFetch reports a clear failure for github urls without exec capability", async () => {
@@ -434,7 +427,9 @@ describe("output formatting", () => {
 			],
 			responseId: null,
 		});
-		expect(text).toContain("Cloned to /tmp/x");
+		expect(text).toContain("GitHub repository preview");
+		expect(text).not.toContain("/tmp/x");
+		expect(text).not.toContain("Explore it with read and bash");
 		expect(text).toContain("FAILED: HTTP 500");
 	});
 
@@ -468,7 +463,7 @@ describe("output formatting", () => {
 		// second url is TEST-NET-1: blocked locally by the SSRF guard without DNS
 		const { pages, failures } = await Effect.runPromise(fetchTopPages(
 			[{ url: "https://ok.dev/a" }, { url: "https://192.0.2.1/b" }],
-			{ config: CONFIG, fetchLike },
+			{ config: CONFIG, fetchLike, lookup: publicLookup },
 			CONFIG,
 		));
 		expect(pages).toHaveLength(1);

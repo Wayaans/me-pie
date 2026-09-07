@@ -3,7 +3,8 @@ import { FETCH_CONCURRENCY, loadConfig, MAX_BATCH_URLS, type WebwebConfig } from
 import { causeMessage, type Provider } from "./errors.ts";
 import { firecrawlScrape, type FetchLike } from "./firecrawl.ts";
 import { httpExtract } from "./extract.ts";
-import { guardedFetch } from "./ssrf.ts";
+import { guardedFetch, type LookupFunction, type RequestFunction } from "./ssrf.ts";
+import { settle, withAbort } from "./network.ts";
 import { createGitHubSession, parseGitHubUrl, serveGitHub, type ExecLike, type GitHubSession } from "./github.ts";
 import { cacheStore, storeSources, type CachedSource } from "./cache.ts";
 
@@ -23,6 +24,7 @@ export interface FetchedItem {
 	readonly repoPath: string | null;
 	readonly fileCount: number | null;
 	readonly error: string | null;
+	readonly fetchedUrl?: string | undefined;
 }
 
 export interface FetchRunResult {
@@ -33,7 +35,10 @@ export interface FetchRunResult {
 export interface FetchDeps {
 	readonly signal?: AbortSignal | undefined;
 	readonly fetchLike?: FetchLike | undefined;
+	readonly lookup?: LookupFunction | undefined;
 	readonly execLike?: ExecLike | undefined;
+	/** Offline connector for direct GitHub files, after SSRF validation. */
+	readonly githubRequest?: RequestFunction | undefined;
 	readonly config?: WebwebConfig | undefined;
 	readonly store?: ReturnType<typeof cacheStore> | undefined;
 	readonly github?: GitHubSession | undefined;
@@ -63,12 +68,14 @@ export function fetchRaw(url: string, deps: FetchDeps): Effect.Effect<FetchedIte
 		try: async (signal) => {
 			const signals = [AbortSignal.timeout(RAW_TIMEOUT_MS), signal];
 			if (deps.signal) signals.push(deps.signal);
-			const response = await guardedFetch(url, { signal: AbortSignal.any(signals) });
+			const response = await guardedFetch(url, { signal: AbortSignal.any(signals), lookup: deps.lookup });
 			if (!response.ok) {
+				response.cancel();
 				throw new Error(`HTTP ${response.status}`);
 			}
 			const contentType = response.headers.get("content-type") ?? "";
 			if (!isRawTextContentType(contentType)) {
+				response.cancel();
 				throw new Error(`raw mode requires a textual content-type, got "${contentType.split(";")[0] || "unknown"}"`);
 			}
 			return response.text();
@@ -77,7 +84,8 @@ export function fetchRaw(url: string, deps: FetchDeps): Effect.Effect<FetchedIte
 	}).pipe(
 		Effect.timeout(RAW_TIMEOUT_MS),
 		Effect.catchTag("TimeoutError", () => Effect.fail(new Error("raw fetch timed out"))),
-		Effect.exit,
+		(effect) => withAbort(effect, deps.signal),
+		settle,
 	);
 
 	return Effect.map(attempt, (exit) =>
@@ -113,26 +121,27 @@ function fetchReadable(url: string, deps: FetchDeps, config: WebwebConfig): Effe
 				firecrawlScrape(url, {
 					apiKey: config.firecrawlApiKey,
 					apiVersion: config.firecrawlApiVersion,
-				baseUrl: config.firecrawlBaseUrl,
+					baseUrl: config.firecrawlBaseUrl,
 					fetchLike: deps.fetchLike,
+					lookup: deps.lookup,
 				}, deps.signal),
 				(page) => toItem(page, "firecrawl"),
 			),
 		)
 		: Option.none();
 
-	const http = Effect.map(httpExtract(url, { signal: deps.signal }), (page) => toItem(page, "http"));
+	const http = Effect.map(httpExtract(url, { signal: deps.signal, lookup: deps.lookup }), (page) => toItem(page, "http"));
 
 	const attempt = Option.isSome(firecrawl)
 		? firecrawl.value.pipe(
-			Effect.catchIf(() => true, (firecrawlError) =>
+			Effect.catchIf((error) => !error.terminal && !deps.signal?.aborted, (firecrawlError) =>
 				Effect.mapError(http, (httpError) => new Error(
 					`firecrawl: ${firecrawlError.message} | http fallback: ${httpError.message}`,
 				))),
 		)
 		: http;
 
-	return Effect.map(Effect.exit(attempt), (exit) =>
+	return Effect.map(settle(withAbort(attempt, deps.signal)), (exit) =>
 		Exit.isSuccess(exit) ? exit.value : failedItem(url, causeMessage(exit.cause)));
 }
 
@@ -144,23 +153,21 @@ function fetchOne(
 ): Effect.Effect<FetchedItem, never> {
 	const githubRef = parseGitHubUrl(url);
 	if (githubRef) {
-		if (!deps.execLike) {
-			return Effect.succeed(failedItem(url, "GitHub handling unavailable: no exec capability provided"));
-		}
 		const github = deps.github ?? createGitHubSession();
 		const execLike = deps.execLike;
 		return Effect.map(
-			Effect.exit(serveGitHub(url, github, execLike, deps.signal, input.forceClone)),
+			settle(withAbort(serveGitHub(url, github, execLike, deps.signal, input.forceClone, { lookup: deps.lookup, request: deps.githubRequest }), deps.signal)),
 			(exit) =>
 				Exit.isSuccess(exit)
 					? {
 							url,
-							status: "cloned" as const,
+							status: exit.value.repoPath === null ? "fetched" as const : "cloned" as const,
 							provider: "github" as const,
 							title: githubRef.repo,
 							content: exit.value.text,
 							repoPath: exit.value.repoPath,
 							fileCount: exit.value.fileCount,
+							fetchedUrl: exit.value.fetchedUrl,
 							error: null,
 						}
 					: failedItem(url, causeMessage(exit.cause)),
@@ -186,16 +193,16 @@ export function runFetch(input: FetchInput, deps: FetchDeps = {}): Effect.Effect
 
 		const cacheable: Array<CachedSource> = items.flatMap((item) =>
 			item.content && item.status === "fetched"
-				? [{ url: item.url, title: item.title ?? item.url, content: item.content }]
+				? [{ url: item.url, title: item.title ?? item.url, content: item.content, contentKind: "fetched-page" as const, ...(item.fetchedUrl ? { fetchedUrl: item.fetchedUrl } : {}) }]
 				: []
 		);
 		const responseId = cacheable.length > 0
 			? yield* Effect.map(
-					Effect.exit(storeSources("fetch", cacheable, deps.store ?? cacheStore())),
+					settle(storeSources("fetch", cacheable, deps.store ?? cacheStore())),
 					(exit) => Exit.isSuccess(exit) ? exit.value : null,
 				)
 			: null;
 
 		return { items, responseId };
-	});
+	}).pipe((effect) => withAbort(effect, deps.signal));
 }
