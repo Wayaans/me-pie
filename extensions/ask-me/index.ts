@@ -3,6 +3,8 @@ import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { AskMeQuestionnaire } from "./questionnaire.ts";
+import { AskMeRouting } from "./routing.ts";
+import type { AskMeDraft } from "./draft.ts";
 import {
 	AskMeParams,
 	type AskMeAnswer,
@@ -131,31 +133,34 @@ async function askQuestionWithRpc(
 		: { cancelled: true };
 }
 
-async function runRpcQuestionnaire(
+export async function runRpcQuestionnaire(
 	ctx: ExtensionContext,
 	request: AskMeRequest,
 	signal: AbortSignal | undefined,
+	draft: AskMeDraft = { answers: [] },
 ): Promise<AskMeDetails> {
-	const answers: AskMeAnswer[] = [];
+	const answers: AskMeAnswer[] = [...draft.answers];
+	let overallResponse = draft.overallResponse;
+	const cancel = (): AskMeDetails => ({ ...request, status: "cancelled", answers, ...(overallResponse ? { overallResponse } : {}) });
 	for (let index = 0; index < request.questions.length; index++) {
 		const question = request.questions[index]!;
+		if (answers.some((answer) => answer.id === question.id)) continue;
 		let response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
 		while (!response.cancelled && request.displayType !== "questionnaire" && question.required && !response.answer) {
 			ctx.ui.notify("An answer is required.", "warning");
 			response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
 		}
-		if (response.cancelled) return cancelledDetails(request, answers);
+		if (response.cancelled) return cancel();
 		if (response.answer) answers.push(response.answer);
 	}
 
-	let overallResponse: string | undefined;
-	if (request.displayType === "questionnaire") {
+	if (request.displayType === "questionnaire" && !overallResponse) {
 		const response = await ctx.ui.input(
 			"Overall response",
 			"Optionally answer the whole questionnaire at once",
 			signal ? { signal } : undefined,
 		);
-		if (signal?.aborted || response === undefined) return cancelledDetails(request, answers);
+		if (signal?.aborted || response === undefined) return cancel();
 		overallResponse = response.trim() || undefined;
 	}
 
@@ -168,9 +173,15 @@ async function runRpcQuestionnaire(
 			while (!response.cancelled && !response.answer) {
 				response = await askQuestionWithRpc(ctx, question, index, request.questions.length, signal);
 			}
-			if (response.cancelled) return cancelledDetails(request, answers);
+			if (response.cancelled) return cancel();
 			if (response.answer) answers.push(response.answer);
 		}
+	}
+
+	if (draft.answers.length > 0 || draft.overallResponse) {
+		const review = request.questions.map((question, index) => `${dialogTitle(question, index, request.questions.length)}\nAnswer: ${answers.find((answer) => answer.id === question.id)?.label ?? "Not answered"}`).join("\n\n");
+		const choice = await ctx.ui.select(`${review}${overallResponse ? `\n\nOverall response: ${overallResponse}` : ""}\n\nSubmit reclaimed draft?`, ["Submit answers", "Cancel interview"], signal ? { signal } : undefined);
+		if (signal?.aborted || choice !== "Submit answers") return cancel();
 	}
 
 	return {
@@ -185,8 +196,10 @@ async function runTuiQuestionnaire(
 	ctx: ExtensionContext,
 	request: AskMeRequest,
 	signal: AbortSignal | undefined,
+	draft: AskMeDraft,
+	sendToTelegram: () => boolean,
 ): Promise<AskMeDetails> {
-	if (signal?.aborted) return cancelledDetails(request, []);
+	if (signal?.aborted) return { ...request, ...draft, status: "cancelled" };
 	let component: AskMeQuestionnaire | undefined;
 	let abortListener: (() => void) | undefined;
 
@@ -198,7 +211,7 @@ async function runTuiQuestionnaire(
 				finished = true;
 				done(result);
 			};
-			component = new AskMeQuestionnaire(request, tui, theme, keybindings, finish);
+			component = new AskMeQuestionnaire(request, tui, theme, keybindings, finish, { draft, send: sendToTelegram });
 			abortListener = () => component?.cancel();
 			signal?.addEventListener("abort", abortListener, { once: true });
 			if (signal?.aborted) abortListener();
@@ -213,17 +226,15 @@ async function executeAskMe(
 	params: AskMeParamsInput,
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	routing: AskMeRouting,
+	progress: (status: string) => void,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: AskMeDetails }> {
 	const request = normalizeAskMeRequest(params);
 	const requestSizeError = getAskMeTranscriptSizeError(cancelledDetails(request, []));
 	if (requestSizeError) throw new Error(requestSizeError);
-	if (!ctx.hasUI || ctx.mode === "json" || ctx.mode === "print") {
-		throw new Error(`ask_me requires interactive input; UI is unavailable in ${ctx.mode} mode`);
-	}
-
-	const details = ctx.mode === "tui"
-		? await runTuiQuestionnaire(ctx, request, signal)
-		: await runRpcQuestionnaire(ctx, request, signal);
+	const details = await routing.run(ctx, request, signal, (context, questions, abort, draft, send) => context.mode === "tui"
+		? runTuiQuestionnaire(context, questions, abort, draft, send)
+		: runRpcQuestionnaire(context, questions, abort, draft), progress);
 	const transcriptSizeError = getAskMeTranscriptSizeError(details);
 	if (transcriptSizeError) throw new Error(transcriptSizeError);
 	const transcript = formatAskMeTranscript(details);
@@ -231,7 +242,8 @@ async function executeAskMe(
 }
 
 export default function askMe(pi: ExtensionAPI): void {
-	pi.registerTool(defineTool<typeof AskMeParams, AskMeDetails, AskMeRenderState>({
+	const routing = new AskMeRouting(pi);
+	pi.registerTool(defineTool<typeof AskMeParams, AskMeDetails | undefined, AskMeRenderState>({
 		name: "ask_me",
 		label: "ask-me",
 		description:
@@ -240,16 +252,16 @@ export default function askMe(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use ask_me whenever progress requires user input, clarification, selection, interviewing, or confirmation instead of asking only in prose.",
 			"Group related questions into one ask_me call, use detail for decision context, and include a recommendation only when its reason can be explained.",
-			"For confirmation questions with long supporting context, explain that context in the assistant response before calling ask_me. Keep the confirmation question concise, and keep detail to a short summary of the action, target, and consequence instead of repeating the full context.",
+			"For confirmation questions, keep the question concise. You may explain supporting context in the assistant response before calling ask_me, but ask_me detail must also contain enough context, constraints, targets and consequences to decide independently: the user may receive only this questionnaire on Telegram. Do not send the whole conversation or secrets.",
 			"Treat a cancelled ask_me result as no decision; never infer approval or silently use a recommendation.",
 		],
 		parameters: AskMeParams,
 		executionMode: "sequential",
 
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			return Effect.runPromise(
 				Effect.tryPromise({
-					try: () => executeAskMe(params, signal, ctx),
+					try: () => executeAskMe(params, signal, ctx, routing, (status) => onUpdate?.({ content: [{ type: "text", text: status }], details: undefined })),
 					catch: (error) => error instanceof Error ? error : new Error(String(error)),
 				}),
 			);

@@ -11,6 +11,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { getAskMeTranscriptSizeError } from "./schema.ts";
+import { validateDraft, type AskMeDraft } from "./draft.ts";
 import type {
 	AskMeAnswer,
 	AskMeDetails,
@@ -48,7 +49,13 @@ export class AskMeQuestionnaire implements Focusable {
 		private readonly theme: Theme,
 		private readonly keybindings: KeybindingsManager,
 		private readonly finish: Finish,
+		private readonly remote?: { draft: AskMeDraft; send: () => boolean },
 	) {
+		if (remote) {
+			const draft = validateDraft(request, remote.draft);
+			for (const answer of draft.answers) this.answers.set(answer.id, answer);
+			this.overallResponse = draft.overallResponse;
+		}
 		const editorTheme: EditorTheme = {
 			borderColor: (text) => theme.fg("accent", text),
 			selectList: {
@@ -348,7 +355,23 @@ export class AskMeQuestionnaire implements Focusable {
 		this.finish(result);
 	}
 
+	private sendToTelegram(): void {
+		if (!this.remote) return;
+		const question = this.currentQuestion();
+		const value = this.editor.getText().trim();
+		if (question && (question.type === "question" || this.customInput) && value) {
+			const existing = this.answers.get(question.id);
+			const source = existing?.source === "recommended" && existing.value === value ? "recommended" : "typed";
+			if (!this.storeAnswer({ id: question.id, value, label: value, source })) { this.refresh(); return; }
+		} else if (!question && this.request.displayType === "questionnaire") this.overallResponse = value || undefined;
+		const result = this.result("cancelled");
+		const error = getAskMeTranscriptSizeError(result);
+		if (error) { this.validationMessage = error; this.refresh(); return; }
+		if (this.remote.send()) this.finish(result);
+	}
+
 	handleInput(data: string): void {
+		if (this.remote && matchesKey(data, Key.ctrl("t"))) { this.sendToTelegram(); return; }
 		if (matchesKey(data, Key.shift("up"))) {
 			this.scrollContext(-1);
 			return;
@@ -534,6 +557,7 @@ export class AskMeQuestionnaire implements Focusable {
 			? `${question.type === "question" || this.customInput ? "Enter/Tab next" : "↑↓ select · Enter next"} · Shift+Tab previous${question.recommendation ? " · Ctrl+R use recommendation" : ""} · Esc cancel`
 			: "Enter submit · Shift+Tab/← previous · Esc cancel";
 		add(this.theme.fg("dim", truncateToWidth(controls, Math.max(1, renderWidth - 1))));
+		if (this.remote) add(this.theme.fg("dim", "Ctrl+T send this draft to Telegram and enable AFK"));
 		lines.push(this.theme.fg("accent", "─".repeat(renderWidth)));
 
 		const visibleLines = contextStart !== undefined && contextEnd !== undefined

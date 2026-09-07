@@ -110,7 +110,10 @@ interface CapturedTool {
 
 function captureTool(): CapturedTool {
 	let captured: unknown;
-	askMe({ registerTool(tool: unknown) { captured = tool; } } as never);
+	askMe({
+		registerTool(tool: unknown) { captured = tool; },
+		registerFlag() {}, registerCommand() {}, on() {},
+	} as never);
 	assert.ok(captured);
 	return captured as CapturedTool;
 }
@@ -137,11 +140,13 @@ function renderContext() {
 	};
 }
 
-test("ask-me guidance keeps long-context handling specific to confirmations", () => {
+test("ask-me guidance includes standalone confirmation context for Telegram", () => {
 	const tool = captureTool();
 	const guidance = tool.promptGuidelines?.join("\n") ?? "";
 	assert.match(guidance, /confirmation questions/);
 	assert.match(guidance, /assistant response before calling ask_me/);
+	assert.match(guidance, /detail must also contain enough context/);
+	assert.match(guidance, /Do not send the whole conversation or secrets/);
 	assert.doesNotMatch(guidance, /free-form questions whose supporting context is long/);
 });
 
@@ -262,7 +267,7 @@ test("ask-me RPC cancellation is not mistaken for skipping an optional question"
 			ui: {
 				select: async () => undefined,
 				input: async () => undefined,
-				notify() {},
+				notify() {}, setStatus() {},
 			},
 		} as never,
 	) as { details: AskMeDetails };
@@ -293,7 +298,7 @@ test("ask-me RPC always offers and accepts a custom selection answer", async () 
 					return options.find((option) => option.includes("Write another answer"));
 				},
 				input: async () => "SQLite",
-				notify() {},
+				notify() {}, setStatus() {},
 			},
 		} as never,
 	) as { details: AskMeDetails };
@@ -329,7 +334,7 @@ test("ask-me RPC accepts a custom confirmation answer", async () => {
 					return options.find((option) => option.includes("Write another answer"));
 				},
 				input: async () => "Only after CI passes",
-				notify() {},
+				notify() {}, setStatus() {},
 			},
 		} as never,
 	) as { details: AskMeDetails };
@@ -363,7 +368,7 @@ test("ask-me RPC exposes an explicit skip action for optional questions", async 
 			ui: {
 				select: async (_title: string, options: string[]) => options.find((option) => option.includes("Skip")),
 				input: async () => undefined,
-				notify() {},
+				notify() {}, setStatus() {},
 			},
 		} as never,
 	) as { content: Array<{ type: "text"; text: string }>; details: AskMeDetails };

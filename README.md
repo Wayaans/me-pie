@@ -46,6 +46,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 
 ## Included extensions
 
+- [`ask-me`](extensions/ask-me/README.md): interview the user locally or through Telegram. Configure once with `/ask-me setup` on macOS, then use `/ask-me afk` or `pi --afk`.
 - `answer` — extract questions from the latest assistant response into an interactive Q&A.
 - `checkpoint-compaction` — replace Pi compaction summaries with structured continuation checkpoints.
 - `codex-usage` — show OpenAI Codex subscription usage.
