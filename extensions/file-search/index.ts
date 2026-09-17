@@ -55,6 +55,7 @@ import { discardCapturedOutput, executeSearchProcess } from "./src/process.ts";
 import {
   registerMepieToolSpacing,
   resultText,
+  searchTarget,
   withMepieToolUi,
   type SummaryPart,
   type ToolView,
@@ -314,7 +315,10 @@ const fdView: ToolView<Static<ReturnType<typeof fdParameters>>, FdToolDetails> =
   icon: TOOL_ICONS.files,
   label: "Fd",
   targetTruncation: "end",
-  target: (args) => `${args.pattern || "(all)"} in ${args.path || "."}`,
+  target: (args, _cwd, argsComplete) => searchTarget(
+    args.pattern || (argsComplete ? "(all)" : undefined),
+    args.path || (argsComplete ? "." : undefined),
+  ),
   summary(_args, result) {
     const details = result.details;
     const count = details?.matchCount ?? 0;
@@ -335,7 +339,10 @@ const rgView: ToolView<Static<ReturnType<typeof rgParameters>>, RgToolDetails> =
   icon: TOOL_ICONS.search,
   label: "Rg",
   targetTruncation: "end",
-  target: (args) => `/${args.pattern}/ in ${args.path || "."}`,
+  target: (args, _cwd, argsComplete) => searchTarget(
+    args.pattern === undefined ? undefined : `/${args.pattern}/`,
+    args.path || (argsComplete ? "." : undefined),
+  ),
   summary(args, result) {
     const details = result.details;
     const count = details?.outputLines ?? 0;

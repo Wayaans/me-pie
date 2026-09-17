@@ -582,10 +582,113 @@ test("collapsed skill reads use the Nerd Font skill label and semantic text colo
 	assert.ok(line.endsWith(" "));
 	const rendered = line.trim();
 
-	assert.match(rendered, /^<toolTitle>󰚩<\/toolTitle> <text>unslop<\/text>/);
-	assert.match(rendered, /<text>unslop<\/text>/);
+	assert.match(rendered, /^<toolTitle>󰚩<\/toolTitle> <toolTitle>unslop<\/toolTitle>/);
 	assert.match(rendered, /<muted> \(.*to expand\)<\/muted>$/);
 	assert.doesNotMatch(rendered, /Read|lines/);
+});
+
+test("streaming headers show known targets without inventing optional defaults", () => {
+	const tools = registeredTools();
+	const cases = [
+		["read", { path: "src/a.ts" }, "󰈙 Read src/a.ts"],
+		["write", { path: "src/a.ts" }, "󰆓 Write src/a.ts"],
+		["edit", { path: "src/a.ts" }, "󰏫 Edit src/a.ts"],
+		["bash", { command: "bun test" }, " Bash"],
+		["bash", { purpose: "Run tests" }, " Bash · Run tests"],
+		["grep", { pattern: "render" }, "󰍉 Grep /render/"],
+		["grep", { path: "src" }, "󰍉 Grep in src"],
+		["find", { pattern: "*.ts" }, "󰈞 Find *.ts"],
+		["ls", {}, "󰉋 List"],
+	] as const;
+	for (const [name, args, expected] of cases) {
+		const tool = tools.get(name);
+		assert.ok(tool);
+		const context = renderContext(args, {}, { argsComplete: false, executionStarted: false, isPartial: true });
+		assert.equal(tool.renderCall(args, plainTheme as unknown as Theme, context).render(120).join("\n").trim(), expected);
+	}
+	for (const tool of tools.values()) {
+		for (const args of [{}, undefined]) {
+			const context = renderContext(args, {}, { argsComplete: false, executionStarted: false, isPartial: true });
+			const output = tool.renderCall(args, plainTheme as unknown as Theme, context).render(120).join("\n");
+			assert.doesNotMatch(output, /undefined| in |Run shell command/);
+		}
+	}
+});
+
+test("write and edit headers survive Pi's streaming, execution, and result lifecycle", () => {
+	for (const name of ["write", "edit"]) {
+		const tool = registeredTools().get(name);
+		assert.ok(tool);
+		const component = new ToolExecutionComponent(name, `lifecycle-${name}`, {}, {},
+			tool as unknown as ToolDefinition, { requestRender() {} } as unknown as TUI, process.cwd());
+		const output = () => unstyledLines(component.render(120).join("\n")).trim();
+		assert.match(output(), new RegExp(name, "i"));
+		component.updateArgs({ path: "src/a.ts" });
+		const header = output();
+		assert.match(header, /src\/a.ts$/);
+		component.updateArgs(name === "write"
+			? { path: "src/a.ts", content: "one\ntwo" }
+			: { path: "src/a.ts", edits: [{ oldText: "one", newText: "two" }] });
+		component.setArgsComplete();
+		component.markExecutionStarted();
+		assert.equal(output(), header);
+		component.updateResult({ content: [{ type: "text", text: "working" }], details: undefined, isError: false }, true);
+		assert.equal(output(), header);
+		component.updateResult({ content: [{ type: "text", text: "done" }], details: undefined, isError: false });
+		assert.match(output(), name === "write" ? /2 lines · 7 B$/ : /no changes$/);
+		component.updateResult({ content: [{ type: "text", text: "failure details" }], details: undefined, isError: true });
+		assert.match(output(), /failed\n╰─ failure details$/);
+		assert.doesNotMatch(output(), /2 lines|no changes/);
+	}
+});
+
+test("compact skill names use the shared state colors while arguments stream", () => {
+	const tool = registeredTools().get("read");
+	assert.ok(tool);
+	const theme = { fg: (color: string, text: string) => `<${color}>${text}</${color}>`, bold: (text: string) => text } as unknown as Theme;
+	for (const [overrides, color] of [
+		[{ argsComplete: false, executionStarted: false, isPartial: true }, "muted"],
+		[{ isPartial: true }, "muted"],
+		[{ isPartial: false }, "toolTitle"],
+		[{ isError: true }, "error"],
+	] as const) {
+		const args = { path: "/tmp/unslop/SKILL.md" };
+		const output = tool.renderCall(args, theme, renderContext(args, {}, overrides)).render(300).join("\n");
+		assert.ok(output.includes(`<${color}>unslop</${color}>`));
+		assert.match(output, /<toolTitle>󰚩<\/toolTitle>/);
+	}
+});
+
+test("streaming targets retain control sanitization and single-line width limits", () => {
+	const tool = registeredTools().get("write");
+	assert.ok(tool);
+	const args = { path: `src/\u001b[2J${"long/".repeat(20)}\nfile.ts` };
+	const context = renderContext(args, {}, { argsComplete: false, executionStarted: false, isPartial: true });
+	const call = tool.renderCall(args, plainTheme as unknown as Theme, context);
+	for (const width of [1, 2, 12, 48, 200]) {
+		const lines = call.render(width);
+		assert.equal(lines.length, 1);
+		assert.ok(visibleWidth(lines[0] ?? "") <= width);
+		assert.doesNotMatch(lines.join("").replaceAll("\u001b[0m", ""), /\u001b|\[2J|\n/);
+	}
+});
+
+test("compact skill rows survive Pi lifecycle and keep error details", () => {
+	const tool = registeredTools().get("read");
+	assert.ok(tool);
+	const component = new ToolExecutionComponent("read", "skill-lifecycle", {}, {},
+		tool as unknown as ToolDefinition, { requestRender() {} } as unknown as TUI, process.cwd());
+	const output = () => unstyledLines(component.render(120).join("\n")).trim();
+	component.updateArgs({ path: "/tmp/unslop/SKILL.md" });
+	assert.match(output(), /^󰚩 unslop/);
+	component.setArgsComplete();
+	component.markExecutionStarted();
+	assert.match(output(), /^󰚩 unslop/);
+	component.updateResult({ content: [{ type: "text", text: "not found" }], details: undefined, isError: true });
+	assert.match(output(), /╰─ not found$/);
+	component.setExpanded(true);
+	assert.match(output(), /Read .*SKILL.md · failed/);
+	assert.match(output(), /╰─ not found$/);
 });
 
 test("Bash exposes an optional purpose title", () => {
@@ -734,8 +837,8 @@ test("tool icons use text color while labels communicate execution state", () =>
 	} as unknown as Theme;
 	const args = { command: "bun test" };
 	const states = [
-		[{ executionStarted: false, isPartial: true }, "dim"],
-		[{ executionStarted: true, isPartial: true }, "accent"],
+		[{ executionStarted: false, isPartial: true }, "muted"],
+		[{ executionStarted: true, isPartial: true }, "muted"],
 		[{ executionStarted: true, isPartial: false }, "toolTitle"],
 		[{ executionStarted: false, isPartial: false }, "toolTitle"],
 		[{ executionStarted: true, isPartial: false, isError: true }, "error"],

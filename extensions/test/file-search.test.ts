@@ -313,6 +313,35 @@ test("file-search tools share Mepie tool-group spacing", async () => {
 	}
 });
 
+test("file-search headers render partial targets through Pi's lifecycle", () => {
+	for (const name of ["fd", "rg"]) {
+		const tool = registeredSearchTools().get(name);
+		assert.ok(tool);
+		const component = new ToolExecutionComponent(name, `stream-${name}`, {}, {},
+			tool as unknown as ToolDefinition, { requestRender() {} } as unknown as TUI, process.cwd());
+		const output = () => component.render(120).join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").trim();
+		assert.doesNotMatch(output(), /undefined|\(all\)| in /);
+		component.updateArgs({ path: "src" });
+		assert.match(output(), /in src$/);
+		component.updateArgs({ pattern: "needle" });
+		assert.ok(output().endsWith(name === "rg" ? "/needle/" : "needle"));
+		assert.doesNotMatch(output(), / in /);
+		component.setArgsComplete();
+		component.markExecutionStarted();
+		assert.match(output(), /in \.$/);
+		component.updateResult({ content: [{ type: "text", text: "a.ts" }], details: { matchCount: 1, outputLines: 1 }, isError: false }, true);
+		assert.doesNotMatch(output(), / · /);
+		component.updateResult({ content: [{ type: "text", text: "a.ts" }], details: { matchCount: 1, outputLines: 1 }, isError: false });
+		assert.match(output(), / · 1 (entry|line)$/);
+		component.updateResult({ content: [{ type: "text", text: "search failed" }], details: undefined, isError: true });
+		assert.match(output(), /failed/);
+		assert.match(output(), /╰─ search failed/);
+	}
+	const fd = registeredSearchTools().get("fd");
+	assert.ok(fd);
+	assert.match(renderCompletedSearch(fd, {}, { content: [], details: undefined }).call, /Fd \(all\) in \./);
+});
+
 test("file-search uses the compact Mepie tool renderer", () => {
 	const tools = registeredSearchTools();
 	const fd = tools.get("fd");

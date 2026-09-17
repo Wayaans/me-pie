@@ -56,7 +56,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `localize`: compose English prompts from instructions or refine wording while preserving structure before submission.
 - `mepie` — enable or disable Mepie extensions globally or for the current project with `/mepie`.
 - `mepie-ui` — add a theme-aware PI header and model, context, cost, and Git dashboard.
-- `mepie-tool-ui`: render built-in tools as compact, state-colored conversation rows with expandable output and mark collapsed skill reads as `[] skill-name` (Nerd Font required).
+- `mepie-tool-ui`: render built-in tools as compact conversation rows with expandable output. Show known targets while arguments stream, keep unfinished names muted, and use `toolTitle` on success or `error` on failure. Collapsed skill reads show `󰚩 skill-name` with the same name colors. Nerd Font required.
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
 - `terminal-environment` — expose one tmux-backed `workspace` tool for raw target operations and managed Agent Runs / Work Cycles.
 

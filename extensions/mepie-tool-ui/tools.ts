@@ -34,6 +34,8 @@ import {
 	countLines,
 	resultText,
 	returnedLines,
+	sanitizeInline,
+	searchTarget,
 	textContent,
 	withMepieToolUi,
 	type SummaryPart,
@@ -80,12 +82,12 @@ function createMepieBashDefinition(
 const readView: ToolView<ReadToolInput, ReadToolDetails | undefined> = {
 	icon: TOOL_ICONS.read,
 	label: "Read",
-	compactCall(args, cwd, theme) {
-		const name = skillName(args.path, cwd);
+	compactCall(args, cwd, theme, nameColor) {
+		const name = args.path === undefined ? undefined : skillName(args.path, cwd);
 		if (!name) return undefined;
 		const label = theme.fg("toolTitle", "󰚩");
 		const hint = theme.fg("muted", ` (${keyText("app.tools.expand")} to expand)`);
-		return new Text(`${label} ${theme.fg("text", name)}${hint}`, 0, 0);
+		return new Text(`${label} ${theme.fg(nameColor, sanitizeInline(name))}${hint}`, 0, 0);
 	},
 	target: (args, cwd) => displayPath(args.path, cwd),
 	summary(args, result) {
@@ -115,7 +117,10 @@ const bashView: ToolView<MepieBashInput, BashToolDetails | undefined> = {
 	label: "Bash",
 	targetColor: "text",
 	targetTruncation: "end",
-	target: (args) => `· ${bashPurpose(args)}`,
+	target(args, _cwd, argsComplete) {
+		const purpose = args.purpose?.trim() || (argsComplete ? "Run shell command" : "");
+		return purpose ? `· ${purpose}` : "";
+	},
 	summary(_args, result) {
 		return result.details?.truncation?.truncated
 			? [{ text: "output truncated", color: "warning" }]
@@ -176,7 +181,10 @@ const grepView: ToolView<GrepToolInput, GrepToolDetails | undefined> = {
 	icon: TOOL_ICONS.search,
 	label: "Grep",
 	targetTruncation: "end",
-	target: (args, cwd) => `/${args.pattern}/ in ${displayPath(args.path ?? ".", cwd)}`,
+	target: (args, cwd, argsComplete) => searchTarget(
+		args.pattern === undefined ? undefined : `/${args.pattern}/`,
+		displayPath(args.path ?? (argsComplete ? "." : undefined), cwd),
+	),
 	summary(args, result) {
 		const parts: SummaryPart[] = [];
 		if (args.glob) parts.push({ text: args.glob, color: "muted" });
@@ -197,7 +205,10 @@ const findView: ToolView<FindToolInput, FindToolDetails | undefined> = {
 	icon: TOOL_ICONS.files,
 	label: "Find",
 	targetTruncation: "end",
-	target: (args, cwd) => `${args.pattern} in ${displayPath(args.path ?? ".", cwd)}`,
+	target: (args, cwd, argsComplete) => searchTarget(
+		args.pattern,
+		displayPath(args.path ?? (argsComplete ? "." : undefined), cwd),
+	),
 	summary(_args, result) {
 		const text = textContent(result);
 		const fileCount = text.trim() === "No files found matching pattern"
@@ -216,7 +227,7 @@ const findView: ToolView<FindToolInput, FindToolDetails | undefined> = {
 const listView: ToolView<LsToolInput, LsToolDetails | undefined> = {
 	icon: TOOL_ICONS.list,
 	label: "List",
-	target: (args, cwd) => displayPath(args.path ?? ".", cwd),
+	target: (args, cwd, argsComplete) => displayPath(args.path ?? (argsComplete ? "." : undefined), cwd),
 	summary(_args, result) {
 		const text = textContent(result);
 		const entryCount = text.trim() === "(empty directory)"
@@ -290,10 +301,6 @@ function scriptLines(script: string): string[] {
 	return lines;
 }
 
-function bashPurpose(args: MepieBashInput): string {
-	return args.purpose?.trim() || "Run shell command";
-}
-
 function skillName(path: string, cwd: string): string | undefined {
 	const normalizedPath = path.startsWith("@") ? path.slice(1) : path;
 	const absolutePath = isAbsolute(normalizedPath) ? normalizedPath : resolve(cwd, normalizedPath);
@@ -301,7 +308,8 @@ function skillName(path: string, cwd: string): string | undefined {
 	return basename(dirname(absolutePath)) || "SKILL.md";
 }
 
-function displayPath(path: string, cwd: string): string {
+function displayPath(path: string | undefined, cwd: string): string {
+	if (path === undefined) return "";
 	if (!isAbsolute(path)) return path || ".";
 	const home = homedir();
 	if (path === home) return "~";

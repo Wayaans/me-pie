@@ -23,8 +23,8 @@ export interface ToolView<TArgs, TDetails> {
 	readonly label: string;
 	readonly targetColor?: ThemeColor;
 	readonly targetTruncation?: "end" | "middle";
-	compactCall?(args: TArgs, cwd: string, theme: Theme): Component | undefined;
-	target(args: TArgs, cwd: string): string;
+	compactCall?(args: Partial<TArgs>, cwd: string, theme: Theme, nameColor: ThemeColor): Component | undefined;
+	target(args: Partial<TArgs>, cwd: string, argsComplete: boolean): string;
 	summary(args: TArgs, result: AgentToolResult<TDetails>): readonly SummaryPart[];
 	collapsed?(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
 	expanded(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
@@ -51,7 +51,6 @@ interface ToolUiState {
 }
 
 interface ToolStateContext {
-	readonly executionStarted: boolean;
 	readonly isPartial: boolean;
 	readonly isError: boolean;
 }
@@ -145,13 +144,11 @@ export function withMepieToolUi<
 		...definition,
 		renderShell: "self",
 		renderCall(args, theme, context) {
-			// While the model streams tool arguments, args are partial ({}, then key by key).
-			// View functions assume complete args (e.g. displayPath(args.path)) and would throw,
-			// which makes Pi fall back to rendering the bare tool name. Render icon + label only
-			// until argsComplete, matching the eventual line shape.
-			const complete = context.argsComplete && args !== undefined;
-			const compactCall = complete && !context.expanded
-				? tryOrUndefined(() => view.compactCall?.(args, context.cwd, theme))
+			// Pi delivers partial arguments before execution. Render fields already available,
+			// but let views defer optional defaults until the argument stream ends.
+			const callArgs = args ?? {};
+			const compactCall = !context.expanded
+				? tryOrUndefined(() => view.compactCall?.(callArgs, context.cwd, theme, toolTone(context)))
 				: undefined;
 			if (compactCall) {
 				const insetCall = new HorizontalInset(compactCall);
@@ -165,7 +162,7 @@ export function withMepieToolUi<
 			line.update({
 				icon: view.icon,
 				label: view.label,
-				target: complete ? tryOrEmpty(() => sanitizeInline(view.target(args, context.cwd))) : "",
+				target: tryOrEmpty(() => sanitizeInline(view.target(callArgs, context.cwd, context.argsComplete))),
 				targetColor: view.targetColor ?? "muted",
 				targetTruncation: view.targetTruncation ?? "middle",
 				theme,
@@ -312,6 +309,10 @@ function indexMessageTools(
 	return previousVisibleItemIsMepieTool;
 }
 
+export function searchTarget(pattern: string | undefined, path: string | undefined): string {
+	return [pattern, path ? `in ${path}` : undefined].filter(Boolean).join(" ");
+}
+
 export function textContent<TDetails>(result: AgentToolResult<TDetails>): string {
 	return result.content
 		.filter((item): item is Extract<(typeof result.content)[number], { type: "text" }> => item.type === "text")
@@ -436,8 +437,7 @@ function summaryText(
 function toolTone(context: ToolStateContext): ThemeColor {
 	if (context.isError) return "error";
 	if (!context.isPartial) return "toolTitle";
-	if (context.executionStarted) return "accent";
-	return "dim";
+	return "muted";
 }
 
 function fitTarget(text: string, width: number, mode: "end" | "middle"): string {
@@ -467,7 +467,7 @@ function tryOrEmpty(value: () => string): string {
 	}
 }
 
-function sanitizeInline(value: string): string {
+export function sanitizeInline(value: string): string {
 	return value
 		.replace(/(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g, "")
 		.replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "")
