@@ -185,7 +185,7 @@ export default function terminalEnvironment(
 			return;
 		}
 		let guidance = await Effect.runPromise(activeWorkspace.managedPromptGuidance()).catch(() => undefined);
-		if (!guidance) {
+		if (!guidance && event.messageType === "user") {
 			const routed = await Effect.runPromise(activeWorkspace.routeManagedInput(event.prompt, undefined)).catch(() => ({ kind: "rejected" as const }));
 			if (routed.kind === "accepted") guidance = await Effect.runPromise(activeWorkspace.managedPromptGuidance()).catch(() => undefined);
 		}
