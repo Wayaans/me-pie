@@ -1,5 +1,5 @@
 /**
- * Theme-aware Mepie dashboard, adapted with permission from
+ * Theme-aware Mepie dashboard footer, adapted with permission from
  * https://github.com/davis7dotsh/my-pi-setup.
  */
 import { homedir } from "node:os";
@@ -8,7 +8,6 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ReadonlyFooterDataProvider,
-	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, hyperlink, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -23,15 +22,6 @@ import {
 import registerGitInfo from "./git-info.ts";
 import registerModelInfo from "./model-info.ts";
 
-const TITLE_LINES = [
-	"  ██████╗  ██╗ ",
-	"  ██╔══██╗ ██║ ",
-	"  ██████╔╝ ██║ ",
-	"  ██╔═══╝  ██║ ",
-	"  ██║      ██║ ",
-	"  ╚═╝      ╚═╝ ",
-];
-const LOGO_COLORS = ["accent", "borderAccent", "mdLink", "syntaxFunction", "mdLink", "borderAccent"] as const;
 // eslint-disable-next-line no-control-regex
 const OSC_PATTERN = /(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g;
 // eslint-disable-next-line no-control-regex
@@ -45,16 +35,6 @@ export function sanitizeTerminalLabel(text: string): string {
 		.replace(CSI_PATTERN, "")
 		.replace(ESCAPE_PATTERN, "")
 		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
-}
-
-function gradientText(theme: Theme, text: string, offset: number): string {
-	return [...text]
-		.map((character, index) => {
-			if (character === " ") return character;
-			const color = LOGO_COLORS[(index + offset) % LOGO_COLORS.length] ?? "accent";
-			return theme.fg(color, character);
-		})
-		.join("");
 }
 
 export function formatTokens(tokens: number): string {
@@ -82,11 +62,6 @@ export function formatDirectory(cwd: string): string {
 	if (cwd === home) return "~";
 	const display = cwd.startsWith(`${home}/`) ? `~/${relative(home, cwd)}` : cwd;
 	return sanitizeTerminalLabel(display);
-}
-
-function center(text: string, width: number): string {
-	const padding = Math.max(0, Math.floor((width - visibleWidth(text)) / 2));
-	return truncateToWidth(`${" ".repeat(padding)}${text}`, width);
 }
 
 export function columns(left: string, right: string, width: number): string {
@@ -131,18 +106,6 @@ export default function mepieUi(pi: ExtensionAPI): void {
 
 	function install(ctx: ExtensionContext): void {
 		if (ctx.mode !== "tui") return;
-
-		ctx.ui.setHeader((tui, theme) => {
-			requestRender = () => tui.requestRender();
-			return {
-				render(width: number) {
-					const art = TITLE_LINES.map((line, row) => center(gradientText(theme, line, row), width));
-					const subtitle = center(theme.bold(gradientText(theme, title, 2)), width);
-					return ["", ...art, subtitle, ""];
-				},
-				invalidate() {},
-			};
-		});
 
 		ctx.ui.setFooter((tui, theme, footerData: ReadonlyFooterDataProvider) => {
 			requestRender = () => tui.requestRender();
@@ -212,7 +175,6 @@ export default function mepieUi(pi: ExtensionAPI): void {
 		stopGitListener();
 		requestRender = undefined;
 		if (ctx.mode === "tui") {
-			ctx.ui.setHeader(undefined);
 			ctx.ui.setFooter(undefined);
 		}
 	});

@@ -1,8 +1,8 @@
 # mepie-ui
 
-A theme-aware Pi header and dashboard footer, adapted with permission from [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup).
+A theme-aware Pi dashboard footer, adapted with permission from [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup).
 
-The header preserves the original block `PI` logo while deriving every color from the active Pi theme. The footer shows:
+The footer derives every color from the active Pi theme and shows:
 
 - working directory
 - provider, model, and thinking level

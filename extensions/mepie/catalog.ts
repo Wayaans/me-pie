@@ -17,7 +17,7 @@ export const MEPIE_EXTENSIONS = [
 	{ id: "find-docs", path: "extensions/find-docs/index.ts", description: "Retrieve current Context7 documentation", configurable: true },
 	{ id: "localize", path: "extensions/localize/index.ts", description: "Translate and refine prompts into English", configurable: true },
 	{ id: "mepie-tool-ui", path: "extensions/mepie-tool-ui/index.ts", description: "Render compact built-in tool rows", configurable: true },
-	{ id: "mepie-ui", path: "extensions/mepie-ui/index.ts", description: "Add the Mepie header and dashboard", configurable: true },
+	{ id: "mepie-ui", path: "extensions/mepie-ui/index.ts", description: "Add the Mepie dashboard footer", configurable: true },
 	{ id: "pi-github", path: "extensions/pi-github/index.ts", description: "Add typed GitHub operations", configurable: true },
 	{ id: "skill-shortcut", path: "extensions/skill-shortcut/index.ts", description: "Invoke skills with $skill-name", configurable: true },
 	{ id: "terminal-environment", path: "extensions/terminal-environment/index.ts", description: "Add tmux-backed workspace coordination", configurable: true },

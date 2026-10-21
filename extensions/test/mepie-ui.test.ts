@@ -106,7 +106,6 @@ test("dashboard refreshes model state after its session reset", async () => {
 		getContextUsage: () => ({ tokens: 1_000, contextWindow: 128_000, percent: 1 }),
 		sessionManager: { getBranch: () => [] },
 		ui: {
-			setHeader() {},
 			setFooter(factory: typeof footerFactory) {
 				footerFactory = factory;
 			},
