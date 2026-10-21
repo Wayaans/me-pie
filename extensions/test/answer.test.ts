@@ -78,7 +78,7 @@ test("recommendations prefill only empty answers", () => {
 });
 
 test("max thinking falls back to the highest level supported by older pi models", () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	assert.ok(model);
 	assert.equal(resolveExtractionThinking(model, "off"), "off");
 	assert.equal(resolveExtractionThinking(model, "medium"), "medium");
@@ -153,7 +153,7 @@ test("answer config writes preserve sibling Mepie config", () => {
 	);
 
 	updateProjectAnswerConfig(cwd, {
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.5",
 		thinking: "medium",
 	});
 
@@ -161,7 +161,7 @@ test("answer config writes preserve sibling Mepie config", () => {
 	assert.deepEqual(saved.subagents, { enabled: false });
 	assert.deepEqual(saved["git-guardrails"], { enabled: true });
 	assert.deepEqual(saved.answer, {
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.5",
 		thinking: "medium",
 	});
 });
@@ -177,7 +177,7 @@ test("answer config writes preserve legacy array entries", () => {
 	);
 
 	updateProjectAnswerConfig(cwd, {
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.5",
 		thinking: "medium",
 	});
 
@@ -186,7 +186,7 @@ test("answer config writes preserve legacy array entries", () => {
 	assert.deepEqual(saved.filter((entry) => entry.extension === "answer"), [
 		{
 			extension: "answer",
-			model: "openai-codex/gpt-5.4-mini",
+			model: "openai-codex/gpt-5.5",
 			thinking: "medium",
 		},
 	]);

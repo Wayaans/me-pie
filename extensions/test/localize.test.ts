@@ -27,7 +27,7 @@ function assistantMessage(text: string, stopReason: AssistantMessage["stopReason
 		content: [{ type: "text", text }],
 		api: "openai-codex-responses",
 		provider: "openai-codex",
-		model: "gpt-5.4-mini",
+		model: "gpt-5.5",
 		usage: {
 			input: 1,
 			output: 1,
@@ -127,7 +127,7 @@ test("config requires trust before opening settings", async () => {
 });
 
 test("config UI edits both prompts and saves only after confirmation", async () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	for (const confirmed of [false, true]) {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-ui-"));
 		const titles: string[] = [];
@@ -182,26 +182,26 @@ test("localize config writes preserve sibling Mepie config", () => {
 	fs.mkdirSync(path.dirname(configPath), { recursive: true });
 	fs.writeFileSync(
 		configPath,
-		"answer:\n  model: openai-codex/gpt-5.4-mini\n  thinking: medium\nsubagents:\n  enabled: false\n",
+		"answer:\n  model: openai-codex/gpt-5.5\n  thinking: medium\nsubagents:\n  enabled: false\n",
 		"utf-8",
 	);
 
 	updateProjectLocalizeConfig(cwd, {
 		composerPrompt: "Compose a prompt.",
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.5",
 		thinking: "low",
 		refinerPrompt: "Refine without expanding.",
 	});
 
 	const saved = parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
 	assert.deepEqual(saved.answer, {
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.5",
 		thinking: "medium",
 	});
 	assert.deepEqual(saved.subagents, { enabled: false });
 	assert.deepEqual(saved.localize, {
 		composerPrompt: "Compose a prompt.",
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.5",
 		thinking: "low",
 		refinerPrompt: "Refine without expanding.",
 	});
@@ -233,7 +233,7 @@ test("composer config round-trips legacy shapes and rejects invalid prompts", ()
 });
 
 test("compose uses its prompt, allows restructuring, and rejects empty output", async () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	const modelRegistry = {
 		find: () => model,
 		getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "token" }),
@@ -294,7 +294,7 @@ test("structure validation preserves inline code, URLs, and paths", () => {
 });
 
 test("requestLocalizedPrompt uses the configured model, prompt, and low thinking", async () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	let capturedContext: Context | undefined;
 	let capturedOptions: SimpleStreamOptions | undefined;
 	const complete = async (
@@ -334,7 +334,7 @@ test("requestLocalizedPrompt uses the configured model, prompt, and low thinking
 });
 
 test("requestLocalizedPrompt falls back to the current session model", async () => {
-	const currentModel = getModel("openai-codex", "gpt-5.4-mini");
+	const currentModel = getModel("openai-codex", "gpt-5.5");
 	assert.ok(currentModel);
 	let selectedModel: typeof currentModel | undefined;
 	const modelRegistry = {
@@ -359,7 +359,7 @@ test("requestLocalizedPrompt falls back to the current session model", async () 
 });
 
 test("requestLocalizedPrompt rejects output that changes structure", async () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	const modelRegistry = {
 		find: () => model,
 		getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "token" }),

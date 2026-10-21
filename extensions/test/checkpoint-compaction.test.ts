@@ -84,7 +84,7 @@ function assistantMessage(
 		content: [{ type: "text", text }],
 		api: "openai-codex-responses",
 		provider: "openai-codex",
-		model: "gpt-5.4-mini",
+		model: "gpt-5.5",
 		usage: usage(),
 		stopReason,
 		timestamp: Date.now(),
@@ -134,7 +134,7 @@ function compactionEvent(signal = new AbortController().signal): SessionBeforeCo
 function extensionContext(
 	notifications: string[],
 ): ExtensionContext {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	assert.ok(model);
 	return {
 		model,
@@ -241,7 +241,7 @@ test("checkpoint state carries raw previous checkpoint and cumulative file opera
 				],
 				api: "openai-codex-responses" as const,
 				provider: "openai-codex",
-				model: "gpt-5.4-mini",
+				model: "gpt-5.5",
 				usage: usage(),
 				stopReason: "toolUse" as const,
 				timestamp: Date.now(),
@@ -262,7 +262,7 @@ test("checkpoint state carries raw previous checkpoint and cumulative file opera
 });
 
 test("checkpoint generation retries one invalid response and accounts for both attempts", async () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	assert.ok(model);
 	const calls: Array<{ context: Context; options?: SimpleStreamOptions }> = [];
 	let callCount = 0;
@@ -310,7 +310,7 @@ test("checkpoint generation retries one invalid response and accounts for both a
 });
 
 test("checkpoint generation does not call the model after cancellation", async () => {
-	const model = getModel("openai-codex", "gpt-5.4-mini");
+	const model = getModel("openai-codex", "gpt-5.5");
 	assert.ok(model);
 	const controller = new AbortController();
 	controller.abort();
