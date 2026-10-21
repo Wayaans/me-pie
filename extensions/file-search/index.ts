@@ -61,6 +61,7 @@ import {
   type ToolView,
 } from "../mepie-tool-ui/tool-renderer.ts";
 import { TOOL_ICONS } from "../mepie-tool-ui/tool-icons.ts";
+import { loadToolRenderMode } from "../mepie/tool-mode.ts";
 
 export function makeBinaryInitializers(
   binDir: string,
@@ -128,7 +129,8 @@ function unwrapToolExit<A, E>(exit: Exit.Exit<A, E>, tool: "fd" | "rg") {
 }
 
 export default function fileSearchTools(pi: ExtensionAPI) {
-  registerMepieToolSpacing(pi);
+  const mode = loadToolRenderMode(pi);
+  registerMepieToolSpacing(pi, mode, ["fd", "rg"]);
 
   let notified = false;
 
@@ -263,7 +265,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     },
 
   };
-  pi.registerTool(withMepieToolUi(fdDefinition, fdView));
+  pi.registerTool(mode === "builtin" ? fdDefinition : withMepieToolUi(fdDefinition, fdView, mode));
 
   const rgDefinition: ToolDefinition<
     ReturnType<typeof rgParameters>,
@@ -308,7 +310,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     },
 
   };
-  pi.registerTool(withMepieToolUi(rgDefinition, rgView));
+  pi.registerTool(mode === "builtin" ? rgDefinition : withMepieToolUi(rgDefinition, rgView, mode));
 }
 
 const fdView: ToolView<Static<ReturnType<typeof fdParameters>>, FdToolDetails> = {

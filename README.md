@@ -60,6 +60,19 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
 - `terminal-environment` — expose one tmux-backed `workspace` tool for raw target operations and managed Agent Runs / Work Cycles.
 
+## Tool rendering
+
+`/mepie` still opens the extension manager. Use `/mepie tool` to see the active rendering mode, or select one:
+
+- `/mepie tool compact`: borderless Mepie summaries with tight spacing. This is the default.
+- `/mepie tool builtin`: native Pi rendering for built-in tools and generic Pi rendering for `fd` and `rg`.
+- `/mepie tool simple`: Mepie summaries and expandable details inside Pi's normal padded, background-colored tool shell.
+- `/mepie tool custom`: compact rendering except for `edit` and `write`. These keep Mepie headers and summaries inside Pi's native boxes, with native diff/content previews and expand/collapse behavior. Boxed rows keep normal spacing.
+
+Changing modes waits for idle, saves the preference, and reloads Pi automatically. Selecting the active mode does nothing. This changes rendering only, not enabled tools or extensions. Bash's optional `purpose` argument works in every mode. Thinking-text styling is unchanged.
+
+Both `mepie-tool-ui` and `file-search` read the global `toolRenderMode` preference in `<getAgentDir()>/mepie.json`, normally `~/.pi/agent/mepie.json`. File search honors it even when `mepie-tool-ui` is disabled. Missing settings use `compact`. Invalid settings produce a warning and fall back to `compact`; fix the file before saving a different mode. Mepie does not overwrite invalid settings.
+
 ## Managed Agent Runs and Work Cycles
 
 `workspace` remains one tool with the existing `spawn`, `run`, `send`, `wait`, and `close` actions. Raw target-based calls remain backward compatible. A successful `run` returns a UUID Run ID while retaining tmux target diagnostics.

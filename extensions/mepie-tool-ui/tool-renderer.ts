@@ -8,9 +8,10 @@ import {
 	type ToolDefinition,
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Text, sliceByColumn, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { Box, Container, Text, sliceByColumn, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
+import { toolPresentation, type ToolRenderMode } from "../mepie/tool-mode.ts";
 
 export interface SummaryPart {
 	readonly text: string;
@@ -37,7 +38,7 @@ type ToolExecutionRender = (this: ToolExecutionComponent, width: number) => stri
 
 interface MepieToolSpacingState {
 	readonly toolNames: Set<string>;
-	readonly callComponents: WeakSet<object>;
+	callComponents: WeakSet<object>;
 	readonly compactToolCallIds: Set<string>;
 	users: number;
 	originalRender: ToolExecutionRender | undefined;
@@ -90,17 +91,25 @@ function isMepieToolSpacingState(value: unknown): value is MepieToolSpacingState
 		&& typeof Reflect.get(value, "users") === "number";
 }
 
-export function registerMepieToolSpacing(pi: ExtensionAPI): void {
+export function registerMepieToolSpacing(
+	pi: ExtensionAPI,
+	mode: ToolRenderMode = "compact",
+	toolNames: readonly string[] = ["read", "bash", "edit", "write", "grep", "find", "ls", "fd", "rg"],
+): void {
 	let active = false;
 	let lastStreamingMessage: AssistantMessage | undefined;
 	let lastStreamingSignature: string | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
 		if (active) deactivateCompactToolSpacing();
-		active = ctx.mode === "tui";
+		active = (mode === "compact" || mode === "custom") && ctx.mode === "tui";
 		lastStreamingMessage = undefined;
 		lastStreamingSignature = undefined;
 		if (!active) return;
+		if (mepieToolSpacing.users === 0) mepieToolSpacing.toolNames.clear();
+		for (const name of toolNames) {
+			if (toolPresentation(mode, name) === "compact") mepieToolSpacing.toolNames.add(name);
+		}
 		rebuildCompactMepieToolCalls(ctx.sessionManager?.getBranch?.() ?? []);
 		activateCompactToolSpacing();
 	});
@@ -138,11 +147,15 @@ export function withMepieToolUi<
 >(
 	definition: ToolDefinition<TParams, TDetails, TOriginalState>,
 	view: ToolView<Static<TParams>, TDetails>,
-): ToolDefinition<TParams, TDetails, ToolUiState> {
-	mepieToolSpacing.toolNames.add(definition.name);
+	mode: Exclude<ToolRenderMode, "builtin"> = "compact",
+): ToolDefinition<TParams, TDetails, TOriginalState & ToolUiState> {
+	const presentation = toolPresentation(mode, definition.name);
+	const compact = presentation === "compact";
+	const nativePreview = presentation === "native-preview";
+	const inset = (component: Component): Component => compact ? new HorizontalInset(component) : component;
 	return {
 		...definition,
-		renderShell: "self",
+		renderShell: nativePreview ? definition.renderShell ?? "default" : compact ? "self" : "default",
 		renderCall(args, theme, context) {
 			// Pi delivers partial arguments before execution. Render fields already available,
 			// but let views defer optional defaults until the argument stream ends.
@@ -151,14 +164,14 @@ export function withMepieToolUi<
 				? tryOrUndefined(() => view.compactCall?.(callArgs, context.cwd, theme, toolTone(context)))
 				: undefined;
 			if (compactCall) {
-				const insetCall = new HorizontalInset(compactCall);
-				mepieToolSpacing.callComponents.add(insetCall);
+				const insetCall = inset(compactCall);
+				if (compact) mepieToolSpacing.callComponents.add(insetCall);
 				return insetCall;
 			}
 
 			const line = context.lastComponent instanceof SummaryLine
 				? context.lastComponent
-				: new SummaryLine();
+				: new SummaryLine(compact);
 			line.update({
 				icon: view.icon,
 				label: view.label,
@@ -169,19 +182,25 @@ export function withMepieToolUi<
 				context,
 				state: context.state,
 			});
-			mepieToolSpacing.callComponents.add(line);
+			if (nativePreview && definition.renderCall) {
+				const previous = context.lastComponent instanceof NativePreviewCall ? context.lastComponent.native : undefined;
+				const native = definition.renderCall(args, theme, { ...context, lastComponent: previous });
+				return new NativePreviewCall(native, line);
+			}
+			if (compact) mepieToolSpacing.callComponents.add(line);
 			return line;
 		},
 		renderResult(result, options, theme, context) {
 			if (!options.isPartial && !context.isError) {
 				context.state.finalSummary = view.summary(context.args, result);
 			}
-			if (context.isError) return renderErrorResult(result, options, theme);
+			if (nativePreview && definition.renderResult) return definition.renderResult(result, options, theme, context);
+			if (context.isError) return inset(renderErrorResult(result, options, theme));
 			if (!options.expanded) {
 				const collapsed = view.collapsed?.(context.args, result, theme);
-				return collapsed ? new HorizontalInset(collapsed) : new Container();
+				return collapsed ? inset(collapsed) : new Container();
 			}
-			return new HorizontalInset(view.expanded(context.args, result, theme));
+			return inset(view.expanded(context.args, result, theme));
 		},
 	};
 }
@@ -224,6 +243,8 @@ function deactivateCompactToolSpacing(): void {
 	mepieToolSpacing.originalRender = undefined;
 	mepieToolSpacing.patchedRender = undefined;
 	mepieToolSpacing.compactToolCallIds.clear();
+	mepieToolSpacing.toolNames.clear();
+	mepieToolSpacing.callComponents = new WeakSet<object>();
 }
 
 function rebuildCompactMepieToolCalls(
@@ -344,7 +365,33 @@ function renderErrorResult<TDetails>(
 	return new ErrorResult(textContent(result) || "Unknown tool error", options.expanded, theme);
 }
 
+/** Pi edit owns a Box; write keeps its preview in the call Text, not the result slot. */
+class NativePreviewCall implements Component {
+	constructor(readonly native: Component, private readonly heading: Component) {}
+
+	render(width: number): string[] {
+		if (this.native instanceof Box) {
+			// Native edit can rebuild its children from either slot. Replace only its header
+			// at render time, leaving the original Box, preview, and row state intact.
+			this.native.children[0] = this.heading;
+			return this.native.render(width);
+		}
+		const lines = this.native.render(width);
+		// Native write separates its heading from content with a blank line. Drop the
+		// whole heading, including wrapped paths, without re-rendering its preview.
+		const bodyStart = lines.findIndex((line) => line.trim() === "");
+		return [...this.heading.render(width), ...(bodyStart < 0 ? [] : lines.slice(bodyStart))];
+	}
+
+	invalidate(): void {
+		this.native.invalidate();
+		this.heading.invalidate();
+	}
+}
+
 class SummaryLine implements Component {
+	constructor(private readonly padded: boolean) {}
+
 	private input: SummaryLineInput | undefined;
 
 	update(input: SummaryLineInput): void {
@@ -353,7 +400,7 @@ class SummaryLine implements Component {
 
 	render(width: number): string[] {
 		if (!this.input || width <= 0) return [];
-		const contentWidth = insetContentWidth(width);
+		const contentWidth = this.padded ? insetContentWidth(width) : width;
 		const { context, icon, label, state, target, targetColor, targetTruncation, theme } = this.input;
 		const heading = `${theme.fg("text", icon)} ${theme.fg(toolTone(context), theme.bold(label))}`;
 		const summary = summaryText(context, state.finalSummary, theme);
@@ -362,7 +409,8 @@ class SummaryLine implements Component {
 		const targetWidth = Math.max(0, contentWidth - fixedWidth);
 		const fittedTarget = fitTarget(target, targetWidth, targetTruncation);
 		const line = `${heading}${fittedTarget ? `${targetPrefix}${theme.fg(targetColor, fittedTarget)}` : ""}${summary}`;
-		return insetLines([truncateToWidth(line, contentWidth, "…")], width);
+		const lines = [truncateToWidth(line, contentWidth, "…")];
+		return this.padded ? insetLines(lines, width) : lines;
 	}
 
 	invalidate(): void {}
@@ -387,9 +435,8 @@ class ErrorResult implements Component {
 		const content = visibleLines
 			.map((line, index) => `${this.theme.fg("dim", index === 0 ? "╰─ " : "   ")}${this.theme.fg("error", line)}`)
 			.join("\n");
-		const contentWidth = insetContentWidth(width);
-		if (this.expanded) return insetLines(new Text(content, 0, 0).render(contentWidth), width);
-		return insetLines([truncateToWidth(content, contentWidth, "…")], width);
+		if (this.expanded) return new Text(content, 0, 0).render(width);
+		return [truncateToWidth(content, width, "…")];
 	}
 
 	invalidate(): void {}

@@ -29,7 +29,7 @@ import {
 	type WriteToolInput,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
 import {
 	countLines,
 	resultText,
@@ -42,6 +42,7 @@ import {
 	type ToolView,
 } from "./tool-renderer.ts";
 import { TOOL_ICONS } from "./tool-icons.ts";
+import type { ToolRenderMode } from "../mepie/tool-mode.ts";
 
 const MepieBashParams = Type.Object({
 	purpose: Type.Optional(Type.String({
@@ -55,14 +56,21 @@ const MepieBashParams = Type.Object({
 
 type MepieBashInput = Static<typeof MepieBashParams>;
 
-export function registerMepieToolUi(pi: ExtensionAPI, cwd: string): void {
-	pi.registerTool(withMepieToolUi(createReadToolDefinition(cwd), readView));
-	pi.registerTool(withMepieToolUi(createMepieBashDefinition(cwd), bashView));
-	pi.registerTool(withMepieToolUi(createEditToolDefinition(cwd), editView));
-	pi.registerTool(withMepieToolUi(createWriteToolDefinition(cwd), writeView));
-	pi.registerTool(withMepieToolUi(createGrepToolDefinition(cwd), grepView));
-	pi.registerTool(withMepieToolUi(createFindToolDefinition(cwd), findView));
-	pi.registerTool(withMepieToolUi(createLsToolDefinition(cwd), listView));
+export function registerMepieToolUi(pi: ExtensionAPI, cwd: string, mode: ToolRenderMode = "compact"): void {
+	function register<TParams extends TSchema, TDetails, TState>(
+		definition: ToolDefinition<TParams, TDetails, TState>,
+		view: ToolView<Static<TParams>, TDetails>,
+	): void {
+		if (mode === "builtin") pi.registerTool(definition);
+		else pi.registerTool(withMepieToolUi(definition, view, mode));
+	}
+	register(createReadToolDefinition(cwd), readView);
+	register(createMepieBashDefinition(cwd), bashView);
+	register(createEditToolDefinition(cwd), editView);
+	register(createWriteToolDefinition(cwd), writeView);
+	register(createGrepToolDefinition(cwd), grepView);
+	register(createFindToolDefinition(cwd), findView);
+	register(createLsToolDefinition(cwd), listView);
 }
 
 function createMepieBashDefinition(

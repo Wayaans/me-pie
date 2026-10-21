@@ -33,6 +33,7 @@ import {
 } from "../file-search/src/binaries.ts";
 import { formatOutput } from "../file-search/src/output.ts";
 import { registerMepieToolUi } from "../mepie-tool-ui/tools.ts";
+import { registerMepieToolSpacing } from "../mepie-tool-ui/tool-renderer.ts";
 
 function makeEnvironment(options: { available?: string[]; failInstall?: boolean } = {}) {
 	const installed = new Set<string>();
@@ -242,6 +243,7 @@ test("file-search tools share Mepie tool-group spacing", async () => {
 		},
 	};
 	registerMepieToolUi(pi as unknown as ExtensionAPI, process.cwd());
+	registerMepieToolSpacing(pi as unknown as ExtensionAPI, "compact", ["read", "bash", "edit", "write", "grep", "find", "ls"]);
 	fileSearchTools(pi as unknown as ExtensionAPI);
 
 	const spacingStart = handlers.get("session_start")?.[0];
@@ -252,6 +254,7 @@ test("file-search tools share Mepie tool-group spacing", async () => {
 	assert.ok(spacingShutdown);
 	const context = { mode: "tui", sessionManager: { getBranch: () => [] as [] } };
 	await spacingStart({}, context);
+	await handlers.get("session_start")?.[1]?.({}, context);
 
 	try {
 		const fd = tools.get("fd");
@@ -310,6 +313,7 @@ test("file-search tools share Mepie tool-group spacing", async () => {
 		assert.notEqual(afterFileSearch.render(120)[0], "");
 	} finally {
 		await spacingShutdown({}, context);
+		await handlers.get("session_shutdown")?.[1]?.({}, context);
 	}
 });
 

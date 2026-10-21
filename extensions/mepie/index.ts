@@ -19,6 +19,7 @@ import {
 	updateProjectPackage,
 	type ProjectExtensionState,
 } from "./config.ts";
+import { changeToolRenderMode, loadToolRenderMode, TOOL_RENDER_MODES } from "./tool-mode.ts";
 
 type Scope = "global" | "project";
 
@@ -222,11 +223,24 @@ async function manageMepie(pi: ExtensionAPI, ctx: ExtensionCommandContext): Prom
 }
 
 export default function mepie(pi: ExtensionAPI): void {
+	const activeMode = loadToolRenderMode(pi);
 	pi.registerCommand("mepie", {
-		description: "Enable or disable Mepie extensions globally or for this project",
-		handler: (_args, ctx) => Effect.runPromise(
+		description: "Manage Mepie extensions and tool rendering",
+		getArgumentCompletions(prefix) {
+			const choices = ["tool", ...TOOL_RENDER_MODES.map((mode) => `tool ${mode}`)];
+			const items = choices.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
+			return items.length ? items : null;
+		},
+		handler: (args, ctx) => Effect.runPromise(
 			Effect.tryPromise({
-				try: () => manageMepie(pi, ctx),
+				try: () => {
+					if (args.trim().split(/\s+/)[0] === "tool") return changeToolRenderMode(args, activeMode, ctx);
+					if (args.trim()) {
+						if (ctx.hasUI) ctx.ui.notify("Usage: /mepie or /mepie tool compact|builtin|simple|custom", "error");
+						return Promise.resolve();
+					}
+					return manageMepie(pi, ctx);
+				},
 				catch: (error) => error instanceof Error ? error : new Error(String(error)),
 			}),
 		),
