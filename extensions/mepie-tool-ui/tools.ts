@@ -42,6 +42,7 @@ import {
 	type ToolView,
 } from "./tool-renderer.ts";
 import { TOOL_ICONS } from "./tool-icons.ts";
+import { registerNestedToolView } from "./nested-views.ts";
 import type { ToolRenderMode } from "../mepie/tool-mode.ts";
 
 const MepieBashParams = Type.Object({
@@ -71,6 +72,14 @@ export function registerMepieToolUi(pi: ExtensionAPI, cwd: string, mode: ToolRen
 	register(createGrepToolDefinition(cwd), grepView);
 	register(createFindToolDefinition(cwd), findView);
 	register(createLsToolDefinition(cwd), listView);
+
+	registerNestedToolView("read", readView);
+	registerNestedToolView("bash", nestedBashView);
+	registerNestedToolView("edit", editView);
+	registerNestedToolView("write", writeView);
+	registerNestedToolView("grep", grepView);
+	registerNestedToolView("find", findView);
+	registerNestedToolView("ls", listView);
 }
 
 function createMepieBashDefinition(
@@ -148,6 +157,15 @@ const bashView: ToolView<MepieBashInput, BashToolDetails | undefined> = {
 			component.addChild(new Text(`\n${theme.fg("dim", `Full output: ${result.details.fullOutputPath}`)}`, 0, 0));
 		}
 		return component;
+	},
+};
+
+/** Codemode rows have no script tree, so a call without a purpose shows its command's first line. */
+const nestedBashView: Pick<ToolView<MepieBashInput, unknown>, "icon" | "label" | "targetColor" | "targetTruncation" | "target"> = {
+	...bashView,
+	target(args) {
+		const title = args.purpose?.trim() || scriptLines(args.command ?? "").find((line) => line.trim())?.trim() || "";
+		return title ? `· ${title}` : "";
 	},
 };
 
