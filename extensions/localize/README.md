@@ -16,23 +16,24 @@ All commands require interactive TUI mode. Compose and refine make a separate mo
 
 Refine rejects structural changes. Compose accepts any nonempty text response; preserving meaning and technical literals relies on its system prompt and your review, not structural validation.
 
-## Project configuration
+## Configuration
 
 Package defaults:
 
-```yaml
-localize:
-  model: openai-codex/gpt-5.4-mini
-  thinking: low
-  composerPrompt: |-
-    You write ready-to-use prompts from the user's instructions...
-  refinerPrompt: |-
-    You are a prompt localizer and language refiner...
+```json
+{
+  "localize": {
+    "model": "openai-codex/gpt-5.4-mini",
+    "thinking": "low",
+    "composerPrompt": "You write ready-to-use prompts from the user's instructions...",
+    "refinerPrompt": "You are a prompt localizer and language refiner..."
+  }
+}
 ```
 
 These prompt excerpts are illustrative. Omit either prompt field to use its complete package default. Existing configs without `composerPrompt` keep their `refinerPrompt` and use the default composer prompt. Both prompt fields must be nonempty strings.
 
-A trusted project's `.pi/mepie/config.yaml` can override these values. Untrusted projects use package defaults. `/localize config` requires project trust and saves only after confirmation, preserving other Mepie configuration sections. No `/reload` is required.
+Set `localize` in the global `~/.pi/agent/mepie.json` or in a trusted project's `.pi/mepie.json`. Project fields override global fields. Untrusted projects use only global values and defaults. `/localize config` requires project trust, saves only after confirmation, and replaces only the `localize` key. No `/reload` is required.
 
 ## Install
 

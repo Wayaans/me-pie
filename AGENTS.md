@@ -21,6 +21,10 @@ Mepie is a Pi package that distributes extensions, skills, prompt templates, and
 
 Do not place extension entry points directly in `extensions/`. Every extension must have its own folder.
 
+`package.json` declares only `extensions/mepie/index.ts`. It loads the extensions registered in `extensions/mepie/catalog.ts` after applying the enable rules from `mepie.json`. Register every new extension in that catalog, or it never loads.
+
+Mepie settings live in one `mepie.json` per scope: `<agentDir>/mepie.json` and `<cwd>/.pi/mepie.json`. Use `extensions/mepie/settings.ts` to read and write them. Each feature owns and validates one top-level key.
+
 ## Extension conventions
 
 - Export a default factory that accepts `ExtensionAPI`.

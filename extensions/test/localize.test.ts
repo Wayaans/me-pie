@@ -11,14 +11,13 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
-import { parse } from "yaml";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	DEFAULT_LOCALIZE_CONFIG,
-	getProjectLocalizeConfigPath,
 	loadMergedLocalizeConfig,
 	updateProjectLocalizeConfig,
 } from "../localize/config.ts";
+import { projectSettingsPath } from "../mepie/settings.ts";
 import { parseLocalizeCommand, registerLocalizeExtension, requestLocalizedPrompt, validateLocalizedStructure } from "../localize/index.ts";
 
 function assistantMessage(text: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
@@ -88,9 +87,7 @@ test("invalid commands show usage without model or config UI calls", async () =>
 test("both modes restore source on cancellation or config failure and guard non-TUI use", async () => {
 	const command = localizeCommand();
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-command-"));
-	const file = getProjectLocalizeConfigPath(cwd);
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, "localize:\n  composerPrompt: 42\n");
+	writeJson(projectSettingsPath(cwd), { localize: { composerPrompt: 42 } });
 	for (const trusted of [false, true]) {
 		for (const mode of ["compose", "refine"]) {
 			let restored: string | undefined;
@@ -143,7 +140,7 @@ test("config UI edits both prompts and saves only after confirmation", async () 
 		};
 		await localizeCommand().handler("config", ctx as unknown as ExtensionCommandContext);
 		assert.deepEqual(titles, ["Edit localize composer prompt", "Edit localize refiner prompt"]);
-		assert.equal(fs.existsSync(getProjectLocalizeConfigPath(cwd)), confirmed);
+		assert.equal(fs.existsSync(projectSettingsPath(cwd)), confirmed);
 		if (confirmed) {
 			const config = loadMergedLocalizeConfig(cwd);
 			assert.equal(config.composerPrompt, "Edited Edit localize composer prompt");
@@ -159,13 +156,9 @@ test("localize config uses package defaults without a project override", () => {
 
 test("localize config merges project overrides", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-override-"));
-	const configPath = getProjectLocalizeConfigPath(cwd);
-	fs.mkdirSync(path.dirname(configPath), { recursive: true });
-	fs.writeFileSync(
-		configPath,
-		"localize:\n  model: anthropic/claude-haiku-4-5\n  thinking: minimal\n  refinerPrompt: Keep it concise.\n",
-		"utf-8",
-	);
+	writeJson(projectSettingsPath(cwd), {
+		localize: { model: "anthropic/claude-haiku-4-5", thinking: "minimal", refinerPrompt: "Keep it concise." },
+	});
 
 	assert.deepEqual(loadMergedLocalizeConfig(cwd), {
 		model: "anthropic/claude-haiku-4-5",
@@ -176,61 +169,46 @@ test("localize config merges project overrides", () => {
 	assert.deepEqual(loadMergedLocalizeConfig(cwd, { includeProject: false }), DEFAULT_LOCALIZE_CONFIG);
 });
 
-test("localize config writes preserve sibling Mepie config", () => {
+test("localize config writes preserve sibling Mepie settings", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-write-"));
-	const configPath = getProjectLocalizeConfigPath(cwd);
-	fs.mkdirSync(path.dirname(configPath), { recursive: true });
-	fs.writeFileSync(
-		configPath,
-		"answer:\n  model: openai-codex/gpt-5.5\n  thinking: medium\nsubagents:\n  enabled: false\n",
-		"utf-8",
-	);
+	const configPath = projectSettingsPath(cwd);
+	writeJson(configPath, { answer: { model: "openai-codex/gpt-5.5", thinking: "medium" }, extensions: { webweb: false } });
 
-	updateProjectLocalizeConfig(cwd, {
+	const config = {
 		composerPrompt: "Compose a prompt.",
 		model: "openai-codex/gpt-5.5",
-		thinking: "low",
+		thinking: "low" as const,
 		refinerPrompt: "Refine without expanding.",
-	});
+	};
+	updateProjectLocalizeConfig(cwd, config);
 
-	const saved = parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
-	assert.deepEqual(saved.answer, {
-		model: "openai-codex/gpt-5.5",
-		thinking: "medium",
-	});
-	assert.deepEqual(saved.subagents, { enabled: false });
-	assert.deepEqual(saved.localize, {
-		composerPrompt: "Compose a prompt.",
-		model: "openai-codex/gpt-5.5",
-		thinking: "low",
-		refinerPrompt: "Refine without expanding.",
-	});
+	const saved = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+	assert.deepEqual(saved.answer, { model: "openai-codex/gpt-5.5", thinking: "medium" });
+	assert.deepEqual(saved.extensions, { webweb: false });
+	assert.deepEqual(saved.localize, config);
+	assert.deepEqual(loadMergedLocalizeConfig(cwd), config);
 });
 
-test("composer config round-trips legacy shapes and rejects invalid prompts", () => {
-	for (const document of [
-		"- extension: localize\n  refinerPrompt: Existing refiner\n- extension: other\n  enabled: true\n",
-		"extension: localize\nrefinerPrompt: Existing refiner\ncomposerPrompt: Old composer\nother: true\n",
-	]) {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-legacy-"));
-		const file = getProjectLocalizeConfigPath(cwd);
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(file, document);
-		const config = { ...loadMergedLocalizeConfig(cwd), composerPrompt: "New composer\nKeep literals." };
-		updateProjectLocalizeConfig(cwd, config);
-		assert.deepEqual(loadMergedLocalizeConfig(cwd), config);
-		const before = fs.readFileSync(file, "utf8");
-		assert.throws(() => updateProjectLocalizeConfig(cwd, { ...config, composerPrompt: " \n" }), /composerPrompt/);
-		assert.equal(fs.readFileSync(file, "utf8"), before);
-	}
-	for (const value of ["''", "42", "[]", "null"]) {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-invalid-"));
-		const file = getProjectLocalizeConfigPath(cwd);
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(file, `localize:\n  composerPrompt: ${value}\n`);
-		assert.throws(() => loadMergedLocalizeConfig(cwd), /composerPrompt/);
+test("localize config rejects invalid prompts without changing the file", () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-invalid-save-"));
+	const config = { ...DEFAULT_LOCALIZE_CONFIG, composerPrompt: "New composer\nKeep literals." };
+	updateProjectLocalizeConfig(cwd, config);
+	const file = projectSettingsPath(cwd);
+	const before = fs.readFileSync(file, "utf8");
+	assert.throws(() => updateProjectLocalizeConfig(cwd, { ...config, composerPrompt: " \n" }), /composerPrompt/);
+	assert.equal(fs.readFileSync(file, "utf8"), before);
+
+	for (const value of ["", 42, [], null]) {
+		const invalidCwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-invalid-"));
+		writeJson(projectSettingsPath(invalidCwd), { localize: { composerPrompt: value } });
+		assert.throws(() => loadMergedLocalizeConfig(invalidCwd), /composerPrompt/);
 	}
 });
+
+function writeJson(file: string, value: unknown): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, JSON.stringify(value));
+}
 
 test("compose uses its prompt, allows restructuring, and rejects empty output", async () => {
 	const model = getModel("openai-codex", "gpt-5.5");

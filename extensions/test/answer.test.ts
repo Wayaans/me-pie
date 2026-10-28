@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { getModel } from "@earendil-works/pi-ai/compat";
-import { parse } from "yaml";
 import {
 	getRecommendationPrefill,
 	isAuthRelatedExtractionError,
@@ -15,10 +14,10 @@ import {
 } from "../answer/index.ts";
 import {
 	DEFAULT_ANSWER_CONFIG,
-	getProjectAnswerConfigPath,
 	loadMergedAnswerConfig,
 	updateProjectAnswerConfig,
 } from "../answer/config.ts";
+import { globalSettingsPath, projectSettingsPath } from "../mepie/settings.ts";
 
 test("parseExtractionResult parses JSON code blocks", () => {
 	const result = parseExtractionResult(
@@ -120,74 +119,44 @@ test("non-recoverable failures are not retried", () => {
 	assert.equal(isRecoverableExtractionError("Invalid role in request payload"), false);
 });
 
-test("answer config uses package defaults without a project override", () => {
+test("answer config uses package defaults without overrides", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-answer-default-"));
 	assert.deepEqual(loadMergedAnswerConfig(cwd), DEFAULT_ANSWER_CONFIG);
 });
 
-test("answer config merges the trusted project override", () => {
+test("answer config layers trusted project fields over global fields", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-answer-override-"));
-	const configPath = getProjectAnswerConfigPath(cwd);
-	fs.mkdirSync(path.dirname(configPath), { recursive: true });
-	fs.writeFileSync(
-		configPath,
-		"subagents:\n  enabled: true\nanswer:\n  model: anthropic/claude-haiku-4-5\n  thinking: max\n",
-		"utf-8",
-	);
+	const globalPath = globalSettingsPath();
+	try {
+		writeJson(globalPath, { answer: { model: "anthropic/claude-haiku-4-5", thinking: "low" } });
+		writeJson(projectSettingsPath(cwd), { extensions: { webweb: false }, answer: { thinking: "max" } });
 
-	assert.deepEqual(loadMergedAnswerConfig(cwd), {
-		model: "anthropic/claude-haiku-4-5",
-		thinking: "max",
-	});
-	assert.deepEqual(loadMergedAnswerConfig(cwd, { includeProject: false }), DEFAULT_ANSWER_CONFIG);
+		assert.deepEqual(loadMergedAnswerConfig(cwd), { model: "anthropic/claude-haiku-4-5", thinking: "max" });
+		assert.deepEqual(loadMergedAnswerConfig(cwd, { includeProject: false }), { model: "anthropic/claude-haiku-4-5", thinking: "low" });
+	} finally {
+		fs.rmSync(globalPath, { force: true });
+	}
 });
 
-test("answer config writes preserve sibling Mepie config", () => {
+test("answer config writes preserve sibling Mepie settings and reject malformed files", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-answer-write-"));
-	const configPath = getProjectAnswerConfigPath(cwd);
-	fs.mkdirSync(path.dirname(configPath), { recursive: true });
-	fs.writeFileSync(
-		configPath,
-		"subagents:\n  enabled: false\ngit-guardrails:\n  enabled: true\n",
-		"utf-8",
-	);
+	const configPath = projectSettingsPath(cwd);
+	writeJson(configPath, { extensions: { webweb: false }, localize: { thinking: "low" } });
 
-	updateProjectAnswerConfig(cwd, {
-		model: "openai-codex/gpt-5.5",
-		thinking: "medium",
+	updateProjectAnswerConfig(cwd, { model: "openai-codex/gpt-5.5", thinking: "medium" });
+
+	assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		extensions: { webweb: false },
+		localize: { thinking: "low" },
+		answer: { model: "openai-codex/gpt-5.5", thinking: "medium" },
 	});
 
-	const saved = parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
-	assert.deepEqual(saved.subagents, { enabled: false });
-	assert.deepEqual(saved["git-guardrails"], { enabled: true });
-	assert.deepEqual(saved.answer, {
-		model: "openai-codex/gpt-5.5",
-		thinking: "medium",
-	});
+	fs.writeFileSync(configPath, "{broken");
+	assert.throws(() => updateProjectAnswerConfig(cwd, { model: "openai-codex/gpt-5.5", thinking: "low" }), /Cannot read/);
+	assert.equal(fs.readFileSync(configPath, "utf-8"), "{broken");
 });
 
-test("answer config writes preserve legacy array entries", () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-answer-array-"));
-	const configPath = getProjectAnswerConfigPath(cwd);
-	fs.mkdirSync(path.dirname(configPath), { recursive: true });
-	fs.writeFileSync(
-		configPath,
-		"- extension: subagents\n  enabled: true\n- extension: answer\n  model: anthropic/old\n  thinking: low\n",
-		"utf-8",
-	);
-
-	updateProjectAnswerConfig(cwd, {
-		model: "openai-codex/gpt-5.5",
-		thinking: "medium",
-	});
-
-	const saved = parse(fs.readFileSync(configPath, "utf-8")) as Array<Record<string, unknown>>;
-	assert.equal(saved.some((entry) => entry.extension === "subagents" && entry.enabled === true), true);
-	assert.deepEqual(saved.filter((entry) => entry.extension === "answer"), [
-		{
-			extension: "answer",
-			model: "openai-codex/gpt-5.5",
-			thinking: "medium",
-		},
-	]);
-});
+function writeJson(file: string, value: unknown): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, JSON.stringify(value));
+}

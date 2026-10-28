@@ -42,7 +42,7 @@ themes/
   <theme-name>.json
 ```
 
-Each extension lives in a separate folder. The `pi` manifest in `package.json` loads `extensions/*/index.ts` and the package's resource directories.
+Each extension lives in a separate folder. The `pi` manifest in `package.json` declares one entry point, `extensions/mepie/index.ts`, which loads the extensions registered in `extensions/mepie/catalog.ts`.
 
 ## Included extensions
 
@@ -54,11 +54,46 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 - `find-docs` — retrieve current Context7 documentation.
 - `pi-github` — typed GitHub repository, issue, pull request, comment, and relation operations plus autocomplete.
 - `localize`: compose English prompts from instructions or refine wording while preserving structure before submission.
-- `mepie` — enable or disable Mepie extensions globally or for the current project with `/mepie`.
+- `mepie` — load the other extensions and enable or disable them globally or for the current project with `/mepie`.
+- `webweb` — web search, fetch, and cached reads through `ww_search`, `ww_fetch`, and `ww_read`.
 - `mepie-ui` — add a theme-aware model, context, cost, and Git dashboard footer.
 - `mepie-tool-ui`: render built-in tools as compact conversation rows with expandable output. Show known targets while arguments stream, keep unfinished names muted, and use `toolTitle` on success or `error` on failure. Collapsed skill reads show `󰚩 skill-name` with the same name colors. Nerd Font required.
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
 - `terminal-environment` — expose one tmux-backed `workspace` tool for raw target operations and managed Agent Runs / Work Cycles.
+
+## Configuration
+
+Mepie reads one `mepie.json` per scope:
+
+- Global: `<getAgentDir()>/mepie.json`, normally `~/.pi/agent/mepie.json`.
+- Project: `<cwd>/.pi/mepie.json`.
+
+```json
+{
+  "toolRenderMode": "custom",
+  "extensions": { "webweb": false, "localize": false },
+  "answer": { "model": "openai-codex/gpt-5.4-mini", "thinking": "medium" },
+  "localize": { "model": "openai-codex/gpt-5.4-mini", "thinking": "low" }
+}
+```
+
+### Enabling extensions
+
+`extensions` maps extension ids to `true` or `false`. Each extension is resolved as follows:
+
+1. Global `false` disables it everywhere. A project cannot re-enable it.
+2. Otherwise, the project value applies.
+3. Otherwise, it is enabled.
+
+In practice, a project can only disable more extensions. `mepie` itself cannot be disabled. Unknown ids or non-boolean values make Mepie ignore that file's `extensions` and show a warning.
+
+`/mepie` edits either scope and reloads Pi. In the project view, globally disabled extensions appear as `off (global)` and cannot be changed. Hand edits take effect after `/reload`.
+
+Pi does not give extension factories the session directory or the trust decision. Mepie therefore reads the project file from the directory where Pi started and skips it only when that project is explicitly distrusted. `/mepie` writes project settings only in trusted projects.
+
+### Feature settings
+
+`toolRenderMode` is global only. `answer` and `localize` merge field by field: project values override global values, which override package defaults. Projects must be trusted for their values to apply.
 
 ## Tool rendering
 
@@ -71,7 +106,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` l
 
 Changing modes waits for idle, saves the preference, and reloads Pi automatically. Selecting the active mode does nothing. This changes rendering only, not enabled tools or extensions. Bash's optional `purpose` argument works in every mode. Thinking-text styling is unchanged.
 
-Both `mepie-tool-ui` and `file-search` read the global `toolRenderMode` preference in `<getAgentDir()>/mepie.json`, normally `~/.pi/agent/mepie.json`. File search honors it even when `mepie-tool-ui` is disabled. Missing settings use `compact`. Invalid settings produce a warning and fall back to `compact`; fix the file before saving a different mode. Mepie does not overwrite invalid settings.
+Both `mepie-tool-ui` and `file-search` read the global `toolRenderMode` preference from the global `mepie.json`. File search honors it even when `mepie-tool-ui` is disabled. Missing settings use `compact`. Invalid settings produce a warning and fall back to `compact`; fix the file before saving a different mode. Mepie does not overwrite invalid settings.
 
 ## Managed Agent Runs and Work Cycles
 
@@ -126,9 +161,10 @@ Retrieval selectors, fuzzy matching, cache durability, and paging remain deferre
 
 1. Create `extensions/<name>/index.ts`.
 2. Export a default function that receives `ExtensionAPI`.
-3. Keep supporting modules inside the same folder.
-4. Use Effect for effectful workflows and run the resulting effect at a Pi handler boundary.
-5. Run `bun run check`.
+3. Register it in `extensions/mepie/catalog.ts`.
+4. Keep supporting modules inside the same folder.
+5. Use Effect for effectful workflows and run the resulting effect at a Pi handler boundary.
+6. Run `bun run check`.
 
 ## Other resources
 

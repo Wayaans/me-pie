@@ -1,9 +1,6 @@
-import { readFileSync } from "node:fs";
-import { mkdir, rename, writeFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
+import { globalSettingsPath, readSettings, updateSettings, type MepieSettings } from "./settings.ts";
 
 export const TOOL_RENDER_MODES = ["compact", "builtin", "simple", "custom"] as const;
 export type ToolRenderMode = typeof TOOL_RENDER_MODES[number];
@@ -18,21 +15,11 @@ export function toolPresentation(mode: ToolRenderMode, toolName: string): "compa
 	return toolName === "edit" || toolName === "write" ? "native-preview" : "compact";
 }
 
-function readSettings(agentDir: string): Record<string, unknown> {
-	let text: string;
-	try {
-		text = readFileSync(join(agentDir, "mepie.json"), "utf8");
-	} catch (error) {
-		if (error instanceof Error && "code" in error && error.code === "ENOENT") return {};
-		throw error;
-	}
-	const value: unknown = JSON.parse(text);
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		throw new Error("Expected a settings object.");
-	}
-	const settings: Record<string, unknown> = Object.fromEntries(Object.entries(value));
+/** Rejects an unknown mode so a save never silently replaces a user's typo. */
+function readToolSettings(agentDir: string): MepieSettings {
+	const settings = readSettings(globalSettingsPath(agentDir));
 	if (settings.toolRenderMode !== undefined && !isToolRenderMode(settings.toolRenderMode)) {
-		throw new Error("Unknown toolRenderMode. Choose compact, builtin, simple, or custom.");
+		throw new Error(`Cannot read ${globalSettingsPath(agentDir)}: unknown toolRenderMode. Choose compact, builtin, simple, or custom.`);
 	}
 	return settings;
 }
@@ -40,10 +27,10 @@ function readSettings(agentDir: string): Record<string, unknown> {
 export function readToolRenderMode(agentDir = getAgentDir()): { mode: ToolRenderMode; warning?: string } {
 	return Effect.runSync(Effect.try({
 		try: () => {
-			const settings = readSettings(agentDir);
+			const settings = readToolSettings(agentDir);
 			return { mode: isToolRenderMode(settings.toolRenderMode) ? settings.toolRenderMode : "compact" as const };
 		},
-		catch: (error) => new Error(`Cannot read ${join(agentDir, "mepie.json")}: ${error instanceof Error ? error.message : String(error)}`),
+		catch: (error) => error instanceof Error ? error : new Error(String(error)),
 	}).pipe(Effect.catch((error) => Effect.succeed({ mode: "compact" as const, warning: `${error.message} Using compact; the file was not changed.` }))));
 }
 
@@ -57,18 +44,11 @@ export function loadToolRenderMode(pi: ExtensionAPI): ToolRenderMode {
 }
 
 export function saveToolRenderMode(mode: ToolRenderMode, agentDir = getAgentDir()) {
-	return Effect.tryPromise({
-		try: async () => {
+	return Effect.try({
+		try: () => {
 			// Refuse to overwrite malformed settings, including when changing the fallback mode.
-			const settings = readSettings(agentDir);
-			await mkdir(agentDir, { recursive: true });
-			const temporary = join(agentDir, `.mepie-${randomUUID()}.tmp`);
-			try {
-				await writeFile(temporary, `${JSON.stringify({ ...settings, toolRenderMode: mode }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-				await rename(temporary, join(agentDir, "mepie.json"));
-			} finally {
-				await unlink(temporary).catch(() => undefined);
-			}
+			readToolSettings(agentDir);
+			updateSettings(globalSettingsPath(agentDir), (settings) => ({ ...settings, toolRenderMode: mode }));
 		},
 		catch: (error) => new Error(`Could not save Mepie tool mode: ${error instanceof Error ? error.message : String(error)}`),
 	});

@@ -45,11 +45,11 @@ import {
 import {
 	type AnswerConfig,
 	type AnswerThinkingLevel,
-	getProjectAnswerConfigPath,
 	loadMergedAnswerConfig,
 	parseAnswerModelRef,
 	updateProjectAnswerConfig,
 } from "./config.ts";
+import { projectSettingsPath } from "../mepie/settings.ts";
 
 // Structured output format for question extraction
 interface ExtractedQuestion {
@@ -774,7 +774,7 @@ async function showAnswerConfig(ctx: ExtensionContext): Promise<void> {
 	);
 	if (!selectedThinking) return;
 
-	const configPath = getProjectAnswerConfigPath(ctx.cwd);
+	const configPath = projectSettingsPath(ctx.cwd);
 	const confirmed = await ctx.ui.confirm(
 		"Save answer configuration?",
 		`${selectedModelRef} · thinking: ${selectedThinking}\n${configPath}`,

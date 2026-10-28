@@ -14,11 +14,11 @@ import { BorderedLoader } from "@earendil-works/pi-coding-agent";
 import {
 	type LocalizeConfig,
 	type LocalizeThinkingLevel,
-	getProjectLocalizeConfigPath,
 	loadMergedLocalizeConfig,
 	parseLocalizeModelRef,
 	updateProjectLocalizeConfig,
 } from "./config.ts";
+import { projectSettingsPath } from "../mepie/settings.ts";
 
 type CompleteSimple = typeof completeSimple;
 type LocalizeMode = "compose" | "refine";
@@ -276,7 +276,7 @@ async function showLocalizeConfig(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 
-	const configPath = getProjectLocalizeConfigPath(ctx.cwd);
+	const configPath = projectSettingsPath(ctx.cwd);
 	const confirmed = await ctx.ui.confirm(
 		"Save localize configuration?",
 		`${selectedModelRef} · thinking: ${selectedThinking}\n${configPath}`,

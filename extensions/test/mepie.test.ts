@@ -1,88 +1,130 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import type { PackageSource } from "@earendil-works/pi-coding-agent";
-import { CONFIGURABLE_EXTENSIONS, MEPIE_MANAGER_PATH } from "../mepie/catalog.ts";
-import {
-	findPackage,
-	isEnabledByPackageEntry,
-	readGlobalStates,
-	readProjectStates,
-	updateGlobalPackage,
-	updateProjectDelta,
-	updateProjectPackage,
-	type ProjectExtensionState,
-} from "../mepie/config.ts";
+import { ProjectTrustStore, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { MepieExtensionId } from "../mepie/catalog.ts";
+import { isExtensionEnabled, parseExtensionChoices, withExtensionChoices } from "../mepie/enablement.ts";
+import { loadEnabledExtensions } from "../mepie/loader.ts";
+import { registerMepieCommand } from "../mepie/manager.ts";
+import { globalSettingsPath, projectSettingsPath } from "../mepie/settings.ts";
 
-const source = "/packages/mepie";
-const answer = CONFIGURABLE_EXTENSIONS.find(({ id }) => id === "answer")!;
-const terminal = CONFIGURABLE_EXTENSIONS.find(({ id }) => id === "terminal-environment")!;
+function writeJson(file: string, value: unknown): void {
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, JSON.stringify(value));
+}
 
-test("package filters resolve includes, exclusions, and force overrides", () => {
-	const entry: PackageSource = {
-		source,
-		extensions: ["extensions/*/index.ts", "!extensions/terminal-*/index.ts", "+extensions/terminal-environment/index.ts", "-extensions/answer/index.ts"],
-	};
-	assert.equal(isEnabledByPackageEntry(entry, answer), false);
-	assert.equal(isEnabledByPackageEntry(entry, terminal), true);
+function choices(entries: Record<string, boolean>) {
+	return parseExtensionChoices({ extensions: entries });
+}
+
+test("global disable wins over every project choice", () => {
+	const global = choices({ webweb: false, answer: true });
+	assert.equal(isExtensionEnabled("webweb", global, choices({ webweb: true })), false);
+	assert.equal(isExtensionEnabled("answer", global, choices({ answer: false })), false);
+	assert.equal(isExtensionEnabled("answer", global, new Map()), true);
+	assert.equal(isExtensionEnabled("localize", new Map(), new Map()), true);
 });
 
-test("global update keeps unrelated package filters and pins the manager", () => {
-	const packages: PackageSource[] = [
-		"npm:other",
-		{ source, skills: ["skills/*"], themes: [], extensions: ["extensions/*/index.ts"] },
-	];
-	const location = findPackage(packages, source)!;
-	const updated = updateGlobalPackage(packages, location, new Set(["answer"]));
-	assert.equal(updated[0], "npm:other");
-	const entry = updated[1];
-	assert.equal(typeof entry, "object");
-	assert.deepEqual(typeof entry === "object" ? entry.skills : undefined, ["skills/*"]);
-	assert.deepEqual(typeof entry === "object" ? entry.themes : undefined, []);
-	assert.ok(typeof entry === "object" && entry.extensions?.includes(`+${MEPIE_MANAGER_PATH}`));
-	assert.ok(typeof entry === "object" && !entry.extensions?.includes(`-${answer.path}`));
-	assert.ok(typeof entry === "object" && entry.extensions?.includes(`-${terminal.path}`));
-	assert.deepEqual([...readGlobalStates(entry!)].filter(([, enabled]) => enabled).map(([id]) => id), ["answer"]);
+test("extension settings reject unknown ids and non-boolean values", () => {
+	assert.throws(() => choices({ webwbe: false }), /Unknown extension "webwbe"/);
+	assert.throws(() => parseExtensionChoices({ extensions: { webweb: "off" } }), /extensions\.webweb must be true or false/);
+	assert.throws(() => parseExtensionChoices({ extensions: [] }), /extensions must be an object/);
 });
 
-test("project delta stores inherit, enabled, and disabled independently", () => {
-	const states = new Map<string, ProjectExtensionState>(CONFIGURABLE_EXTENSIONS.map(({ id }) => [id, "inherit"]));
-	states.set("answer", "enabled");
-	states.set("terminal-environment", "disabled");
-	const updated = updateProjectDelta([], source, states);
-	assert.deepEqual(updated, [{
-		source,
-		autoload: false,
-		extensions: [
-		`+${MEPIE_MANAGER_PATH}`,
-		`+${answer.path}`,
-		`-${terminal.path}`,
-	],
-	}]);
-	assert.equal(readProjectStates(updated[0]).get("answer"), "enabled");
-	assert.equal(readProjectStates(updated[0]).get("terminal-environment"), "disabled");
-	assert.equal(readProjectStates(updated[0]).get("ask-me"), "inherit");
+test("saving extension choices keeps other settings and stores only disabled ids", () => {
+	const settings = { toolRenderMode: "custom", extensions: { answer: true, webweb: false } };
+	assert.deepEqual(withExtensionChoices(settings, new Set(["localize"])), { toolRenderMode: "custom", extensions: { localize: false } });
+	assert.deepEqual(withExtensionChoices(settings, new Set()), { toolRenderMode: "custom" });
 });
 
-test("project delta updates preserve filters for other resource types", () => {
-	const packages: PackageSource[] = [{ source, autoload: false, skills: ["+skills/unslop/SKILL.md"], extensions: [] }];
-	const states = new Map([["answer", "disabled" as const]]);
-	const updated = updateProjectDelta(packages, source, states);
-	assert.deepEqual(updated[0], {
-		source,
-		autoload: false,
-		skills: ["+skills/unslop/SKILL.md"],
-		extensions: [`+${MEPIE_MANAGER_PATH}`, `-${answer.path}`],
-	});
+function fakeExtensions(loaded: string[]) {
+	const ids: MepieExtensionId[] = ["answer", "localize", "webweb"];
+	return ids.map((id) => ({
+		id,
+		load: async () => ({
+			default: () => {
+				if (id === "localize") throw new Error("boom");
+				loaded.push(id);
+			},
+		}),
+	}));
+}
+
+test("loader applies global and project settings and isolates failing extensions", async () => {
+	const agentDir = mkdtempSync(join(tmpdir(), "mepie-loader-agent-"));
+	const cwd = mkdtempSync(join(tmpdir(), "mepie-loader-project-"));
+	writeJson(globalSettingsPath(agentDir), { extensions: { webweb: false } });
+	writeJson(projectSettingsPath(cwd), { extensions: { webweb: true, answer: false } });
+
+	const loaded: string[] = [];
+	const pi = {} as ExtensionAPI;
+	const warnings = await loadEnabledExtensions(pi, { cwd, agentDir, extensions: fakeExtensions(loaded) });
+	assert.deepEqual(loaded, []);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0] ?? "", /could not load localize: boom/);
+
+	// An explicitly distrusted project cannot change which extensions load.
+	new ProjectTrustStore(agentDir).set(cwd, false);
+	loaded.length = 0;
+	await loadEnabledExtensions(pi, { cwd, agentDir, extensions: fakeExtensions(loaded) });
+	assert.deepEqual(loaded, ["answer"]);
 });
 
-test("project-only package update removes delta mode and keeps the manager", () => {
-	const packages: PackageSource[] = [{ source, autoload: false, prompts: [], extensions: [] }];
-	const location = findPackage(packages, source)!;
-	const updated = updateProjectPackage(packages, location, new Set(["answer"]));
-	const entry = updated[0];
-	assert.equal(typeof entry, "object");
-	assert.deepEqual(typeof entry === "object" ? entry.prompts : undefined, []);
-	assert.ok(typeof entry === "object" && entry.extensions?.includes(`+${MEPIE_MANAGER_PATH}`));
-	assert.ok(typeof entry === "object" && !entry.extensions?.includes(`-${answer.path}`));
-	assert.ok(typeof entry === "object" && entry.extensions?.includes(`-${terminal.path}`));
+test("loader warns and ignores malformed settings", async () => {
+	const agentDir = mkdtempSync(join(tmpdir(), "mepie-loader-agent-"));
+	const cwd = mkdtempSync(join(tmpdir(), "mepie-loader-project-"));
+	mkdirSync(dirname(globalSettingsPath(agentDir)), { recursive: true });
+	writeFileSync(globalSettingsPath(agentDir), "{broken");
+	writeJson(projectSettingsPath(cwd), { extensions: { nope: false } });
+
+	const loaded: string[] = [];
+	const warnings = await loadEnabledExtensions({} as ExtensionAPI, { cwd, agentDir, extensions: fakeExtensions(loaded) });
+	assert.deepEqual(loaded, ["answer", "webweb"]);
+	assert.equal(warnings.filter((warning) => warning.startsWith("Ignoring Mepie extension settings")).length, 2);
+});
+
+test("project manager locks globally disabled extensions and preserves their project choice", async () => {
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const agentDir = mkdtempSync(join(tmpdir(), "mepie-manager-agent-"));
+	const cwd = mkdtempSync(join(tmpdir(), "mepie-manager-project-"));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	try {
+		writeJson(globalSettingsPath(agentDir), { toolRenderMode: "simple", extensions: { webweb: false } });
+		writeJson(projectSettingsPath(cwd), { answer: { thinking: "low" }, extensions: { webweb: false } });
+
+		let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
+		registerMepieCommand({ registerCommand: (_name, value) => { command = value; } }, "compact");
+		assert.ok(command);
+
+		const picks = ["This project", "webweb", "answer", "Apply changes"];
+		const notices: string[] = [];
+		let reloaded = false;
+		const ctx = {
+			cwd,
+			mode: "tui",
+			hasUI: true,
+			isProjectTrusted: () => true,
+			ui: {
+				notify: (message: string) => notices.push(message),
+				select: async (_title: string, options: string[]) => {
+					const pick = picks.shift();
+					return options.find((option) => option === pick || option.includes(` ${pick} ·`));
+				},
+			},
+			reload: async () => { reloaded = true; },
+		} as unknown as ExtensionCommandContext;
+		await command.handler("", ctx);
+
+		assert.match(notices[0] ?? "", /webweb is disabled globally/);
+		assert.equal(reloaded, true);
+		assert.deepEqual(JSON.parse(readFileSync(projectSettingsPath(cwd), "utf8")), {
+			answer: { thinking: "low" },
+			extensions: { answer: false, webweb: false },
+		});
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	}
 });

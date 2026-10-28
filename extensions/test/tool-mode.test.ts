@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Effect } from "effect";
 import { createBashToolDefinition, initTheme, ToolExecutionComponent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
-import mepie from "../mepie/index.ts";
+import { registerMepieCommand } from "../mepie/manager.ts";
 import mepieToolUi from "../mepie-tool-ui/index.ts";
 import fileSearch from "../file-search/index.ts";
 import { readToolRenderMode, saveToolRenderMode, TOOL_RENDER_MODES, toolPresentation } from "../mepie/tool-mode.ts";
@@ -26,7 +26,7 @@ test("tool mode settings and commands preserve configuration and reload only aft
 		assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { unrelated: { keep: true }, toolRenderMode: "simple" });
 
 		let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
-		mepie({ on() {}, registerCommand(_name: string, value: Parameters<ExtensionAPI["registerCommand"]>[1]) { command = value; } } as unknown as ExtensionAPI);
+		registerMepieCommand({ registerCommand(_name, value) { command = value; } }, readToolRenderMode(dir).mode);
 		assert.ok(command);
 		assert.deepEqual(command.getArgumentCompletions?.("tool s"), [{ value: "tool simple", label: "tool simple" }]);
 		assert.deepEqual(command.getArgumentCompletions?.("tool cu"), [{ value: "tool custom", label: "tool custom" }]);

@@ -15,7 +15,7 @@ Extract actionable questions from the last assistant message and answer them in 
 - **/answer** — extract and answer questions from the last assistant message.
 - **/answer-config** — search for a project-specific extraction model, then select its thinking level.
 
-Both selectors support type-to-search. `/answer-config` saves immediately to `.pi/mepie/config.yaml`; `/reload` is not required.
+Both selectors support type-to-search. `/answer-config` saves immediately to the project's `.pi/mepie.json`; `/reload` is not required.
 
 ## Shortcuts
 
@@ -24,17 +24,15 @@ Both selectors support type-to-search. `/answer-config` saves immediately to `.p
 
 Ctrl+R never overwrites an answer that already contains text. Ctrl+Y is not used because it is pi's editor yank shortcut.
 
-## Project configuration
+## Configuration
 
 Package defaults:
 
-```yaml
-answer:
-  model: openai-codex/gpt-5.4-mini
-  thinking: medium
+```json
+{ "answer": { "model": "openai-codex/gpt-5.4-mini", "thinking": "medium" } }
 ```
 
-A trusted project's `.pi/mepie/config.yaml` overrides these values. The `answer` section is merged without removing other Mepie configuration such as `subagents` or `git-guardrails`.
+Set `answer` in the global `~/.pi/agent/mepie.json` or in a trusted project's `.pi/mepie.json`. Project fields override global fields. Saving replaces only the `answer` key.
 
 The configured authenticated model is tried first. If it is unavailable or encounters a recoverable error, `/answer` falls back to the current session model. The configured thinking level is applied through pi's provider-neutral reasoning interface and clamped to the selected model's capabilities.
 

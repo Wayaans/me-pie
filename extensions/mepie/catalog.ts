@@ -1,26 +1,31 @@
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+
 export interface MepieExtension {
 	readonly id: string;
-	readonly path: `extensions/${string}/index.ts`;
 	readonly description: string;
-	readonly configurable: boolean;
+	/** Imported only when enabled, so disabled extensions never load their modules. */
+	readonly load: () => Promise<{ readonly default: ExtensionFactory }>;
 }
 
-export const MEPIE_MANAGER_PATH = "extensions/mepie/index.ts" as const;
-
+/** The only registry of Mepie extensions. The `mepie` manager loads these and cannot disable itself. */
 export const MEPIE_EXTENSIONS = [
-	{ id: "mepie", path: MEPIE_MANAGER_PATH, description: "Manage Mepie extensions", configurable: false },
-	{ id: "answer", path: "extensions/answer/index.ts", description: "Answer assistant questions interactively", configurable: true },
-	{ id: "ask-me", path: "extensions/ask-me/index.ts", description: "Ask structured interactive questions", configurable: true },
-	{ id: "checkpoint-compaction", path: "extensions/checkpoint-compaction/index.ts", description: "Create structured continuation checkpoints", configurable: true },
-	{ id: "codex-usage", path: "extensions/codex-usage/index.ts", description: "Show Codex subscription usage", configurable: true },
-	{ id: "file-search", path: "extensions/file-search/index.ts", description: "Add bounded fd and rg search tools", configurable: true },
-	{ id: "find-docs", path: "extensions/find-docs/index.ts", description: "Retrieve current Context7 documentation", configurable: true },
-	{ id: "localize", path: "extensions/localize/index.ts", description: "Translate and refine prompts into English", configurable: true },
-	{ id: "mepie-tool-ui", path: "extensions/mepie-tool-ui/index.ts", description: "Render compact built-in tool rows", configurable: true },
-	{ id: "mepie-ui", path: "extensions/mepie-ui/index.ts", description: "Add the Mepie dashboard footer", configurable: true },
-	{ id: "pi-github", path: "extensions/pi-github/index.ts", description: "Add typed GitHub operations", configurable: true },
-	{ id: "skill-shortcut", path: "extensions/skill-shortcut/index.ts", description: "Invoke skills with $skill-name", configurable: true },
-	{ id: "terminal-environment", path: "extensions/terminal-environment/index.ts", description: "Add tmux-backed workspace coordination", configurable: true },
+	{ id: "answer", description: "Answer assistant questions interactively", load: () => import("../answer/index.ts") },
+	{ id: "ask-me", description: "Ask structured interactive questions", load: () => import("../ask-me/index.ts") },
+	{ id: "checkpoint-compaction", description: "Create structured continuation checkpoints", load: () => import("../checkpoint-compaction/index.ts") },
+	{ id: "codex-usage", description: "Show Codex subscription usage", load: () => import("../codex-usage/index.ts") },
+	{ id: "file-search", description: "Add bounded fd and rg search tools", load: () => import("../file-search/index.ts") },
+	{ id: "find-docs", description: "Retrieve current Context7 documentation", load: () => import("../find-docs/index.ts") },
+	{ id: "localize", description: "Translate and refine prompts into English", load: () => import("../localize/index.ts") },
+	{ id: "mepie-tool-ui", description: "Render compact built-in tool rows", load: () => import("../mepie-tool-ui/index.ts") },
+	{ id: "mepie-ui", description: "Add the Mepie dashboard footer", load: () => import("../mepie-ui/index.ts") },
+	{ id: "pi-github", description: "Add typed GitHub operations", load: () => import("../pi-github/index.ts") },
+	{ id: "skill-shortcut", description: "Invoke skills with $skill-name", load: () => import("../skill-shortcut/index.ts") },
+	{ id: "terminal-environment", description: "Add tmux-backed workspace coordination", load: () => import("../terminal-environment/index.ts") },
+	{ id: "webweb", description: "Add web search, fetch, and read tools", load: () => import("../webweb/index.ts") },
 ] as const satisfies readonly MepieExtension[];
 
-export const CONFIGURABLE_EXTENSIONS = MEPIE_EXTENSIONS.filter((extension) => extension.configurable);
+export type MepieExtensionId = (typeof MEPIE_EXTENSIONS)[number]["id"];
+
+export function isMepieExtensionId(value: string): value is MepieExtensionId {
+	return MEPIE_EXTENSIONS.some(({ id }) => id === value);
+}

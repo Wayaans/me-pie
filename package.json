@@ -29,8 +29,7 @@
     "@mozilla/readability": "^0.6.0",
     "effect": "4.0.0-beta.102",
     "linkedom": "^0.16.0",
-    "turndown": "^7.2.0",
-    "yaml": "^2.8.2"
+    "turndown": "^7.2.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -49,7 +48,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/*/index.ts"
+      "./extensions/mepie/index.ts"
     ],
     "skills": [
       "./skills"

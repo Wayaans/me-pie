@@ -1,7 +1,4 @@
-import fs from "node:fs";
-import path from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { parse, stringify } from "yaml";
+import { globalSettingsPath, isRecord, projectSettingsPath, readSettings, updateSettings, type MepieSettings } from "../mepie/settings.ts";
 
 export const LOCALIZE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
@@ -45,14 +42,6 @@ export const DEFAULT_LOCALIZE_CONFIG: LocalizeConfig = {
 	composerPrompt: DEFAULT_COMPOSER_PROMPT,
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isLocalizeExtension(value: unknown): boolean {
-	return typeof value === "string" && value.trim().toLowerCase() === "localize";
-}
-
 export function parseLocalizeModelRef(value: string): { provider: string; modelId: string } | undefined {
 	const model = value.trim();
 	const separator = model.indexOf("/");
@@ -95,97 +84,20 @@ function parseLocalizeFields(record: Record<string, unknown>): Partial<LocalizeC
 	return config;
 }
 
-function extractLocalizeConfig(document: unknown): Partial<LocalizeConfig> {
-	if (Array.isArray(document)) {
-		let config: Partial<LocalizeConfig> = {};
-		for (const item of document) {
-			if (!isRecord(item) || !isLocalizeExtension(item.extension)) continue;
-			config = { ...config, ...parseLocalizeFields(item) };
-		}
-		return config;
-	}
-
-	if (!isRecord(document)) return {};
-	if (isLocalizeExtension(document.extension)) return parseLocalizeFields(document);
-	if (document.localize === undefined) return {};
-	if (!isRecord(document.localize)) throw new Error("localize config must be a mapping");
-	return parseLocalizeFields(document.localize);
+function extractLocalizeConfig(settings: MepieSettings): Partial<LocalizeConfig> {
+	if (settings.localize === undefined) return {};
+	if (!isRecord(settings.localize)) throw new Error("localize config must be an object");
+	return parseLocalizeFields(settings.localize);
 }
 
-function readYamlFile(filePath: string): unknown {
-	if (!fs.existsSync(filePath)) return undefined;
-	try {
-		return parse(fs.readFileSync(filePath, "utf-8"));
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Failed to parse localize config at ${filePath}: ${message}`);
-	}
-}
-
-function findProjectRoot(startCwd: string): string {
-	let current = path.resolve(startCwd);
-	while (true) {
-		if (fs.existsSync(path.join(current, ".git")) || fs.existsSync(path.join(current, CONFIG_DIR_NAME))) {
-			return current;
-		}
-		const parent = path.dirname(current);
-		if (parent === current) return path.resolve(startCwd);
-		current = parent;
-	}
-}
-
-export function getProjectLocalizeConfigPath(cwd: string): string {
-	return path.join(findProjectRoot(cwd), CONFIG_DIR_NAME, "mepie", "config.yaml");
-}
-
+/** Project fields override global fields, which override package defaults. */
 export function loadMergedLocalizeConfig(
 	cwd: string,
 	options: { includeProject?: boolean } = {},
 ): LocalizeConfig {
-	if (options.includeProject === false) return { ...DEFAULT_LOCALIZE_CONFIG };
-	const project = extractLocalizeConfig(readYamlFile(getProjectLocalizeConfigPath(cwd)));
-	return {
-		model: project.model ?? DEFAULT_LOCALIZE_CONFIG.model,
-		thinking: project.thinking ?? DEFAULT_LOCALIZE_CONFIG.thinking,
-		refinerPrompt: project.refinerPrompt ?? DEFAULT_LOCALIZE_CONFIG.refinerPrompt,
-		composerPrompt: project.composerPrompt ?? DEFAULT_LOCALIZE_CONFIG.composerPrompt,
-	};
-}
-
-function mergeLocalizeConfig(existingDocument: unknown, saved: LocalizeConfig): unknown {
-	if (Array.isArray(existingDocument)) {
-		const filtered = existingDocument.filter(
-			(item) => !isRecord(item) || !isLocalizeExtension(item.extension),
-		);
-		return [...filtered, { extension: "localize", ...saved }];
-	}
-
-	if (existingDocument === undefined || existingDocument === null) {
-		return { localize: saved };
-	}
-
-	if (!isRecord(existingDocument)) {
-		throw new Error("Mepie config must be a mapping or sequence");
-	}
-
-	if (isLocalizeExtension(existingDocument.extension)) {
-		const {
-			extension: _extension,
-			model: _model,
-			thinking: _thinking,
-			refinerPrompt: _refinerPrompt,
-			composerPrompt: _composerPrompt,
-			...rest
-		} = existingDocument;
-		void _extension;
-		void _model;
-		void _thinking;
-		void _refinerPrompt;
-		void _composerPrompt;
-		return { ...rest, localize: saved };
-	}
-
-	return { ...existingDocument, localize: saved };
+	const global = extractLocalizeConfig(readSettings(globalSettingsPath()));
+	const project = options.includeProject === false ? {} : extractLocalizeConfig(readSettings(projectSettingsPath(cwd)));
+	return { ...DEFAULT_LOCALIZE_CONFIG, ...global, ...project };
 }
 
 export function updateProjectLocalizeConfig(
@@ -205,9 +117,7 @@ export function updateProjectLocalizeConfig(
 		refinerPrompt: config.refinerPrompt,
 		composerPrompt: config.composerPrompt,
 	};
-	const configPath = getProjectLocalizeConfigPath(cwd);
-	const nextDocument = mergeLocalizeConfig(readYamlFile(configPath), saved);
-	fs.mkdirSync(path.dirname(configPath), { recursive: true });
-	fs.writeFileSync(configPath, stringify(nextDocument), "utf-8");
+	const configPath = projectSettingsPath(cwd);
+	updateSettings(configPath, (settings) => ({ ...settings, localize: saved }));
 	return { path: configPath, saved };
 }
