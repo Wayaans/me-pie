@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect } from "effect";
-import { createBashToolDefinition, initTheme, ToolExecutionComponent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, initTheme, ToolExecutionComponent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionToolContext, type ToolDefinition, type ToolRendererResolver } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { registerMepieCommand } from "../mepie/manager.ts";
 import mepieToolUi from "../mepie-tool-ui/index.ts";
@@ -86,10 +86,14 @@ test("render modes survive reload cycles and file-search reads its mode independ
 			for (const factory of [mepieToolUi, fileSearch]) {
 				const tools = new Map<string, ToolDefinition>();
 				const handlers = new Map<string, Handler[]>();
+				const rendererResolvers: ToolRendererResolver[] = [];
 				factory({
 					registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
+					registerToolRenderer(resolver: ToolRendererResolver) { rendererResolvers.push(resolver); },
 					on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
 				} as unknown as ExtensionAPI);
+				// Codemode keeps its built-in renderer only in builtin mode.
+				assert.equal(rendererResolvers.length, factory === mepieToolUi && mode !== "builtin" ? 1 : 0);
 				const start = handlers.get("session_start")?.[0];
 				assert.ok(start);
 				// Start only spacing, not binary setup or thinking styling.

@@ -6,4 +6,6 @@ export const TOOL_ICONS = {
 	search: "󰍉",
 	files: "󰈞",
 	list: "󰉋",
+	code: "󰅩",
+	tool: "󰒓",
 } as const;

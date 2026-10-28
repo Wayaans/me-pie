@@ -49,4 +49,17 @@ Visible thinking text starts with the `󰧑` glyph and uses the active theme's `
 󰧑 I need to inspect the current implementation before proposing the change.
 ```
 
+## Codemode
+
+`codemode` rows use the same shell. Each nested tool call becomes one tree line with the icon, label, and target of its direct row and a right-aligned duration. Calls to tools without a Mepie row show their name and arguments. Codemode records only a 200-character preview of each call's arguments, so targets come from that preview, and result summaries such as line counts are not available.
+
+```text
+󰅩 Codemode · 3 calls · 0.4s
+├─ 󰈙 Read extensions/mepie-tool-ui/tools.ts                 4ms
+├─  Bash · Find renderer docs                            120ms
+╰─ 󰍉 Grep /registerToolRenderer/ in extensions             38ms
+```
+
+When the script succeeds, the header counts calls and failed calls and shows the script's duration. A failed script's header shows `failed`. Collapsed rows show the last eight calls and no script output. A failed call adds its last error line below it. When the script fails for another reason, the script error is the last tree line. Cancelled calls show `cancelled` in place of a duration. Expanded rows show each call's full argument preview, the script, and its output. Nested Bash calls without a purpose show the command's first line. The `builtin` tool mode keeps Pi's codemode renderer.
+
 The extension affects TUI presentation only. Tool inputs, outputs, execution semantics, and model context remain unchanged.

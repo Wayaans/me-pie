@@ -26,10 +26,15 @@ export interface ToolView<TArgs, TDetails> {
 	readonly targetTruncation?: "end" | "middle";
 	compactCall?(args: Partial<TArgs>, cwd: string, theme: Theme, nameColor: ThemeColor): Component | undefined;
 	target(args: Partial<TArgs>, cwd: string, argsComplete: boolean): string;
-	summary(args: TArgs, result: AgentToolResult<TDetails>): readonly SummaryPart[];
+	summary(args: TArgs, result: AgentToolResult<TDetails>, durationMs: number | undefined): readonly SummaryPart[];
 	collapsed?(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
 	expanded(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme): Component;
+	/** Replaces the default one-line error result. */
+	failed?(args: TArgs, result: AgentToolResult<TDetails>, theme: Theme, expanded: boolean): Component;
 }
+
+type ToolRenderersOf<TParams extends TSchema, TDetails, TState> =
+	Pick<ToolDefinition<TParams, TDetails, TState>, "renderShell" | "renderCall" | "renderResult">;
 
 const HORIZONTAL_PADDING = 1;
 const MEPIE_TOOL_SPACING_STATE = Symbol.for("mepie.tool-ui.spacing-state");
@@ -149,13 +154,26 @@ export function withMepieToolUi<
 	view: ToolView<Static<TParams>, TDetails>,
 	mode: Exclude<ToolRenderMode, "builtin"> = "compact",
 ): ToolDefinition<TParams, TDetails, TOriginalState & ToolUiState> {
-	const presentation = toolPresentation(mode, definition.name);
+	return { ...definition, ...mepieToolRenderers(definition.name, view, mode, definition) };
+}
+
+/** Mepie renderers for a tool row; `native` supplies the previews kept in native-preview mode. */
+export function mepieToolRenderers<
+	TParams extends TSchema,
+	TDetails,
+	TOriginalState,
+>(
+	name: string,
+	view: ToolView<Static<TParams>, TDetails>,
+	mode: Exclude<ToolRenderMode, "builtin"> = "compact",
+	native: ToolRenderersOf<TParams, TDetails, TOriginalState> = {},
+): ToolRenderersOf<TParams, TDetails, TOriginalState & ToolUiState> {
+	const presentation = toolPresentation(mode, name);
 	const compact = presentation === "compact";
 	const nativePreview = presentation === "native-preview";
 	const inset = (component: Component): Component => compact ? new HorizontalInset(component) : component;
 	return {
-		...definition,
-		renderShell: nativePreview ? definition.renderShell ?? "default" : compact ? "self" : "default",
+		renderShell: nativePreview ? native.renderShell ?? "default" : compact ? "self" : "default",
 		renderCall(args, theme, context) {
 			// Pi delivers partial arguments before execution. Render fields already available,
 			// but let views defer optional defaults until the argument stream ends.
@@ -182,20 +200,22 @@ export function withMepieToolUi<
 				context,
 				state: context.state,
 			});
-			if (nativePreview && definition.renderCall) {
+			if (nativePreview && native.renderCall) {
 				const previous = context.lastComponent instanceof NativePreviewCall ? context.lastComponent.native : undefined;
-				const native = definition.renderCall(args, theme, { ...context, lastComponent: previous });
-				return new NativePreviewCall(native, line);
+				const nativeCall = native.renderCall(args, theme, { ...context, lastComponent: previous });
+				return new NativePreviewCall(nativeCall, line);
 			}
 			if (compact) mepieToolSpacing.callComponents.add(line);
 			return line;
 		},
 		renderResult(result, options, theme, context) {
 			if (!options.isPartial && !context.isError) {
-				context.state.finalSummary = view.summary(context.args, result);
+				context.state.finalSummary = view.summary(context.args, result, context.durationMs);
 			}
-			if (nativePreview && definition.renderResult) return definition.renderResult(result, options, theme, context);
-			if (context.isError) return inset(renderErrorResult(result, options, theme));
+			if (nativePreview && native.renderResult) return native.renderResult(result, options, theme, context);
+			if (context.isError) {
+				return inset(view.failed?.(context.args, result, theme, options.expanded) ?? renderErrorResult(result, options, theme));
+			}
 			if (!options.expanded) {
 				const collapsed = view.collapsed?.(context.args, result, theme);
 				return collapsed ? inset(collapsed) : new Container();
@@ -481,13 +501,13 @@ function summaryText(
 	}, "");
 }
 
-function toolTone(context: ToolStateContext): ThemeColor {
+export function toolTone(context: ToolStateContext): ThemeColor {
 	if (context.isError) return "error";
 	if (!context.isPartial) return "toolTitle";
 	return "muted";
 }
 
-function fitTarget(text: string, width: number, mode: "end" | "middle"): string {
+export function fitTarget(text: string, width: number, mode: "end" | "middle"): string {
 	if (width <= 0) return "";
 	if (visibleWidth(text) <= width) return text;
 	if (mode === "end" || width < 4) return truncateToWidth(text, width, "…");

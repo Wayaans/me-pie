@@ -61,6 +61,7 @@ import {
   type ToolView,
 } from "../mepie-tool-ui/tool-renderer.ts";
 import { TOOL_ICONS } from "../mepie-tool-ui/tool-icons.ts";
+import { registerNestedToolView } from "../mepie-tool-ui/nested-views.ts";
 import { loadToolRenderMode } from "../mepie/tool-mode.ts";
 
 export function makeBinaryInitializers(
@@ -131,6 +132,8 @@ function unwrapToolExit<A, E>(exit: Exit.Exit<A, E>, tool: "fd" | "rg") {
 export default function fileSearchTools(pi: ExtensionAPI) {
   const mode = loadToolRenderMode(pi);
   registerMepieToolSpacing(pi, mode, ["fd", "rg"]);
+  registerNestedToolView("fd", fdView);
+  registerNestedToolView("rg", rgView);
 
   let notified = false;
 

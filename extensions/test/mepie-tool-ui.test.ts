@@ -45,6 +45,7 @@ function registeredTools(): Map<string, RegisteredTool> {
 		registerTool(tool: ToolDefinition) {
 			tools.set(tool.name, tool as unknown as RegisteredTool);
 		},
+		registerToolRenderer() {},
 		on() {},
 	};
 	mepieToolUi(pi as unknown as ExtensionAPI);
@@ -147,6 +148,7 @@ test("thinking text includes the Nerd Font icon and preserves its styling withou
 	try {
 		const pi = {
 			registerTool() {},
+			registerToolRenderer() {},
 			on(event: string, handler: EventHandler) {
 				handlers.set(event, handler);
 			},
