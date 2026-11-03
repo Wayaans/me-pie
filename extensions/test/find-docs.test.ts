@@ -17,7 +17,7 @@ import {
 } from "../find-docs/utils.ts";
 
 function execResult(overrides: Partial<ExecResult> = {}): ExecResult {
-	return { code: 0, stdout: "", stderr: "", killed: false, ...overrides };
+	return { code: 0, stdout: "", stderr: "", killed: false, truncated: false, ...overrides };
 }
 
 function queuedRunner(responses: ExecResult[]) {

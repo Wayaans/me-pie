@@ -1,4 +1,4 @@
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum } from "../mepie/string-enum.ts";
 import { Type, type Static } from "typebox";
 
 const repo = Type.Optional(Type.String({

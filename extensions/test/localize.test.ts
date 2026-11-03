@@ -26,7 +26,7 @@ function assistantMessage(text: string, stopReason: AssistantMessage["stopReason
 		content: [{ type: "text", text }],
 		api: "openai-codex-responses",
 		provider: "openai-codex",
-		model: "gpt-5.5",
+		model: "gpt-6.1-sol",
 		usage: {
 			input: 1,
 			output: 1,
@@ -124,7 +124,7 @@ test("config requires trust before opening settings", async () => {
 });
 
 test("config UI edits both prompts and saves only after confirmation", async () => {
-	const model = getModel("openai-codex", "gpt-5.5");
+	const model = getModel("openai-codex", "gpt-6.1-sol");
 	for (const confirmed of [false, true]) {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-ui-"));
 		const titles: string[] = [];
@@ -172,18 +172,18 @@ test("localize config merges project overrides", () => {
 test("localize config writes preserve sibling Mepie settings", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-write-"));
 	const configPath = projectSettingsPath(cwd);
-	writeJson(configPath, { answer: { model: "openai-codex/gpt-5.5", thinking: "medium" }, extensions: { webweb: false } });
+	writeJson(configPath, { answer: { model: "openai-codex/gpt-6.1-sol", thinking: "medium" }, extensions: { webweb: false } });
 
 	const config = {
 		composerPrompt: "Compose a prompt.",
-		model: "openai-codex/gpt-5.5",
+		model: "openai-codex/gpt-6.1-sol",
 		thinking: "low" as const,
 		refinerPrompt: "Refine without expanding.",
 	};
 	updateProjectLocalizeConfig(cwd, config);
 
 	const saved = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
-	assert.deepEqual(saved.answer, { model: "openai-codex/gpt-5.5", thinking: "medium" });
+	assert.deepEqual(saved.answer, { model: "openai-codex/gpt-6.1-sol", thinking: "medium" });
 	assert.deepEqual(saved.extensions, { webweb: false });
 	assert.deepEqual(saved.localize, config);
 	assert.deepEqual(loadMergedLocalizeConfig(cwd), config);
@@ -211,7 +211,7 @@ function writeJson(file: string, value: unknown): void {
 }
 
 test("compose uses its prompt, allows restructuring, and rejects empty output", async () => {
-	const model = getModel("openai-codex", "gpt-5.5");
+	const model = getModel("openai-codex", "gpt-6.1-sol");
 	const modelRegistry = {
 		find: () => model,
 		getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "token" }),
@@ -272,7 +272,7 @@ test("structure validation preserves inline code, URLs, and paths", () => {
 });
 
 test("requestLocalizedPrompt uses the configured model, prompt, and low thinking", async () => {
-	const model = getModel("openai-codex", "gpt-5.5");
+	const model = getModel("openai-codex", "gpt-6.1-sol");
 	let capturedContext: Context | undefined;
 	let capturedOptions: SimpleStreamOptions | undefined;
 	const complete = async (
@@ -312,7 +312,7 @@ test("requestLocalizedPrompt uses the configured model, prompt, and low thinking
 });
 
 test("requestLocalizedPrompt falls back to the current session model", async () => {
-	const currentModel = getModel("openai-codex", "gpt-5.5");
+	const currentModel = getModel("openai-codex", "gpt-6.1-sol");
 	assert.ok(currentModel);
 	let selectedModel: typeof currentModel | undefined;
 	const modelRegistry = {
@@ -337,7 +337,7 @@ test("requestLocalizedPrompt falls back to the current session model", async () 
 });
 
 test("requestLocalizedPrompt rejects output that changes structure", async () => {
-	const model = getModel("openai-codex", "gpt-5.5");
+	const model = getModel("openai-codex", "gpt-6.1-sol");
 	const modelRegistry = {
 		find: () => model,
 		getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "token" }),

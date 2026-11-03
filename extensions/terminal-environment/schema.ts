@@ -1,4 +1,4 @@
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum } from "../mepie/string-enum.ts";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { MANAGED_TEXT_MAX_BYTES } from "./coordination.ts";
