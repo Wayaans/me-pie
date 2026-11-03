@@ -3,11 +3,10 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { MEPIE_EXTENSIONS, type MepieExtensionId } from "./catalog.ts";
 import { parseExtensionChoices, withExtensionChoices, type ExtensionChoices } from "./enablement.ts";
 import { globalSettingsPath, projectSettingsPath, readSettings, updateSettings } from "./settings.ts";
-import { changeToolRenderMode, type ToolRenderMode, TOOL_RENDER_MODES } from "./tool-mode.ts";
 
 const APPLY = "Apply changes";
 const CANCEL = "Cancel";
-const USAGE = "Usage: /mepie or /mepie tool compact|builtin|simple|custom";
+const USAGE = "Usage: /mepie";
 
 function disabledIds(choices: ExtensionChoices): Set<MepieExtensionId> {
 	return new Set([...choices].filter(([, enabled]) => !enabled).map(([id]) => id));
@@ -71,18 +70,12 @@ async function manageExtensions(ctx: ExtensionCommandContext): Promise<void> {
 	await ctx.reload();
 }
 
-export function registerMepieCommand(pi: Pick<ExtensionAPI, "registerCommand">, activeMode: ToolRenderMode): void {
+export function registerMepieCommand(pi: Pick<ExtensionAPI, "registerCommand">): void {
 	pi.registerCommand("mepie", {
-		description: "Manage Mepie extensions and tool rendering",
-		getArgumentCompletions(prefix) {
-			const choices = ["tool", ...TOOL_RENDER_MODES.map((mode) => `tool ${mode}`)];
-			const items = choices.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
-			return items.length ? items : null;
-		},
+		description: "Manage Mepie extensions",
 		handler: (args, ctx) => Effect.runPromise(
 			Effect.tryPromise({
 				try: () => {
-					if (args.trim().split(/\s+/)[0] === "tool") return changeToolRenderMode(args, activeMode, ctx);
 					if (args.trim()) {
 						if (ctx.hasUI) ctx.ui.notify(USAGE, "error");
 						return Promise.resolve();

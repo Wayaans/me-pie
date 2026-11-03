@@ -109,7 +109,6 @@ test("dashboard refreshes model state after its session reset", async () => {
 			setFooter(factory: typeof footerFactory) {
 				footerFactory = factory;
 			},
-			setTitle() {},
 		},
 	};
 
@@ -119,7 +118,7 @@ test("dashboard refreshes model state after its session reset", async () => {
 	const footer = footerFactory(
 		{ requestRender() {} },
 		{ fg: (_color: string, text: string) => text },
-		{ getExtensionStatuses: () => new Map([["codex-usage", "◷ 5h 73%"]]) },
+		{ getExtensionStatuses: () => new Map([["example", "◷ 5h 73%"]]) },
 	);
 	const lines = footer.render(120);
 	assert.equal(lines.length, 2);

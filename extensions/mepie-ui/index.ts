@@ -88,7 +88,6 @@ export default function mepieUi(pi: ExtensionAPI): void {
 	registerModelInfo(pi);
 	registerGitInfo(pi);
 
-	let title = "mepie";
 	let modelInfo = emptyModelInfoState();
 	let gitInfo = emptyGitInfoState();
 	let requestRender: (() => void) | undefined;
@@ -155,12 +154,9 @@ export default function mepieUi(pi: ExtensionAPI): void {
 				},
 			};
 		});
-
-		ctx.ui.setTitle(`mepie · ${title}`);
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		title = formatDirectory(ctx.cwd);
 		modelInfo = emptyModelInfoState();
 		gitInfo = emptyGitInfoState();
 		install(ctx);

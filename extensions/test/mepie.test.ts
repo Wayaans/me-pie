@@ -20,10 +20,10 @@ function choices(entries: Record<string, boolean>) {
 }
 
 test("global disable wins over every project choice", () => {
-	const global = choices({ webweb: false, answer: true });
+	const global = choices({ webweb: false, "ask-me": true });
 	assert.equal(isExtensionEnabled("webweb", global, choices({ webweb: true })), false);
-	assert.equal(isExtensionEnabled("answer", global, choices({ answer: false })), false);
-	assert.equal(isExtensionEnabled("answer", global, new Map()), true);
+	assert.equal(isExtensionEnabled("ask-me", global, choices({ "ask-me": false })), false);
+	assert.equal(isExtensionEnabled("ask-me", global, new Map()), true);
 	assert.equal(isExtensionEnabled("localize", new Map(), new Map()), true);
 });
 
@@ -34,13 +34,13 @@ test("extension settings reject unknown ids and non-boolean values", () => {
 });
 
 test("saving extension choices keeps other settings and stores only disabled ids", () => {
-	const settings = { toolRenderMode: "custom", extensions: { answer: true, webweb: false } };
-	assert.deepEqual(withExtensionChoices(settings, new Set(["localize"])), { toolRenderMode: "custom", extensions: { localize: false } });
-	assert.deepEqual(withExtensionChoices(settings, new Set()), { toolRenderMode: "custom" });
+	const settings = { localize: { thinking: "low" }, extensions: { "ask-me": true, webweb: false } };
+	assert.deepEqual(withExtensionChoices(settings, new Set(["localize"])), { localize: { thinking: "low" }, extensions: { localize: false } });
+	assert.deepEqual(withExtensionChoices(settings, new Set()), { localize: { thinking: "low" } });
 });
 
 function fakeExtensions(loaded: string[]) {
-	const ids: MepieExtensionId[] = ["answer", "localize", "webweb"];
+	const ids: MepieExtensionId[] = ["ask-me", "localize", "webweb"];
 	return ids.map((id) => ({
 		id,
 		load: async () => ({
@@ -56,7 +56,7 @@ test("loader applies global and project settings and isolates failing extensions
 	const agentDir = mkdtempSync(join(tmpdir(), "mepie-loader-agent-"));
 	const cwd = mkdtempSync(join(tmpdir(), "mepie-loader-project-"));
 	writeJson(globalSettingsPath(agentDir), { extensions: { webweb: false } });
-	writeJson(projectSettingsPath(cwd), { extensions: { webweb: true, answer: false } });
+	writeJson(projectSettingsPath(cwd), { extensions: { webweb: true, "ask-me": false } });
 
 	const loaded: string[] = [];
 	const pi = {} as ExtensionAPI;
@@ -69,7 +69,7 @@ test("loader applies global and project settings and isolates failing extensions
 	new ProjectTrustStore(agentDir).set(cwd, false);
 	loaded.length = 0;
 	await loadEnabledExtensions(pi, { cwd, agentDir, extensions: fakeExtensions(loaded) });
-	assert.deepEqual(loaded, ["answer"]);
+	assert.deepEqual(loaded, ["ask-me"]);
 });
 
 test("loader warns and ignores malformed settings", async () => {
@@ -81,7 +81,7 @@ test("loader warns and ignores malformed settings", async () => {
 
 	const loaded: string[] = [];
 	const warnings = await loadEnabledExtensions({} as ExtensionAPI, { cwd, agentDir, extensions: fakeExtensions(loaded) });
-	assert.deepEqual(loaded, ["answer", "webweb"]);
+	assert.deepEqual(loaded, ["ask-me", "webweb"]);
 	assert.equal(warnings.filter((warning) => warning.startsWith("Ignoring Mepie extension settings")).length, 2);
 });
 
@@ -91,14 +91,14 @@ test("project manager locks globally disabled extensions and preserves their pro
 	const cwd = mkdtempSync(join(tmpdir(), "mepie-manager-project-"));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	try {
-		writeJson(globalSettingsPath(agentDir), { toolRenderMode: "simple", extensions: { webweb: false } });
-		writeJson(projectSettingsPath(cwd), { answer: { thinking: "low" }, extensions: { webweb: false } });
+		writeJson(globalSettingsPath(agentDir), { extensions: { webweb: false } });
+		writeJson(projectSettingsPath(cwd), { localize: { thinking: "low" }, extensions: { webweb: false } });
 
 		let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
-		registerMepieCommand({ registerCommand: (_name, value) => { command = value; } }, "compact");
+		registerMepieCommand({ registerCommand: (_name, value) => { command = value; } });
 		assert.ok(command);
 
-		const picks = ["This project", "webweb", "answer", "Apply changes"];
+		const picks = ["This project", "webweb", "ask-me", "Apply changes"];
 		const notices: string[] = [];
 		let reloaded = false;
 		const ctx = {
@@ -120,8 +120,8 @@ test("project manager locks globally disabled extensions and preserves their pro
 		assert.match(notices[0] ?? "", /webweb is disabled globally/);
 		assert.equal(reloaded, true);
 		assert.deepEqual(JSON.parse(readFileSync(projectSettingsPath(cwd), "utf8")), {
-			answer: { thinking: "low" },
-			extensions: { answer: false, webweb: false },
+			localize: { thinking: "low" },
+			extensions: { "ask-me": false, webweb: false },
 		});
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;

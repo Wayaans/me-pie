@@ -47,20 +47,14 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` d
 ## Included extensions
 
 - [`ask-me`](extensions/ask-me/README.md): interview the user locally or through Telegram. Configure once with `/ask-me setup` on macOS, then use `/ask-me afk` or `pi --afk`.
-- `answer` — extract questions from the latest assistant response into an interactive Q&A.
-- `checkpoint-compaction` — replace Pi compaction summaries with structured continuation checkpoints.
 - `codemode-ui`: render `codemode` rows as a live activity line (`Running bun run check · 3 tools · 4.0s`). Expand a row to list every nested call as a tree, followed by a capped script preview.
-- `codex-usage` — show OpenAI Codex subscription usage.
 - `file-search` — provide first-class, bounded `fd` and `rg` search tools.
 - `find-docs` — retrieve current Context7 documentation.
-- `pi-github` — typed GitHub repository, issue, pull request, comment, and relation operations plus autocomplete.
 - `localize`: compose English prompts from instructions or refine wording while preserving structure before submission.
 - `mepie` — load the other extensions and enable or disable them globally or for the current project with `/mepie`.
 - `webweb` — web search, fetch, and cached reads through `ww_search`, `ww_fetch`, and `ww_read`.
 - `mepie-ui` — add a theme-aware model, context, cost, and Git dashboard footer.
-- `mepie-tool-ui`: render built-in tools as compact conversation rows with expandable output. Show known targets while arguments stream, keep unfinished names muted, and use `toolTitle` on success or `error` on failure. Collapsed skill reads show `󰚩 skill-name` with the same name colors. Nerd Font required.
 - `skill-shortcut` — invoke loaded skills with `$skill-name`.
-- `terminal-environment` — expose one tmux-backed `workspace` tool for raw target operations and managed Agent Runs / Work Cycles.
 
 ## Configuration
 
@@ -71,9 +65,7 @@ Mepie reads one `mepie.json` per scope:
 
 ```json
 {
-  "toolRenderMode": "custom",
   "extensions": { "webweb": false, "localize": false },
-  "answer": { "model": "openai-codex/gpt-5.4-mini", "thinking": "medium" },
   "localize": { "model": "openai-codex/gpt-5.4-mini", "thinking": "low" }
 }
 ```
@@ -94,34 +86,7 @@ Pi does not give extension factories the session directory or the trust decision
 
 ### Feature settings
 
-`toolRenderMode` is global only. `answer` and `localize` merge field by field: project values override global values, which override package defaults. Projects must be trusted for their values to apply.
-
-## Tool rendering
-
-`/mepie` still opens the extension manager. Use `/mepie tool` to see the active rendering mode, or select one:
-
-- `/mepie tool compact`: borderless Mepie summaries with tight spacing. This is the default.
-- `/mepie tool builtin`: native Pi rendering for built-in tools and generic Pi rendering for `fd` and `rg`.
-- `/mepie tool simple`: Mepie summaries and expandable details inside Pi's normal padded, background-colored tool shell.
-- `/mepie tool custom`: compact rendering except for `edit` and `write`. These keep Mepie headers and summaries inside Pi's native boxes, with native diff/content previews and expand/collapse behavior. Boxed rows keep normal spacing.
-
-Changing modes waits for idle, saves the preference, and reloads Pi automatically. Selecting the active mode does nothing. This changes rendering only, not enabled tools or extensions. Bash's optional `purpose` argument works in every mode. Thinking-text styling is unchanged.
-
-Both `mepie-tool-ui` and `file-search` read the global `toolRenderMode` preference from the global `mepie.json`. File search honors it even when `mepie-tool-ui` is disabled. Missing settings use `compact`. Invalid settings produce a warning and fall back to `compact`; fix the file before saving a different mode. Mepie does not overwrite invalid settings.
-
-## Managed Agent Runs and Work Cycles
-
-`workspace` remains one tool with the existing `spawn`, `run`, `send`, `wait`, and `close` actions. Raw target-based calls remain backward compatible. A successful `run` returns a UUID Run ID while retaining tmux target diagnostics.
-
-For verified Pi lifecycle support:
-
-1. Run an agent and keep its `runId`.
-2. Send one task with `send: { kind: "task", runId, input: "prompt", text }`. This creates a `workId` and delivery UUID and resolves the target internally.
-3. The managed transport wraps correlation privately, then the child input hook removes it before prompt-template or skill expansion and binds the exact Work Cycle. The Pi worker reports through the same action with `send: { kind: "result", outcome: "completed" | "blocked" | "failed", text }`; the result is stored durably and is not pasted into the controller terminal.
-4. Wait with `{ runId, workId? }` until both **Result Received** and **Work Finished** are recorded. A result/finish pair leaves the process and tmux target open for another Work Cycle.
-5. Close only with `close: { runId }` when the Agent Run should actually end.
-
-Pi readiness and Work Finished are verified through bounded launch/readiness coordination. Only verified Pi runs accept managed Work Cycles; Codex, Claude, and OpenCode retain UUID/process-started persistence and raw target operations but never claim verified Work Finished. The shared per-tmux-instance ledger uses owner-only files, locking, atomic writes, bounded result payloads, UUID correlation, and bounded historical retention. Pi session snapshot entries are validated branch-local diagnostics; the ledger remains runtime authority.
+`localize` merges field by field: project values override global values, which override package defaults. Projects must be trusted for their values to apply.
 
 ## Webweb exposure limits
 
