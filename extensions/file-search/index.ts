@@ -19,7 +19,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Cause, Data, Effect, Exit } from "effect";
-import { Type, type Static } from "typebox";
+import { Type } from "typebox";
 import { StringEnum } from "../mepie/string-enum.ts";
 import {
   buildFdArgs,
@@ -52,17 +52,6 @@ import {
   RG_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
 import { discardCapturedOutput, executeSearchProcess } from "./src/process.ts";
-import {
-  registerMepieToolSpacing,
-  resultText,
-  searchTarget,
-  withMepieToolUi,
-  type SummaryPart,
-  type ToolView,
-} from "../mepie-tool-ui/tool-renderer.ts";
-import { TOOL_ICONS } from "../mepie-tool-ui/tool-icons.ts";
-import { registerNestedToolView } from "../mepie-tool-ui/nested-views.ts";
-import { loadToolRenderMode } from "../mepie/tool-mode.ts";
 
 export function makeBinaryInitializers(
   binDir: string,
@@ -130,11 +119,6 @@ function unwrapToolExit<A, E>(exit: Exit.Exit<A, E>, tool: "fd" | "rg") {
 }
 
 export default function fileSearchTools(pi: ExtensionAPI) {
-  const mode = loadToolRenderMode(pi);
-  registerMepieToolSpacing(pi, mode, ["fd", "rg"]);
-  registerNestedToolView("fd", fdView);
-  registerNestedToolView("rg", rgView);
-
   let notified = false;
 
   const binDir = repositoryBinDir();
@@ -268,7 +252,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     },
 
   };
-  pi.registerTool(mode === "builtin" ? fdDefinition : withMepieToolUi(fdDefinition, fdView, mode));
+  pi.registerTool(fdDefinition);
 
   const rgDefinition: ToolDefinition<
     ReturnType<typeof rgParameters>,
@@ -313,57 +297,8 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     },
 
   };
-  pi.registerTool(mode === "builtin" ? rgDefinition : withMepieToolUi(rgDefinition, rgView, mode));
+  pi.registerTool(rgDefinition);
 }
-
-const fdView: ToolView<Static<ReturnType<typeof fdParameters>>, FdToolDetails> = {
-  icon: TOOL_ICONS.files,
-  label: "Fd",
-  targetTruncation: "end",
-  target: (args, _cwd, argsComplete) => searchTarget(
-    args.pattern || (argsComplete ? "(all)" : undefined),
-    args.path || (argsComplete ? "." : undefined),
-  ),
-  summary(_args, result) {
-    const details = result.details;
-    const count = details?.matchCount ?? 0;
-    const parts: SummaryPart[] = [
-      { text: `${count} ${count === 1 ? "entry" : "entries"}` },
-    ];
-    if (details?.truncated) {
-      parts.push({ text: "truncated", color: "warning" });
-    }
-    return parts;
-  },
-  expanded(_args, result, theme) {
-    return resultText(result, theme);
-  },
-};
-
-const rgView: ToolView<Static<ReturnType<typeof rgParameters>>, RgToolDetails> = {
-  icon: TOOL_ICONS.search,
-  label: "Rg",
-  targetTruncation: "end",
-  target: (args, _cwd, argsComplete) => searchTarget(
-    args.pattern === undefined ? undefined : `/${args.pattern}/`,
-    args.path || (argsComplete ? "." : undefined),
-  ),
-  summary(args, result) {
-    const details = result.details;
-    const count = details?.outputLines ?? 0;
-    const parts: SummaryPart[] = [];
-    if (args.glob) parts.push({ text: args.glob, color: "muted" });
-    if (args.file_type) parts.push({ text: args.file_type, color: "muted" });
-    parts.push({ text: `${count} ${count === 1 ? "line" : "lines"}` });
-    if (details?.truncated) {
-      parts.push({ text: "truncated", color: "warning" });
-    }
-    return parts;
-  },
-  expanded(_args, result, theme) {
-    return resultText(result, theme);
-  },
-};
 
 function fdParameters() {
   return Type.Object({

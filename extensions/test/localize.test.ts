@@ -172,7 +172,7 @@ test("localize config merges project overrides", () => {
 test("localize config writes preserve sibling Mepie settings", () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "mepie-localize-write-"));
 	const configPath = projectSettingsPath(cwd);
-	writeJson(configPath, { answer: { model: "openai-codex/gpt-6.1-sol", thinking: "medium" }, extensions: { webweb: false } });
+	writeJson(configPath, { example: { model: "openai-codex/gpt-6.1-sol", thinking: "medium" }, extensions: { webweb: false } });
 
 	const config = {
 		composerPrompt: "Compose a prompt.",
@@ -183,7 +183,7 @@ test("localize config writes preserve sibling Mepie settings", () => {
 	updateProjectLocalizeConfig(cwd, config);
 
 	const saved = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
-	assert.deepEqual(saved.answer, { model: "openai-codex/gpt-6.1-sol", thinking: "medium" });
+	assert.deepEqual(saved.example, { model: "openai-codex/gpt-6.1-sol", thinking: "medium" });
 	assert.deepEqual(saved.extensions, { webweb: false });
 	assert.deepEqual(saved.localize, config);
 	assert.deepEqual(loadMergedLocalizeConfig(cwd), config);
