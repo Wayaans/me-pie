@@ -20,7 +20,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Cause, Data, Effect, Exit } from "effect";
 import { Type, type Static } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum } from "../mepie/string-enum.ts";
 import {
   buildFdArgs,
   buildRgArgs,

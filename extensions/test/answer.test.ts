@@ -77,8 +77,11 @@ test("recommendations prefill only empty answers", () => {
 });
 
 test("max thinking falls back to the highest level supported by older pi models", () => {
-	const model = getModel("openai-codex", "gpt-5.5");
-	assert.ok(model);
+	const catalogModel = getModel("openai-codex", "gpt-6-sol");
+	assert.ok(catalogModel);
+	// Every current catalog model supports max, so simulate an older model without it.
+	const { max: _max, ...levelsWithoutMax } = catalogModel.thinkingLevelMap ?? {};
+	const model = { ...catalogModel, thinkingLevelMap: levelsWithoutMax };
 	assert.equal(resolveExtractionThinking(model, "off"), "off");
 	assert.equal(resolveExtractionThinking(model, "medium"), "medium");
 	assert.equal(resolveExtractionThinking(model, "max"), "xhigh");
@@ -143,16 +146,16 @@ test("answer config writes preserve sibling Mepie settings and reject malformed 
 	const configPath = projectSettingsPath(cwd);
 	writeJson(configPath, { extensions: { webweb: false }, localize: { thinking: "low" } });
 
-	updateProjectAnswerConfig(cwd, { model: "openai-codex/gpt-5.5", thinking: "medium" });
+	updateProjectAnswerConfig(cwd, { model: "openai-codex/gpt-6.1-sol", thinking: "medium" });
 
 	assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
 		extensions: { webweb: false },
 		localize: { thinking: "low" },
-		answer: { model: "openai-codex/gpt-5.5", thinking: "medium" },
+		answer: { model: "openai-codex/gpt-6.1-sol", thinking: "medium" },
 	});
 
 	fs.writeFileSync(configPath, "{broken");
-	assert.throws(() => updateProjectAnswerConfig(cwd, { model: "openai-codex/gpt-5.5", thinking: "low" }), /Cannot read/);
+	assert.throws(() => updateProjectAnswerConfig(cwd, { model: "openai-codex/gpt-6.1-sol", thinking: "low" }), /Cannot read/);
 	assert.equal(fs.readFileSync(configPath, "utf-8"), "{broken");
 });
 
