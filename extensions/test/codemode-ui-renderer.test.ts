@@ -83,9 +83,8 @@ test("a finished row collapses to a summary, adding one line for a failure", () 
 	assert.deepEqual(scriptError.lines(), ["Script failed · 400ms", "╰─ ReferenceError: x is not defined"]);
 });
 
-test("an expanded row lists every call, then a capped script preview without output", () => {
-	const code = Array.from({ length: 14 }, (_, index) => `const value${index} = "${"x".repeat(150)}";`).join("\n");
-	const row = codemodeRow(code);
+test("an expanded row lists every call and nothing else", () => {
+	const row = codemodeRow("const hidden = await tools.read({ path: 'SCRIPT CODE' });");
 	const calls = Array.from({ length: 12 }, (_, index): NestedCall => ({ ...read, args: `{"path":"/repo/file${index}.ts"}` }));
 	final(row, calls, false, "Script completed\nWall time 0.4 seconds\nOutput:\nSCRIPT OUTPUT");
 	row.component.setExpanded(true);
@@ -93,11 +92,8 @@ test("an expanded row lists every call, then a capped script preview without out
 	assert.equal(lines[0], "Ran 12 tools · 400ms");
 	assert.equal(lines.filter((line) => /^(├─|╰─) ✓ read {2}file\d+\.ts/.test(line)).length, 12);
 	assert.match(lines[12] ?? "", /^╰─ ✓ read {2}file11\.ts +12ms$/);
-	const preview = lines.slice(13);
-	assert.equal(preview.length, 11);
-	assert.ok(preview.slice(0, 10).every((line) => line.length <= 100 && line.endsWith("…")));
-	assert.equal(preview[10], "… 4 more lines");
-	assert.ok(!lines.some((line) => line.includes("SCRIPT OUTPUT")));
+	assert.equal(lines.length, 13);
+	assert.ok(!lines.some((line) => line.includes("SCRIPT OUTPUT") || line.includes("SCRIPT CODE")));
 });
 
 test("the elapsed-time timer runs only while the script runs", () => {

@@ -18,7 +18,7 @@ When the script finishes, the line becomes a summary, such as `Ran 5 tools · 2.
 
 ## Expanded
 
-The summary line, then every nested call as a tree with its status, target, and duration, and the first lines of each call error. After the tree comes the script, capped at 10 lines of 100 columns. The script output is not shown.
+The summary line, then every nested call as a tree with its status, target, and duration, and the first lines of each call error. The script and its output are not shown.
 
 ## Notes
 
