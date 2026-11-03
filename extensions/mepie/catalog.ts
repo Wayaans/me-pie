@@ -12,6 +12,7 @@ export const MEPIE_EXTENSIONS = [
 	{ id: "answer", description: "Answer assistant questions interactively", load: () => import("../answer/index.ts") },
 	{ id: "ask-me", description: "Ask structured interactive questions", load: () => import("../ask-me/index.ts") },
 	{ id: "checkpoint-compaction", description: "Create structured continuation checkpoints", load: () => import("../checkpoint-compaction/index.ts") },
+	{ id: "codemode-ui", description: "Render codemode as a live activity line with a call tree", load: () => import("../codemode-ui/index.ts") },
 	{ id: "codex-usage", description: "Show Codex subscription usage", load: () => import("../codex-usage/index.ts") },
 	{ id: "file-search", description: "Add bounded fd and rg search tools", load: () => import("../file-search/index.ts") },
 	{ id: "find-docs", description: "Retrieve current Context7 documentation", load: () => import("../find-docs/index.ts") },
