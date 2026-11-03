@@ -1,5 +1,4 @@
 import {
-	highlightCode,
 	type AgentToolResult,
 	type Theme,
 	type ThemeColor,
@@ -34,8 +33,6 @@ type RowContext = Omit<Parameters<NonNullable<ToolRenderers["renderCall"]>>[2], 
 	readonly args: unknown;
 };
 
-const CODE_PREVIEW_LINES = 10;
-const CODE_PREVIEW_WIDTH = 100;
 const CALL_ERROR_LINES = 5;
 const SCRIPT_ERROR_MARKER = "Script error:\n";
 
@@ -142,8 +139,6 @@ function expandedLines(
 		return callLines(call, isLast, nameWidth, context.cwd, theme, width);
 	});
 	if (scriptFailed) lines.push(branchLine(theme.fg("dim", "╰─ "), theme.fg("error", failure), width));
-	const code = typeof context.args === "object" && context.args !== null && "code" in context.args ? context.args.code : undefined;
-	if (typeof code === "string" && code.trim() !== "") lines.push(...(lines.length > 0 ? [""] : []), ...codePreview(code, theme, width));
 	return lines;
 }
 
@@ -167,14 +162,6 @@ function callLines(call: NestedCall, isLast: boolean, nameWidth: number, cwd: st
 			branchLine(`${continuation}${theme.fg("dim", index === errorLines.length - 1 ? "╰─ " : "├─ ")}`, theme.fg("error", line), width),
 		),
 	];
-}
-
-function codePreview(code: string, theme: Theme, width: number): string[] {
-	const lines = highlightCode(code.replaceAll("\r", "").replaceAll("\t", "  ").trimEnd(), "javascript");
-	const lineWidth = Math.min(width, CODE_PREVIEW_WIDTH);
-	const shown = lines.slice(0, CODE_PREVIEW_LINES).map((line) => truncateToWidth(line, lineWidth, "…"));
-	const hidden = lines.length - shown.length;
-	return hidden > 0 ? [...shown, theme.fg("muted", `… ${hidden} more ${hidden === 1 ? "line" : "lines"}`)] : shown;
 }
 
 function branchLine(prefix: string, text: string, width: number): string {
