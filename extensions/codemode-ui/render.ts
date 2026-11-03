@@ -6,7 +6,7 @@ import {
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { describeCall, inline } from "./activity.ts";
+import { describeCall, inline, summarizeCalls } from "./activity.ts";
 
 type CallStatus = "running" | "ok" | "error" | "cancelled";
 
@@ -52,7 +52,7 @@ export const codemodeRenderers: ToolRenderers = {
 		context.state.calls = calls;
 		context.state.failure = failure;
 		if (!options.expanded) {
-			return new Lines((width) => (failure ? [branchLine(theme.fg("dim", "╰─ "), theme.fg("error", failure), width)] : []));
+			return new Lines((width) => (failure ? [branchLine(theme.fg("dim", "  ⎿  "), theme.fg("error", failure), width)] : []));
 		}
 		return new Lines((width) => expandedLines(calls, failure, context, theme, width));
 	},
@@ -87,6 +87,39 @@ function syncTimer(context: RowContext): void {
 }
 
 function headerText(context: RowContext, theme: Theme): string {
+	return context.expanded ? expandedHeader(context, theme) : collapsedHeader(context, theme);
+}
+
+/**
+ * A Claude Code style group line: a status bullet, then the calls summarized by kind, with the call in
+ * progress last while the script runs: `⏺ Read 2 files, running bun run check · 1.2s`.
+ */
+function collapsedHeader(context: RowContext, theme: Theme): string {
+	const calls: readonly NestedCall[] = context.state.calls ?? [];
+	if (context.isPartial && !context.isError) {
+		const bullet = theme.fg("muted", "⏺");
+		if (!context.executionStarted) return `${bullet} ${theme.fg("toolTitle", theme.bold("Preparing script"))}`;
+		const running = calls.filter((call) => call.status === "running").at(-1);
+		const done = summarizeCalls(calls.filter((call) => call.status !== "running"));
+		const current = running ? lowerFirst(describeCall(running.name, running.args, context.cwd).status) : undefined;
+		const summary = [done, current].filter((part) => part).join(", ") || "executing script";
+		const startedAt = context.state.startedAt;
+		const elapsed = startedAt === undefined ? undefined : formatDuration(Date.now() - startedAt);
+		return `${bullet} ${header(theme.fg("toolTitle", theme.bold(upperFirst(summary))), [elapsed], theme)}`;
+	}
+	const failed = calls.filter((call) => call.status === "error").length;
+	const cancelled = calls.filter((call) => call.status === "cancelled").length;
+	const isFailure = context.isError || failed > 0;
+	const summary = calls.length > 0 ? upperFirst(summarizeCalls(calls)) : context.isError ? "Script failed" : "Ran script";
+	const bullet = theme.fg(isFailure ? "error" : "success", "⏺");
+	return `${bullet} ${header(theme.fg(isFailure ? "error" : "toolTitle", theme.bold(summary)), [
+		failed > 0 ? theme.fg("error", `${failed} failed`) : undefined,
+		cancelled > 0 ? `${cancelled} cancelled` : undefined,
+		context.durationMs === undefined ? undefined : formatDuration(context.durationMs),
+	], theme)}`;
+}
+
+function expandedHeader(context: RowContext, theme: Theme): string {
 	const calls: readonly NestedCall[] = context.state.calls ?? [];
 	const count = calls.length > 0 ? `${calls.length} ${calls.length === 1 ? "tool" : "tools"}` : undefined;
 	if (context.isPartial && !context.isError) {
@@ -218,6 +251,14 @@ function textLines(text: string): string[] {
 
 function firstLine(text: string): string | undefined {
 	return textLines(text)[0];
+}
+
+function upperFirst(text: string): string {
+	return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function lowerFirst(text: string): string {
+	return text.charAt(0).toLowerCase() + text.slice(1);
 }
 
 function formatDuration(ms: number): string {

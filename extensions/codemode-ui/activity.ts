@@ -60,6 +60,70 @@ export function describeCall(name: string, argsPreview: string, cwd: string): Ca
 	}
 }
 
+/** One kind of call in a summary: calls with the same `key` count together under one phrase. */
+interface CallGroup {
+	readonly key: string;
+	readonly phrase: (count: number) => string;
+}
+
+/**
+ * Summarize calls by kind, in order of first appearance, the way Claude Code collapses a tool group:
+ * `read 3 files, searched 2 patterns, ran bun run check`. A single bash call names its command.
+ */
+export function summarizeCalls(calls: readonly { readonly name: string; readonly args: string }[]): string {
+	const groups = new Map<string, { readonly group: CallGroup; count: number }>();
+	for (const call of calls) {
+		const group = callGroup(call.name, call.args);
+		const entry = groups.get(group.key);
+		if (entry) entry.count++;
+		else groups.set(group.key, { group, count: 1 });
+	}
+	return [...groups.values()].map(({ group, count }) => group.phrase(count)).join(", ");
+}
+
+function callGroup(name: string, argsPreview: string): CallGroup {
+	const counted = (verb: string, singular: string, plural: string): CallGroup => ({
+		key: `${verb} ${plural}`,
+		phrase: (count) => (count === 1 ? `${verb} 1 ${singular}` : `${verb} ${count} ${plural}`),
+	});
+	switch (name) {
+		case "bash": {
+			const command = argReader(argsPreview)("command");
+			const only = lastCommand(command?.text ?? "", command?.cut ?? false);
+			return { key: "bash", phrase: (count) => (count === 1 && only ? `ran ${only}` : counted("ran", "command", "commands").phrase(count)) };
+		}
+		case "read":
+			return counted("read", "file", "files");
+		case "edit":
+			return counted("edited", "file", "files");
+		case "write":
+			return counted("wrote", "file", "files");
+		case "rg":
+		case "grep":
+		case "fd":
+		case "find":
+			return counted("searched", "pattern", "patterns");
+		case "ls":
+			return counted("listed", "directory", "directories");
+		case "ww_fetch":
+			return counted("fetched", "page", "pages");
+		case "ww_search":
+			return counted("ran", "web search", "web searches");
+		case "ww_read":
+			return counted("read", "cached source", "cached sources");
+		case "find_docs":
+			return counted("looked up", "library's docs", "libraries' docs");
+		case "models.classify":
+			return counted("ran", "classification", "classifications");
+		case "models.generateImages":
+			return counted("ran", "image generation", "image generations");
+		default: {
+			const tool = inline(name);
+			return { key: `called ${tool}`, phrase: (count) => (count === 1 ? `called ${tool}` : `called ${tool} ${count} times`) };
+		}
+	}
+}
+
 /**
  * The command a bash call ends with: the last part of a `&&`, `||`, `;`, or newline chain, without
  * leading environment assignments, redirections, or the commands it pipes into.

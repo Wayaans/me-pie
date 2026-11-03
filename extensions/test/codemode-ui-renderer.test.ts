@@ -4,7 +4,7 @@ import { initTheme, ToolExecutionComponent, type ExtensionAPI, type Theme, type 
 import type { TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import codemodeUi from "../codemode-ui/index.ts";
-import { describeCall, lastCommand } from "../codemode-ui/activity.ts";
+import { describeCall, lastCommand, summarizeCalls } from "../codemode-ui/activity.ts";
 import { codemodeRenderers, type CodemodeRowState, type NestedCall } from "../codemode-ui/render.ts";
 
 initTheme();
@@ -62,6 +62,18 @@ test("nested calls describe their activity from truncated argument previews", ()
 	assert.deepEqual(describeCall("mystery", '{"x":1}', cwd), { status: "Calling mystery", target: '{"x":1}' });
 });
 
+test("collapsed summaries group calls by kind in order of first appearance", () => {
+	const call = (name: string, args = "{}") => ({ name, args });
+	assert.equal(
+		summarizeCalls([call("read"), call("rg"), call("read"), call("fd"), call("read")]),
+		"read 3 files, searched 2 patterns",
+	);
+	assert.equal(summarizeCalls([call("bash", '{"command":"cd /repo && bun run check"}')]), "ran bun run check");
+	assert.equal(summarizeCalls([call("bash", '{"command":"ls"}'), call("bash", '{"command":"pwd"}')]), "ran 2 commands");
+	assert.equal(summarizeCalls([call("mystery"), call("mystery")]), "called mystery 2 times");
+	assert.equal(summarizeCalls([]), "");
+});
+
 // Codemode's own argument preview: JSON cut at 200 characters, ending in "...".
 const preview = (args: object) => {
 	const json = JSON.stringify(args);
@@ -79,26 +91,26 @@ test("a bash command cut by the preview names its last whole step", () => {
 test("a running row shows the current call as one line", () => {
 	const row = codemodeRow();
 	row.component.markExecutionStarted();
-	assert.deepEqual(row.lines(), ["Executing script · 0ms"]);
+	assert.match(row.lines().join("\n"), /^⏺ Executing script · \d+ms$/);
 	row.component.updateResult({ content: [], details: { calls: [read, check] }, isError: false }, true);
 	const lines = row.lines();
 	assert.equal(lines.length, 1);
-	assert.match(lines[0] ?? "", /^Running bun run check · 2 tools · \d+ms$/);
+	assert.match(lines[0] ?? "", /^⏺ Read 1 file, running bun run check · \d+ms$/);
 	final(row, [read, { ...check, status: "ok", durationMs: 300 }]);
 });
 
 test("a finished row collapses to a summary, adding one line for a failure", () => {
 	const success = codemodeRow();
 	final(success, [read]);
-	assert.deepEqual(success.lines(), ["Ran 1 tool · 400ms"]);
+	assert.deepEqual(success.lines(), ["⏺ Read 1 file · 400ms"]);
 
 	const failed = codemodeRow();
 	final(failed, [read, { ...check, status: "error", durationMs: 900, error: "tsc exited with code 2\nat stack" }], true);
-	assert.deepEqual(failed.lines(), ["Ran 2 tools · 1 failed · 400ms", "╰─ bash: tsc exited with code 2"]);
+	assert.deepEqual(failed.lines(), ["⏺ Read 1 file, ran bun run check · 1 failed · 400ms", "⎿  bash: tsc exited with code 2"]);
 
 	const scriptError = codemodeRow();
 	final(scriptError, [], true, "Script failed\nWall time 0.1 seconds\nOutput:\nScript error:\nReferenceError: x is not defined\n\nNo tool calls were made.");
-	assert.deepEqual(scriptError.lines(), ["Script failed · 400ms", "╰─ ReferenceError: x is not defined"]);
+	assert.deepEqual(scriptError.lines(), ["⏺ Script failed · 400ms", "⎿  ReferenceError: x is not defined"]);
 });
 
 test("an expanded row lists every call and nothing else", () => {

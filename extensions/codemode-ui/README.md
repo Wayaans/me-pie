@@ -4,21 +4,23 @@ Renders `codemode` tool rows. Only the rendering changes. Codemode itself runs a
 
 ## Collapsed
 
-While the script runs, the row is one live line that names the nested call in progress, plus the call count and elapsed time:
+The row is one Claude Code style group line: a status bullet, then the nested calls summarized by kind in order of first appearance. While the script runs, the call in progress comes last, followed by the elapsed time:
 
 ```
-Running bun run check · 3 tools · 4.0s
+⏺ Read 2 files, running bun run check · 4.0s
 ```
+
+The bullet is muted while running, green on success, and red on failure. A single bash call names its command (`ran bun run check`); several read as `ran 3 commands`.
 
 - `bash` shows only the last command of a chain, without leading env assignments, redirections, or the commands it pipes into: `cd x && FOO=1 bun test 2>&1 | tail` becomes `Running bun test`. Codemode cuts call arguments at 200 characters. When the cut lands inside a chain, the line names the last step that came through whole, followed by `…`, for example `Running git push …`.
 - Known tools get a verb: `Reading`, `Editing`, `Writing`, `Searching`, `Finding`, `Fetching`, `Looking up`. Other tools show `Calling <name>`.
-- Between calls, the line reads `Executing script`.
+- Before the first call finishes or starts, the line reads `Executing script`.
 
-When the script finishes, the line becomes a summary, such as `Ran 5 tools · 2.3s`. If a call or the script failed, one line underneath names the error.
+When the script finishes, the line becomes the full summary, such as `⏺ Read 3 files, searched 2 patterns, ran bun run check · 2.3s`. If a call or the script failed, one `⎿` line underneath names the error.
 
 ## Expanded
 
-The summary line, then every nested call as a tree with its status, target, and duration, and the first lines of each call error. The script and its output are not shown.
+Unchanged by the collapsed style: the count line (`Ran 5 tools · 2.3s`), then every nested call as a tree with its status, target, and duration, and the first lines of each call error. The script and its output are not shown.
 
 ## Notes
 
