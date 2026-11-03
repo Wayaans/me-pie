@@ -47,7 +47,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` d
 ## Included extensions
 
 - [`ask-me`](extensions/ask-me/README.md): interview the user locally or through Telegram. Configure once with `/ask-me setup` on macOS, then use `/ask-me afk` or `pi --afk`.
-- `codemode-ui`: render `codemode` rows as a live activity line (`Running bun run check · 3 tools · 4.0s`). Expand a row to list every nested call as a tree, followed by a capped script preview.
+- `codemode-ui`: render `codemode` rows as a live activity line (`Running bun run check · 3 tools · 4.0s`). Expand a row to list every nested call as a tree.
 - `file-search` — provide first-class, bounded `fd` and `rg` search tools.
 - `find-docs` — retrieve current Context7 documentation.
 - `localize`: compose English prompts from instructions or refine wording while preserving structure before submission.

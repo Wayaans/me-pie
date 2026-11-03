@@ -43,7 +43,11 @@ function final(row: Row, calls: readonly NestedCall[], isError = false, text = "
 }
 
 test("bash calls show only the command the chain ends with", () => {
-	assert.equal(lastCommand("cd /repo && FOO=1 bun run check 2>&1 | tail -5"), "bun run check 2>&1");
+	assert.equal(lastCommand("cd /repo && FOO=1 bun run check 2>&1 | tail -5"), "bun run check");
+	assert.equal(lastCommand("rg -n foo src > /tmp/out.txt 2>/dev/null"), "rg -n foo src");
+	assert.equal(lastCommand("bun test &>/dev/null"), "bun test");
+	assert.equal(lastCommand("head -n 5 <input.txt"), "head -n 5");
+	assert.equal(lastCommand('echo "a > b"'), 'echo "a > b"');
 	assert.equal(lastCommand("git status; git diff --stat;"), "git diff --stat");
 	assert.equal(lastCommand('echo "a && b; c" | wc -l'), 'echo "a && b; c"');
 	assert.equal(lastCommand("python3 -c 'print(1)'\nsed -n 1,5p file.txt"), "sed -n 1,5p file.txt");
@@ -58,6 +62,20 @@ test("nested calls describe their activity from truncated argument previews", ()
 	assert.deepEqual(describeCall("mystery", '{"x":1}', cwd), { status: "Calling mystery", target: '{"x":1}' });
 });
 
+// Codemode's own argument preview: JSON cut at 200 characters, ending in "...".
+const preview = (args: object) => {
+	const json = JSON.stringify(args);
+	return json.length > 200 ? `${json.slice(0, 197)}...` : json;
+};
+
+test("a bash command cut by the preview names its last whole step", () => {
+	const chained = `cd /repo && git add -A && git commit -q -m "${"long message ".repeat(8)}" && git push 2>&1 | tail -1 && gh pr edit 4 --body-file /tmp/body.md`;
+	assert.equal(describeCall("bash", preview({ command: chained }), cwd).status, "Running git push …");
+	const single = `bun test ${"extensions/test/some-long-file.test.ts ".repeat(8)}`;
+	assert.match(describeCall("bash", preview({ command: single }), cwd).status, /^Running bun test extensions\/test\/.+ …$/);
+	assert.equal(describeCall("bash", preview({ command: "bun run check", timeout: 60 }), cwd).status, "Running bun run check");
+});
+
 test("a running row shows the current call as one line", () => {
 	const row = codemodeRow();
 	row.component.markExecutionStarted();
@@ -65,7 +83,7 @@ test("a running row shows the current call as one line", () => {
 	row.component.updateResult({ content: [], details: { calls: [read, check] }, isError: false }, true);
 	const lines = row.lines();
 	assert.equal(lines.length, 1);
-	assert.match(lines[0] ?? "", /^Running bun run check 2>&1 · 2 tools · \d+ms$/);
+	assert.match(lines[0] ?? "", /^Running bun run check · 2 tools · \d+ms$/);
 	final(row, [read, { ...check, status: "ok", durationMs: 300 }]);
 });
 
@@ -83,9 +101,8 @@ test("a finished row collapses to a summary, adding one line for a failure", () 
 	assert.deepEqual(scriptError.lines(), ["Script failed · 400ms", "╰─ ReferenceError: x is not defined"]);
 });
 
-test("an expanded row lists every call, then a capped script preview without output", () => {
-	const code = Array.from({ length: 14 }, (_, index) => `const value${index} = "${"x".repeat(150)}";`).join("\n");
-	const row = codemodeRow(code);
+test("an expanded row lists every call and nothing else", () => {
+	const row = codemodeRow("const hidden = await tools.read({ path: 'SCRIPT CODE' });");
 	const calls = Array.from({ length: 12 }, (_, index): NestedCall => ({ ...read, args: `{"path":"/repo/file${index}.ts"}` }));
 	final(row, calls, false, "Script completed\nWall time 0.4 seconds\nOutput:\nSCRIPT OUTPUT");
 	row.component.setExpanded(true);
@@ -93,11 +110,8 @@ test("an expanded row lists every call, then a capped script preview without out
 	assert.equal(lines[0], "Ran 12 tools · 400ms");
 	assert.equal(lines.filter((line) => /^(├─|╰─) ✓ read {2}file\d+\.ts/.test(line)).length, 12);
 	assert.match(lines[12] ?? "", /^╰─ ✓ read {2}file11\.ts +12ms$/);
-	const preview = lines.slice(13);
-	assert.equal(preview.length, 11);
-	assert.ok(preview.slice(0, 10).every((line) => line.length <= 100 && line.endsWith("…")));
-	assert.equal(preview[10], "… 4 more lines");
-	assert.ok(!lines.some((line) => line.includes("SCRIPT OUTPUT")));
+	assert.equal(lines.length, 13);
+	assert.ok(!lines.some((line) => line.includes("SCRIPT OUTPUT") || line.includes("SCRIPT CODE")));
 });
 
 test("the elapsed-time timer runs only while the script runs", () => {

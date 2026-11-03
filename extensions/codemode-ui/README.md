@@ -10,7 +10,7 @@ While the script runs, the row is one live line that names the nested call in pr
 Running bun run check · 3 tools · 4.0s
 ```
 
-- `bash` shows only the last command of a chain, without leading env assignments or the commands it pipes into: `cd x && FOO=1 bun test | tail` becomes `Running bun test`.
+- `bash` shows only the last command of a chain, without leading env assignments, redirections, or the commands it pipes into: `cd x && FOO=1 bun test 2>&1 | tail` becomes `Running bun test`. Codemode cuts call arguments at 200 characters. When the cut lands inside a chain, the line names the last step that came through whole, followed by `…`, for example `Running git push …`.
 - Known tools get a verb: `Reading`, `Editing`, `Writing`, `Searching`, `Finding`, `Fetching`, `Looking up`. Other tools show `Calling <name>`.
 - Between calls, the line reads `Executing script`.
 
@@ -18,7 +18,7 @@ When the script finishes, the line becomes a summary, such as `Ran 5 tools · 2.
 
 ## Expanded
 
-The summary line, then every nested call as a tree with its status, target, and duration, and the first lines of each call error. After the tree comes the script, capped at 10 lines of 100 columns. The script output is not shown.
+The summary line, then every nested call as a tree with its status, target, and duration, and the first lines of each call error. The script and its output are not shown.
 
 ## Notes
 
