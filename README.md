@@ -49,6 +49,7 @@ Each extension lives in a separate folder. The `pi` manifest in `package.json` d
 - [`ask-me`](extensions/ask-me/README.md): interview the user locally or through Telegram. Configure once with `/ask-me setup` on macOS, then use `/ask-me afk` or `pi --afk`.
 - `answer` — extract questions from the latest assistant response into an interactive Q&A.
 - `checkpoint-compaction` — replace Pi compaction summaries with structured continuation checkpoints.
+- `codemode-ui`: render `codemode` rows as a live activity line (`Running bun run check · 3 tools · 4.0s`). Expand a row to list every nested call as a tree, followed by a capped script preview.
 - `codex-usage` — show OpenAI Codex subscription usage.
 - `file-search` — provide first-class, bounded `fd` and `rg` search tools.
 - `find-docs` — retrieve current Context7 documentation.
