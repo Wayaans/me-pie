@@ -4,18 +4,30 @@ export interface CallActivity {
 	readonly target: string;
 }
 
-type ArgReader = (key: string) => string | undefined;
+/** A string argument; `cut` when codemode's 200-character preview ended inside it. */
+interface ArgValue {
+	readonly text: string;
+	readonly cut: boolean;
+}
+
+type ArgReader = (key: string) => ArgValue | undefined;
 
 /**
  * Describe a nested call from its name and codemode's argument preview, a JSON string that codemode
  * cuts at 200 characters, so it may not parse.
  */
 export function describeCall(name: string, argsPreview: string, cwd: string): CallActivity {
-	const arg = argReader(argsPreview);
+	const field = argReader(argsPreview);
+	const arg = (key: string) => {
+		const value = field(key);
+		return value?.cut ? `${value.text}…` : value?.text;
+	};
 	const path = () => relativePath(arg("path") ?? "", cwd);
 	switch (name) {
-		case "bash":
-			return activity("Running", lastCommand(arg("command") ?? ""));
+		case "bash": {
+			const command = field("command");
+			return activity("Running", lastCommand(command?.text ?? "", command?.cut ?? false));
+		}
 		case "read":
 			return activity("Reading", path());
 		case "edit":
@@ -51,10 +63,18 @@ export function describeCall(name: string, argsPreview: string, cwd: string): Ca
 /**
  * The command a bash call ends with: the last part of a `&&`, `||`, `;`, or newline chain, without
  * leading environment assignments, redirections, or the commands it pipes into.
+ *
+ * A `cut` command ends mid-step, so it names the last step that came through whole, marked with `…`.
  */
-export function lastCommand(command: string): string {
+export function lastCommand(command: string, cut = false): string {
 	const steps = splitOutsideQuotes(command, ["&&", "||", ";", "\n"]).filter((step) => step.trim() !== "");
-	const pipeline = splitOutsideQuotes(steps.at(-1) ?? "", ["|"]);
+	const wholeSteps = cut && steps.length > 1 ? steps.slice(0, -1) : steps;
+	const name = commandName(wholeSteps.at(-1) ?? "");
+	return cut && name ? `${name} …` : name;
+}
+
+function commandName(step: string): string {
+	const pipeline = splitOutsideQuotes(step, ["|"]);
 	const head = (pipeline[0] ?? "").replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, "");
 	return inline(withoutRedirections(head));
 }
@@ -93,8 +113,8 @@ function argReader(preview: string): ArgReader {
 	if (parsed) {
 		return (key) => {
 			const value = parsed[key];
-			if (typeof value === "string") return value;
-			if (Array.isArray(value) && typeof value[0] === "string") return value[0];
+			if (typeof value === "string") return { text: value, cut: false };
+			if (Array.isArray(value) && typeof value[0] === "string") return { text: value[0], cut: false };
 			return undefined;
 		};
 	}
@@ -110,11 +130,19 @@ function parseRecord(text: string): Readonly<Record<string, unknown>> | undefine
 	}
 }
 
-/** Read a string field, or the first string of an array field, from a JSON preview that was cut short. */
-function truncatedStringField(preview: string, key: string): string | undefined {
-	const match = new RegExp(`"${key}":\\[?"((?:[^"\\\\]|\\\\.)*)`).exec(preview);
+/**
+ * Read a string field, or the first string of an array field, from a JSON preview that was cut short.
+ * A field without its closing quote ran into the cut, which ends with codemode's `...` marker.
+ */
+function truncatedStringField(preview: string, key: string): ArgValue | undefined {
+	const match = new RegExp(`"${key}":\\[?"((?:[^"\\\\]|\\\\.)*)(")?`).exec(preview);
 	if (!match?.[1]) return undefined;
-	const raw = match[1];
+	const cut = match[2] === undefined;
+	const raw = cut ? match[1].replace(/\.\.\.$/, "") : match[1];
+	return { text: decodeJsonString(raw), cut };
+}
+
+function decodeJsonString(raw: string): string {
 	// The cut can split an escape sequence; drop an unpaired trailing backslash before decoding.
 	const closed = raw.replace(/\\+$/, (slashes) => (slashes.length % 2 === 1 ? slashes.slice(1) : slashes));
 	try {

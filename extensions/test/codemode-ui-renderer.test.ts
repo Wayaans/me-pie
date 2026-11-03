@@ -62,6 +62,20 @@ test("nested calls describe their activity from truncated argument previews", ()
 	assert.deepEqual(describeCall("mystery", '{"x":1}', cwd), { status: "Calling mystery", target: '{"x":1}' });
 });
 
+// Codemode's own argument preview: JSON cut at 200 characters, ending in "...".
+const preview = (args: object) => {
+	const json = JSON.stringify(args);
+	return json.length > 200 ? `${json.slice(0, 197)}...` : json;
+};
+
+test("a bash command cut by the preview names its last whole step", () => {
+	const chained = `cd /repo && git add -A && git commit -q -m "${"long message ".repeat(8)}" && git push 2>&1 | tail -1 && gh pr edit 4 --body-file /tmp/body.md`;
+	assert.equal(describeCall("bash", preview({ command: chained }), cwd).status, "Running git push …");
+	const single = `bun test ${"extensions/test/some-long-file.test.ts ".repeat(8)}`;
+	assert.match(describeCall("bash", preview({ command: single }), cwd).status, /^Running bun test extensions\/test\/.+ …$/);
+	assert.equal(describeCall("bash", preview({ command: "bun run check", timeout: 60 }), cwd).status, "Running bun run check");
+});
+
 test("a running row shows the current call as one line", () => {
 	const row = codemodeRow();
 	row.component.markExecutionStarted();
