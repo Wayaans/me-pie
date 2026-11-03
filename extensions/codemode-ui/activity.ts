@@ -50,13 +50,23 @@ export function describeCall(name: string, argsPreview: string, cwd: string): Ca
 
 /**
  * The command a bash call ends with: the last part of a `&&`, `||`, `;`, or newline chain, without
- * leading environment assignments or the commands it pipes into.
+ * leading environment assignments, redirections, or the commands it pipes into.
  */
 export function lastCommand(command: string): string {
 	const steps = splitOutsideQuotes(command, ["&&", "||", ";", "\n"]).filter((step) => step.trim() !== "");
 	const pipeline = splitOutsideQuotes(steps.at(-1) ?? "", ["|"]);
 	const head = (pipeline[0] ?? "").replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, "");
-	return inline(head);
+	return inline(withoutRedirections(head));
+}
+
+/**
+ * Redirections such as `2>&1` or `> out.txt` name where output goes, not what runs. They usually trail
+ * the command, so cut at the first unquoted `>` or `<`, along with a file descriptor (`2`, `&`) attached to it.
+ */
+function withoutRedirections(command: string): string {
+	const parts = splitOutsideQuotes(command, [">", "<"]);
+	const beforeRedirect = parts[0] ?? "";
+	return parts.length > 1 ? beforeRedirect.replace(/(^|\s)(?:\d+|&)$/, "$1") : beforeRedirect;
 }
 
 /** Collapse whitespace and drop control characters, which would break a one-line terminal row. */

@@ -43,7 +43,11 @@ function final(row: Row, calls: readonly NestedCall[], isError = false, text = "
 }
 
 test("bash calls show only the command the chain ends with", () => {
-	assert.equal(lastCommand("cd /repo && FOO=1 bun run check 2>&1 | tail -5"), "bun run check 2>&1");
+	assert.equal(lastCommand("cd /repo && FOO=1 bun run check 2>&1 | tail -5"), "bun run check");
+	assert.equal(lastCommand("rg -n foo src > /tmp/out.txt 2>/dev/null"), "rg -n foo src");
+	assert.equal(lastCommand("bun test &>/dev/null"), "bun test");
+	assert.equal(lastCommand("head -n 5 <input.txt"), "head -n 5");
+	assert.equal(lastCommand('echo "a > b"'), 'echo "a > b"');
 	assert.equal(lastCommand("git status; git diff --stat;"), "git diff --stat");
 	assert.equal(lastCommand('echo "a && b; c" | wc -l'), 'echo "a && b; c"');
 	assert.equal(lastCommand("python3 -c 'print(1)'\nsed -n 1,5p file.txt"), "sed -n 1,5p file.txt");
@@ -65,7 +69,7 @@ test("a running row shows the current call as one line", () => {
 	row.component.updateResult({ content: [], details: { calls: [read, check] }, isError: false }, true);
 	const lines = row.lines();
 	assert.equal(lines.length, 1);
-	assert.match(lines[0] ?? "", /^Running bun run check 2>&1 · 2 tools · \d+ms$/);
+	assert.match(lines[0] ?? "", /^Running bun run check · 2 tools · \d+ms$/);
 	final(row, [read, { ...check, status: "ok", durationMs: 300 }]);
 });
 
