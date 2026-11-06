@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { homedir } from "node:os";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import fileSearchTools, {
@@ -22,7 +24,7 @@ import {
 	type ReleaseAsset,
 	type ResolvedBinary,
 } from "../file-search/src/binaries.ts";
-import { formatOutput } from "../file-search/src/output.ts";
+import { formatOutput, partialErrorWarning } from "../file-search/src/output.ts";
 
 function makeEnvironment(options: { available?: string[]; failInstall?: boolean } = {}) {
 	const installed = new Set<string>();
@@ -152,7 +154,7 @@ test("large output is truncated and its complete form is persisted", async () =>
 	assert.equal(formatted.fullOutputPath, "/tmp/mepie-search/output.txt");
 });
 
-test("file-search registers fd and rg with Pi's default rendering", () => {
+function registerTools() {
 	const tools = new Map<string, ToolDefinition>();
 	const pi = {
 		on() {},
@@ -161,6 +163,62 @@ test("file-search registers fd and rg with Pi's default rendering", () => {
 		},
 	};
 	fileSearchTools(pi as unknown as ExtensionAPI);
+	return tools;
+}
+
+function runRg(params: Record<string, unknown>, cwd: string) {
+	const rg = registerTools().get("rg");
+	assert.ok(rg);
+	// The search tools read only `cwd` from the tool context.
+	const ctx = { cwd } as Parameters<ToolDefinition["execute"]>[4];
+	return rg.execute("call", params, undefined, undefined, ctx);
+}
+
+function resultText(result: Awaited<ReturnType<typeof runRg>>) {
+	return result.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+}
+
+test("file-search registers fd and rg with Pi's default rendering", () => {
+	const tools = registerTools();
 	assert.deepEqual([...tools.keys()], ["fd", "rg"]);
 	for (const tool of tools.values()) assert.equal(tool.renderCall, undefined);
+});
+
+test("partial-error warnings cap the listed stderr lines", () => {
+	const stderr = Array.from({ length: 8 }, (_, index) => `rg: ./file-${index}: Permission denied`).join("\n");
+	const warning = partialErrorWarning(`${stderr}\n`);
+	assert.match(warning, /results may be incomplete/);
+	assert.match(warning, /file-4: Permission denied/);
+	assert.doesNotMatch(warning, /file-5/);
+	assert.match(warning, /3 more error lines omitted/);
+});
+
+test("rg keeps matches found before an unreadable path", { skip: process.getuid?.() === 0 }, async () => {
+	const directory = await mkdtemp(join(tmpdir(), "mepie-rg-partial-"));
+	const unreadable = join(directory, "secret.txt");
+	try {
+		await writeFile(join(directory, "ok.txt"), "needle\n");
+		await writeFile(unreadable, "needle\n");
+		await chmod(unreadable, 0o000);
+
+		const text = resultText(await runRg({ pattern: "needle" }, directory));
+		assert.match(text, /ok\.txt:1:needle/);
+		assert.match(text, /results may be incomplete/);
+		assert.match(text, /secret\.txt/);
+	} finally {
+		await chmod(unreadable, 0o600).catch(() => undefined);
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("rg fails on exit 2 without output and reports exit 1 as no matches", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "mepie-rg-invalid-"));
+	try {
+		await writeFile(join(directory, "haystack.txt"), "hay\n");
+		await assert.rejects(runRg({ pattern: "(" }, directory), /rg failed: .*regex/s);
+		const text = resultText(await runRg({ pattern: "absent" }, directory));
+		assert.equal(text, "No matches found");
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
 });

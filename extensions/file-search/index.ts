@@ -40,7 +40,11 @@ import {
   type PlatformTarget,
   type ResolvedBinary,
 } from "./src/binaries.ts";
-import { formatCapturedOutput, type CapturedOutput } from "./src/output.ts";
+import {
+  formatCapturedOutput,
+  partialErrorWarning,
+  type CapturedOutput,
+} from "./src/output.ts";
 import {
   FD_PARAMETER_DESCRIPTIONS,
   FD_PROMPT_GUIDELINES,
@@ -87,6 +91,8 @@ interface SearchOutcome {
   readonly output: CapturedOutput;
   readonly noMatches: boolean;
   readonly binarySource: BinarySource;
+  /** Errors reported alongside partial results. */
+  readonly warning?: string | undefined;
 }
 
 export interface FdToolDetails {
@@ -180,6 +186,16 @@ export default function fileSearchTools(pi: ExtensionAPI) {
           output: result.output,
           noMatches: true,
           binarySource: binary.source,
+        } satisfies SearchOutcome;
+      }
+      // ripgrep also exits 2 when it skips an unreadable path after printing
+      // matches; keep those matches and surface the errors as a warning.
+      if (tool === "rg" && result.code === 2 && result.output.lineCount > 0) {
+        return {
+          output: result.output,
+          noMatches: false,
+          binarySource: binary.source,
+          warning: partialErrorWarning(result.stderr),
         } satisfies SearchOutcome;
       }
       if (result.code !== 0) {
@@ -281,8 +297,11 @@ export default function fileSearchTools(pi: ExtensionAPI) {
           }
 
           const formatted = formatCapturedOutput(outcome.output);
+          const text = outcome.warning
+            ? `${formatted.text}\n\n${outcome.warning}`
+            : formatted.text;
           return {
-            content: [{ type: "text", text: formatted.text }],
+            content: [{ type: "text", text }],
             details: {
               binarySource: outcome.binarySource,
               outputLines: formatted.lineCount,
