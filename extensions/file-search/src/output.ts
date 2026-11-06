@@ -58,6 +58,23 @@ function truncationNotice(options: {
   );
 }
 
+const WARNING_MAX_LINES = 5;
+
+/** Summarize stderr from a search that still produced results. */
+export function partialErrorWarning(stderr: string) {
+  const lines = stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const shown = lines.slice(0, WARNING_MAX_LINES);
+  const omitted = lines.length - shown.length;
+  return [
+    "[Warning: some paths could not be searched, so results may be incomplete.]",
+    ...shown,
+    ...(omitted > 0 ? [`[${omitted} more error lines omitted]`] : []),
+  ].join("\n");
+}
+
 /** Format output already captured by a bounded-memory streaming process. */
 export function formatCapturedOutput(captured: CapturedOutput) {
   const trimmed = captured.preview.replace(/\n+$/, "");
